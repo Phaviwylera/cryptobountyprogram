@@ -34,6 +34,36 @@ function execute(address target, bytes calldata data) external {
     token.safeTransfer(to, amount);
 }""",
     },
+    "arbitrary-transferfrom": {
+        "attack": [
+            "Find accounts that approved this contract to spend their tokens (Approval events on-chain).",
+            "Call the function with `from = victim`, `to = attacker`, `amount = victim's balance`.",
+            "The contract is the approved spender, so the token moves the victim's balance to the attacker. Repeat for every approver.",
+        ],
+        "fix": """// Pull only from the caller, or require the owner's signature/permit.
+function pull(uint256 amount) external {
+    token.safeTransferFrom(msg.sender, address(this), amount);   // from == msg.sender
+}""",
+    },
+    "arbitrary-approval": {
+        "attack": [
+            "Call the function with `spender = attacker` (and often a max/`type(uint256).max` amount).",
+            "The contract approves the attacker, who then calls `token.transferFrom(contract, attacker, balance)` to take its tokens.",
+        ],
+        "fix": """// Approve only a known, immutable router, for an exact amount.
+IERC20(token).forceApprove(trustedRouter, amount);   // trustedRouter is immutable""",
+    },
+    "cross-function-reentrancy": {
+        "attack": [
+            "Deposit from an attacker contract so you have a balance/collateral position.",
+            "Call the function that makes an external call (e.g. borrow/withdraw) before it settles state.",
+            "In the callback, re-enter a DIFFERENT, unguarded function (e.g. exitMarket / transfer) that reads the not-yet-updated balance.",
+            "Extract the collateral twice (or borrow against stale collateral), then repay the flash position.",
+        ],
+        "fix": """// Guard EVERY function touching the shared mapping with the SAME lock, and settle state before any call.
+function borrow(uint256 amount) external nonReentrant { ... }
+function exitMarket() external nonReentrant { ... }   // same guard - they share `collateral`""",
+    },
     "controlled-delegatecall": {
         "attack": [
             "Deploy a contract whose function writes the owner slot / transfers all tokens to the attacker.",

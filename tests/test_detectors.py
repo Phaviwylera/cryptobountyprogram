@@ -62,6 +62,10 @@ class VulnerableFixtureTests(unittest.TestCase):
         self.assertDetected("unprotected-selfdestruct", "kill")
         self.assertDetected("unvalidated-flash-callback", "onFlashLoan")
         self.assertDetected("unvalidated-flash-callback", "pancakeCall")
+        self.assertDetected("arbitrary-transferfrom", "pull")
+        self.assertDetected("arbitrary-approval", "allow")
+        self.assertDetected("cross-function-reentrancy", "borrow")
+        self.assertDetected("reentrancy", "withdraw")  # state write in internal helper
 
     def test_defi_economic_classes(self):
         self.assertDetected("erc4626-inflation", "deposit")

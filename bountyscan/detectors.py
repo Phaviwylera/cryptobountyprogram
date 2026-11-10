@@ -58,6 +58,70 @@ class Project:
             for c in f.contracts:
                 yield from c.functions
 
+    def callables_by_name(self) -> dict[str, list[Function]]:
+        if not hasattr(self, "_by_name"):
+            m: dict[str, list[Function]] = {}
+            for fn in self.functions():
+                m.setdefault(fn.name, []).append(fn)
+            # library functions live as contract.functions too; include them
+            self._by_name = m
+        return self._by_name
+
+    def resolve_call(self, name: str) -> Function | None:
+        """Best-effort resolve an internal/library function body by name (last definition wins)."""
+        got = self.callables_by_name().get(name)
+        return got[-1] if got else None
+
+
+CALL_IN_BODY_RE = re.compile(r"(?<![.\w])([A-Za-z_]\w*)\s*\(")
+# `Lib.func(` library-style call
+LIB_CALL_RE = re.compile(r"(?<![.\w])[A-Z]\w*\s*\.\s*([A-Za-z_]\w*)\s*\(")
+
+
+_INLINE_SKIP = {"require", "assert", "revert", "if", "for", "while", "return", "emit", "keccak256",
+                "abi", "address", "payable", "uint256", "uint", "int256", "bytes", "bool", "new",
+                "sha256", "ecrecover", "type", "this", "super"}
+
+
+def effective_body(fn: Function, project: Project, depth: int = 1, _seen: frozenset = frozenset()) -> str:
+    """fn.body with one level of internal/library calls SUBSTITUTED AT THE CALL SITE, so a regex
+    detector sees a call or state-write a helper performs, in the right textual order
+    (V03/V04/V14/V15 shapes). Substituting (not appending) preserves before/after-call ordering."""
+    body = fn.body or ""
+    if depth <= 0 or fn.name in _seen:
+        return body
+    seen = _seen | {fn.name}
+
+    def repl(match: re.Match) -> str:
+        name = match.group("name")
+        if name in _INLINE_SKIP:
+            return match.group(0)
+        callee = project.resolve_call(name)
+        if not (callee and callee is not fn and callee.body
+                and callee.visibility in (None, "internal", "private", "public")):
+            return match.group(0)
+        inner = effective_body(callee, project, depth - 1, seen)
+        # Bind the callee's parameter names to the call's actual arguments so a forwarded
+        # `data`/`target` reads as the caller's `routerData`/`strategy` (V14/V17 shapes).
+        raw_args = split_top_level(match.group("args"))
+        # `x.f(a)` via `using X for ...` passes the receiver as the first param; but a static library
+        # call `Lib.f(a,b)` does NOT (Lib is a type name, not an argument). Tell them apart by whether
+        # the receiver is a known library/contract name.
+        if match.start("name") > 0 and body[match.start("name") - 1] == ".":
+            receiver = expression_before(body, match.start("name") - 1)
+            recv_root = root_identifier(receiver)
+            type_names = {c.name for f in project.files for c in f.contracts if c.kind in ("library", "interface", "contract")}
+            if receiver and recv_root not in type_names:
+                raw_args = [receiver] + raw_args
+        for p, a in zip(callee.params, raw_args):
+            if p.name and a:
+                inner = re.sub(rf"(?<![.\w]){re.escape(p.name)}\b", lambda _m, a=a: a, inner)
+        return " { " + inner + " } "
+
+    # Replace `name(...)` and `Lib.name(...)`/`x.name(...)` invocations with the (arg-bound) callee body.
+    pattern = re.compile(r"(?:(?<![.\w])|(?<=\.))(?P<name>[A-Za-z_]\w*)\s*\((?P<args>[^;{}]*)\)")
+    return pattern.sub(repl, body)
+
 
 @dataclass
 class Detector:
@@ -94,7 +158,7 @@ AUTH_BODY_RE = re.compile(
 )
 # `address caller = _msgSender(); if (caller != authority()) revert ...;`
 SENDER_ALIAS_RE = re.compile(rf"\b(\w+)\s*=\s*{SENDER}\s*;")
-REENTRANCY_GUARD_RE = re.compile(r"re.?entr|^lock(ed)?$|nonreentrant|noreenter|noentry|^mutex|synchronized|globallock", re.I)
+REENTRANCY_GUARD_RE = re.compile(r"re.?entr|^lock(ed)?$|nonreentrant|noreenter|noentry|^mutex$|^guard(ed)?$|synchronized|globallock", re.I)
 # set-once guards: require(_implementation() == address(0)), if (owner != address(0)) revert ...
 ONE_TIME_GUARD_RE = re.compile(
     r"require\s*\([^;]*==\s*address\s*\(\s*0\s*\)|if\s*\([^;{]*!=\s*address\s*\(\s*0\s*\)[^;{]*\)\s*(?:revert|\{\s*revert)"
@@ -168,6 +232,33 @@ def root_identifier(expr: str) -> str:
     expr = re.sub(r"^(?:payable|address|I[A-Z]\w*|\w+)\s*\(\s*", "", expr) if re.match(r"^\w+\s*\(", expr) else expr
     m = re.match(r"[A-Za-z_]\w*", expr)
     return m.group(0) if m else ""
+
+
+ROLE_MODIFIER_RE = AUTH_MODIFIER_RE
+# msg.sender EQUALITY auth (owner/role), not a balance/amount comparison that merely mentions msg.sender.
+ROLE_BODY_RE = re.compile(
+    r"_check(?:Owner|Role|Auth|Admin|Caller|Sender|Permission)\w*\s*\(|hasRole\s*\(|_?only\w*\s*\(|_authorize\w*"
+    r"|_?isAuthorized|requiresAuth|_require\w*(?:Owner|Admin|Role|Auth)\w*\s*\("
+    rf"|require\s*\([^;{{]*{SENDER}\s*==|require\s*\([^;{{]*==\s*{SENDER}\b"
+    rf"|if\s*\([^;{{]*{SENDER}\s*[!=]=\s*\w[^;{{]*\)\s*(?:revert|\{{\s*revert)"
+)
+
+
+def is_role_controlled(fn: Function, project: Project) -> bool:
+    """Restricts WHO may call (owner/role/modifier). Unlike access_controlled, a bare
+    require that only *mentions* msg.sender (e.g. a balanceOf(msg.sender) check) does not count."""
+    for m in fn.modifiers:
+        if m in project.auth_modifiers or ROLE_MODIFIER_RE.search(m):
+            return True
+    body = fn.body or ""
+    if ROLE_BODY_RE.search(body):
+        return True
+    if re.search(rf"\bsuper\.{re.escape(fn.name)}\s*\(", body):
+        return True
+    for alias in re.findall(rf"\b(\w+)\s*=\s*{SENDER}\s*;", body):
+        if re.search(rf"(?:require|if)\s*\([^;{{]*\b{re.escape(alias)}\b\s*[!=]=", body):
+            return True
+    return False
 
 
 def is_immutable(contract, ident: str) -> bool:
@@ -402,35 +493,98 @@ def _reentrancy(project: Project):
         if any(REENTRANCY_GUARD_RE.search(m) for m in fn.modifiers):
             continue
         body = fn.body or ""
-        call = call_re.search(body)
+        # Inline one level so a call (or a state-write) hidden in an internal helper is visible.
+        eff = effective_body(fn, project)
+        call = call_re.search(eff)
         if not call:
             continue
+        orig_call = call_re.search(body)
+        in_original = orig_call is not None
         # A call to a fixed immutable/constant address is not attacker-controllable reentry.
-        receiver = root_identifier(expression_before(body, call.start())) if body[call.start()] == "." else ""
+        receiver = root_identifier(expression_before(eff, call.start())) if eff[call.start()] == "." else ""
         if receiver and is_immutable(fn.contract, receiver):
             continue
-        _, stmt_end = statement_bounds(body, call.start())
-        before, after = body[:call.start()], body[stmt_end:]
+        _, stmt_end = statement_bounds(eff, call.start())
+        before, after = eff[:call.start()], eff[stmt_end:]
+        # Storage-pointer aliases: `UserInfo storage u = userInfo[msg.sender];` means a later
+        # `u.amount -= x` is really a write to the state var `userInfo` (MasterChef / V05 shape).
+        alias_vars = set()
+        for am in re.finditer(r"\bstorage\s+(\w+)\s*=\s*([A-Za-z_]\w*)\s*\[", eff):
+            if am.group(2) in project.state_vars:
+                alias_vars.add((am.group(1), am.group(2)))
         writes = []
+        for alias, target_var in alias_vars:
+            if re.search(rf"(?<![.\w]){re.escape(alias)}\b\s*\.\s*\w+\s*(?:[+\-*/]?=(?!=)|\+\+|--)", after):
+                writes.append(target_var)
         for v in project.state_vars:
             w = (re.search(rf"(?<![.\w]){re.escape(v)}\b\s*(?:\[[^;]*?\]\s*)*(?:\.\w+\s*)*(?:[+\-*/]?=(?!=)|\+\+|--)", after)
                  or re.search(rf"\bdelete\s+{re.escape(v)}\b", after))
             if not w:
                 continue
-            # Skip an inline-mutex RELEASE: a var set to a bool/guarded at entry and reset after the call.
-            if re.search(rf"(?<![.\w]){re.escape(v)}\b\s*=\s*(?:true|false|1|0|_?(?:ENTERED|NOT_ENTERED|_TRUE|_FALSE))\b", before) \
-               or re.search(rf"require\s*\(\s*!?\s*{re.escape(v)}\b", before):
+            # Skip an inline-mutex RELEASE: a scalar lock var set to a bool/sentinel at entry and reset
+            # after the call. Must be a genuine lock (bool/0/1/ENTERED), never a balance comparison.
+            is_lock = re.search(
+                rf"(?<![.\w]){re.escape(v)}\b\s*=\s*(?:true|false|1|0|_?(?:ENTERED|NOT_ENTERED|_TRUE|_FALSE|LOCKED|UNLOCKED))\b",
+                before)
+            lock_require = re.search(
+                rf"require\s*\(\s*!\s*{re.escape(v)}\s*[,)]"
+                rf"|require\s*\(\s*{re.escape(v)}\s*(?:==|!=)\s*(?:true|false|0|1|_?\w*(?:ENTERED|LOCKED)\w*)\b", before)
+            if is_lock and lock_require:
                 continue
             writes.append(v)
         if not writes:
             continue
-        native = not re.match(r"\b_safeMint|\.onERC721Received|\.tokensReceived", call.group(0))
+        is_hook = bool(re.match(r"\b_safeMint|\.onERC721Received|\.tokensReceived|\.safeTransferFrom", call.group(0)))
+        # A hook/token-transfer reentrancy that lets a PRE-call require be bypassed (the written var is
+        # the one guarded) is a real fund-theft vector - escalate to high (V07/V08 mint- or LTV-limit bypass).
+        bypass = is_hook and any(re.search(rf"(?:require|assert)\s*\([^;{{]*\b{re.escape(v)}\b", before) for v in writes)
+        native = not is_hook
+        sev = "high" if (native or bypass) else "medium"
+        note = "" if in_original else f" (via internal helper reached from `{fn.name}`)"
         yield Hit(
-            fn, call.start(),
-            f"External call in `{fn.name}` happens before writing state variable(s): {', '.join(sorted(writes))}; no reentrancy guard.",
-            severity="high" if native else "medium",
-            confidence="high" if native else "medium",
+            fn, orig_call.start() if in_original else fn.offset,
+            f"External call in `{fn.name}` happens before writing state variable(s): {', '.join(sorted(writes))}; no reentrancy guard{note}.",
+            severity=sev, confidence="high" if native else "medium", absolute=not in_original,
         )
+
+
+GOVERNANCE_GATE_RE = re.compile(r"proposal|governance|_validateState|timelock|queued|ProposalState|_executeOperations|onlyGovernance", re.I)
+
+
+@detector(
+    "hook-reentrancy",
+    "Token-transfer / mint hook lets a pre-call check be bypassed by reentrancy",
+    "high",
+    "ERC777/ERC721/ERC1155 transfers and safe-mints invoke a hook on the receiver. Re-entering before the contract updates the balance/limit it just checked bypasses that check - minting past a cap, borrowing past the LTV, or claiming twice (Cream/Amp, imBTC).",
+    "Apply checks-effects-interactions (update the checked state BEFORE the transfer) and add a reentrancy guard.",
+    ["https://rekt.news/cream-rekt/", "https://consensys.io/diligence/blog/2020/11/..."],
+)
+def _hook_reentrancy(project: Project):
+    hook_call = re.compile(
+        r"\.safeTransferFrom\s*\(|\.safeBatchTransferFrom\s*\(|\.safeTransfer\s*\(|\.transfer\s*\(|\b_safeMint\s*\(|\b_mint\s*\(|\.mint\s*\(")
+    for fn in entrypoints(project):
+        if any(REENTRANCY_GUARD_RE.search(m) for m in fn.modifiers):
+            continue
+        body = effective_body(fn, project)
+        m = hook_call.search(body)
+        if not m:
+            continue
+        # token .transfer(X, ...) to a bare address is only a hook risk for ERC777; require the
+        # receiver to be a user (msg.sender or a param), not address(this).
+        args, _ = call_args(body, m.end() - 1)
+        if m.group(0).strip().startswith(".transfer") and args and "address(this)" in args[0]:
+            continue
+        _, stmt_end = statement_bounds(body, m.start())
+        before, after = body[:m.start()], body[stmt_end:]
+        for v in project.state_vars:
+            written_after = (re.search(rf"(?<![.\w]){re.escape(v)}\b\s*(?:\[[^;]*?\]\s*)*(?:[+\-*/]?=(?!=)|\+\+|--)", after)
+                             or re.search(rf"\bdelete\s+{re.escape(v)}\b", after))
+            checked_before = re.search(rf"(?:require|assert|if)\s*\([^;{{]*\b{re.escape(v)}\b", before)
+            if written_after and checked_before:
+                yield Hit(fn, fn.offset,
+                          f"`{fn.name}` transfers/mints (hook can re-enter) before updating `{v}`, which it checked beforehand - "
+                          "the check can be bypassed by re-entering.", absolute=True, confidence="medium")
+                break
 
 
 @detector(
@@ -443,17 +597,141 @@ def _reentrancy(project: Project):
 )
 def _arbitrary_call(project: Project):
     for fn in entrypoints(project):
-        if access_controlled(fn, project):
+        # Only who-may-call matters here; a balanceOf(msg.sender) sanity check is NOT authorization.
+        if is_role_controlled(fn, project):
             continue
         body = fn.body or ""
+        eff = effective_body(fn, project)
+        # Governance executors forward proposal-approved targets/calldata; they are gated by a vote, not open.
+        if GOVERNANCE_GATE_RE.search(eff):
+            continue
+        # bytes params of this fn, plus bytes fields of any struct/array calldata param (V11 LiFi shape).
         bytes_params = fn.params_of_type("bytes")
-        for m in re.finditer(r"\.(call|functionCall|functionCallWithValue)\s*(\{[^}]*\})?\s*\(", body):
-            target = root_identifier(expression_before(body, m.start()))
+        calldata_params = {p.name for p in fn.params if p.name}
+        call_pat = r"\.(call|functionCall|functionCallWithValue)\s*(?:\{[^}]*\})?\s*\(|\.call\s*\.\s*value\s*\([^)]*\)\s*\("
+        orig_has = re.search(call_pat, body)
+        for m in re.finditer(call_pat, eff):
+            in_original = orig_has is not None
+            target_expr = expression_before(eff, m.start())
+            target_root = root_identifier(target_expr)
+            args, _ = call_args(eff, m.end() - 1)
+            if not args:
+                continue
+            # Target is caller-controlled if it is a param, or a member/index of a calldata param
+            # (e.g. swaps[i].callTo), i.e. its root identifier is one of the function's parameters.
+            target_user = target_root in fn.param_names or any(
+                re.search(rf"(?<![.\w]){re.escape(p)}\b\s*[\[.]", target_expr) for p in calldata_params)
+            # Calldata is caller-controlled if it is a bytes param or a .bytesField of a calldata param.
+            data_user = any(re.search(rf"\b{re.escape(b)}\b", args[0]) for b in bytes_params) or \
+                re.search(r"\.\s*\w*[Dd]ata\b|\.\s*callData\b|\[\s*\w+\s*\]\s*\.\s*\w+", args[0])
+            if target_user and data_user and not target_whitelisted(fn, target_root):
+                note = "" if in_original else f" (forwarded through a helper/library from `{fn.name}`)"
+                off = orig_has.start() if in_original else fn.offset
+                yield Hit(fn, off,
+                          f"`{fn.name}` makes a call to a caller-supplied target with caller-supplied calldata{note}.",
+                          absolute=not in_original)
+                break
+
+
+@detector(
+    "arbitrary-transferfrom",
+    "Caller-controlled transferFrom drains token approvals",
+    "critical",
+    "Anyone can call `token.transferFrom(victim, attacker, amount)` through the contract for any token users approved to it - draining every approval (Transit Swap, SushiSwap RouteProcessor2, Multichain).",
+    "Only pull funds from msg.sender (`transferFrom(msg.sender, ...)`), or require a signature/permit from the `from` account.",
+    ["https://rekt.news/transit-swap-rekt/", "https://rekt.news/sushi-rekt/"],
+)
+def _arbitrary_transferfrom(project: Project):
+    for fn in entrypoints(project):
+        if is_role_controlled(fn, project):
+            continue
+        body = effective_body(fn, project)
+        addr_params = fn.params_of_type("address")
+        # transferFrom(FROM, ...) / safeTransferFrom(token, FROM, ...) where FROM is a caller-chosen address
+        for m in re.finditer(r"\.(safeTransferFrom|transferFrom)\s*\(", body):
             args, _ = call_args(body, m.end() - 1)
-            if target in fn.param_names and args and any(
-                re.search(rf"\b{re.escape(b)}\b", args[0]) for b in bytes_params
-            ) and not target_whitelisted(fn, target):
-                yield Hit(fn, m.start(), f"`{target}.{m.group(1)}(...)` uses a caller-supplied target and calldata.")
+            if len(args) < 2:
+                continue
+            # Method form `token.(safe)transferFrom(from, to, amount/id)` - `from` is the first arg.
+            src = root_identifier(args[0])
+            if src in addr_params and not re.search(r"permit|_spendAllowance|allowance|ecrecover|\.recover\s*\(|SignatureChecker|isValidSignature|_useNonce|_isApprovedOrOwner|_isAuthorized|getApproved|ownerOf", body, re.I):
+                yield Hit(fn, fn.offset, f"`{fn.name}` calls {m.group(1)} with caller-chosen `from` = `{src}`, so anyone can move a victim's approved tokens.", absolute=True)
+                break
+
+
+@detector(
+    "arbitrary-approval",
+    "Caller-controlled approval lets an attacker spend the contract's tokens",
+    "critical",
+    "The contract approves a caller-chosen spender (often for its whole balance or max uint), who then transfers the contract's - or its users' - tokens out.",
+    "Never approve a caller-supplied spender; approve only known, immutable routers for exact amounts.",
+    ["https://rekt.news/transit-swap-rekt/"],
+)
+def _arbitrary_approval(project: Project):
+    for fn in entrypoints(project):
+        if is_role_controlled(fn, project):
+            continue
+        body = effective_body(fn, project)
+        addr_params = fn.params_of_type("address")
+        for m in re.finditer(r"\.(approve|safeApprove|forceApprove|safeIncreaseAllowance)\s*\(", body):
+            args, _ = call_args(body, m.end() - 1)
+            if not args:
+                continue
+            spender = root_identifier(args[0])
+            amount = args[1] if len(args) > 1 else ""
+            risky_amount = re.search(r"type\s*\(\s*uint\d*\s*\)\s*\.\s*max|balanceOf|2\s*\*\*\s*256|0xff{6,}", amount)
+            if spender in addr_params and risky_amount:
+                yield Hit(fn, fn.offset, f"`{fn.name}` approves caller-chosen spender `{spender}` for an unbounded amount.", absolute=True)
+                break
+
+
+@detector(
+    "cross-function-reentrancy",
+    "State shared with a reentrant external call is mutated by an unguarded function",
+    "high",
+    "While one function holds an external call open (before it settles state), the attacker re-enters a DIFFERENT unguarded function that reads or writes the same balance/collateral mapping - draining funds even though each function looks safe alone (Fei Rari, Cream, Orion).",
+    "Put every function that touches the shared state behind the SAME reentrancy guard, and apply checks-effects-interactions everywhere.",
+    ["https://rekt.news/cream-rekt-2/", "https://rekt.news/fei-rari/"],
+)
+def _cross_function_reentrancy(project: Project):
+    call_re = re.compile(r"\.call\s*\{|\.call\s*\(|\.call\s*\.\s*value\s*\(|safeTransferETH\s*\(|\.sendValue\s*\(")
+    for f in project.files:
+        for c in f.contracts:
+            entry = [fn for fn in c.functions if fn.is_entrypoint and fn.is_mutating]
+            for fn in entry:
+                body = fn.body or ""
+                call = call_re.search(body)
+                if not call:
+                    continue
+                receiver = root_identifier(expression_before(body, call.start())) if body[call.start()] == "." else ""
+                if receiver and is_immutable(c, receiver):
+                    continue
+                _, stmt_end = statement_bounds(body, call.start())
+                after = body[stmt_end:]
+                # state vars this function settles AFTER its external call (the reentrancy-sensitive ones)
+                touched = {v for v in project.state_vars
+                           if re.search(rf"(?<![.\w]){re.escape(v)}\b\s*(?:\[[^;]*?\]\s*)*(?:[+\-*/]?=(?!=)|\+\+|--)", after)}
+                if not touched:
+                    continue
+                value_out = re.compile(r"\.call\s*\{|\.transfer\s*\(|\.send\s*\(|\.safeTransfer\s*\(|payable\s*\(|sendValue\s*\(")
+                for other in entry:
+                    if other is fn or any(REENTRANCY_GUARD_RE.search(m) for m in other.modifiers):
+                        continue
+                    ob = other.body or ""
+                    # The other function must itself be an extraction path (moves value out); a pure
+                    # deposit that only credits a balance cannot drain funds by being re-entered.
+                    if not value_out.search(ob):
+                        continue
+                    shared = {v for v in touched
+                              if re.search(rf"(?<![.\w]){re.escape(v)}\b\s*(?:\[[^;]*?\]\s*)*(?:[+\-*/]?=(?!=)|\+\+|--)", ob)
+                              or re.search(rf"\bdelete\s+{re.escape(v)}\b", ob)
+                              or re.search(rf"(?<![.\w]){re.escape(v)}\b\s*\[[^\]]*\]", ob)}
+                    if shared:
+                        yield Hit(fn, fn.offset,
+                                  f"`{fn.name}` makes an external call before settling {', '.join(sorted(shared))}, which the unguarded "
+                                  f"`{other.name}` also mutates - reentrancy across the two can bypass the accounting.",
+                                  absolute=True, confidence="medium")
+                        break
 
 
 @detector(
@@ -467,13 +745,18 @@ def _arbitrary_call(project: Project):
 def _delegatecall(project: Project):
     for fn in entrypoints(project):
         body = fn.body or ""
-        for m in re.finditer(r"\.delegatecall\s*\(|functionDelegateCall\s*\(", body):
-            target = root_identifier(expression_before(body, m.start())) if body[m.start()] == "." else ""
+        eff = effective_body(fn, project)
+        orig_dc = re.search(r"\.delegatecall\s*\(|functionDelegateCall\s*\(", body)
+        for m in re.finditer(r"\.delegatecall\s*\(|functionDelegateCall\s*\(", eff):
+            in_original = orig_dc is not None
+            target = root_identifier(expression_before(eff, m.start())) if eff[m.start()] == "." else ""
             if not target:
-                args, _ = call_args(body, m.end() - 1)
+                args, _ = call_args(eff, m.end() - 1)
                 target = root_identifier(args[0]) if args else ""
-            if target in fn.param_names and not access_controlled(fn, project) and not ONE_TIME_GUARD_RE.search(body):
-                yield Hit(fn, m.start(), f"delegatecall target `{target}` is a function parameter.")
+            if target in fn.param_names and not is_role_controlled(fn, project) and not ONE_TIME_GUARD_RE.search(eff):
+                note = "" if in_original else f" (forwarded through a helper/library from `{fn.name}`)"
+                yield Hit(fn, orig_dc.start() if in_original else fn.offset,
+                          f"delegatecall target `{target}` is a function parameter{note}.", absolute=not in_original)
 
 
 @detector(

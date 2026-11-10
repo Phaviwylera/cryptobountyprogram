@@ -111,6 +111,8 @@ Each `scan`/`program` run writes `reports/<name>-<timestamp>/`:
 | Severity | Detector | Bug class |
 |---|---|---|
 | Critical | `arbitrary-external-call` | `target.call(data)` with caller-controlled target and calldata drains user approvals |
+| Critical | `arbitrary-transferfrom` | caller-chosen `from` in transferFrom drains every token approval (Transit Swap, SushiSwap) |
+| Critical | `arbitrary-approval` | approves a caller-chosen spender for an unbounded amount |
 | Critical | `arbitrary-recipient-withdrawal` | Withdraw/claim pays a caller-chosen address without checking the caller |
 | Critical | `controlled-delegatecall` | delegatecall to a parameter address |
 | Critical | `unprotected-initializer` | Proxy initializer that anyone can call, or call again |
@@ -118,7 +120,9 @@ Each `scan`/`program` run writes `reports/<name>-<timestamp>/`:
 | Critical | `unvalidated-flash-callback` | `onFlashLoan` / `uniswapV3SwapCallback` etc. that never authenticate the caller |
 | Critical | `unprotected-selfdestruct` | Anyone can destroy the contract |
 | High/Crit | `unprotected-privileged-function` | Upgrade, ownership, oracle/price, sweep or rescue functions without access control |
-| High | `reentrancy` | State written after an external ETH call, with no guard |
+| High | `reentrancy` | State written after an external ETH call, with no guard (sees through internal helpers and library forwarders) |
+| High | `cross-function-reentrancy` | A reentrant call shares state with a second unguarded function that pays out (Fei Rari, Cream) |
+| High | `hook-reentrancy` | ERC777/721/1155 transfer or mint hook lets a pre-call check be bypassed |
 | High | `spot-price-oracle` | Prices taken from `getReserves()` / `slot0()`, which flash loans can manipulate |
 | High | `erc4626-inflation` | First-depositor share-inflation attack |
 | High | `missing-slippage-protection` | Swaps with `amountOutMin = 0` that bots can sandwich |
@@ -127,10 +131,16 @@ Each `scan`/`program` run writes `reports/<name>-<timestamp>/`:
 | Medium | `chainlink-stale-price`, `donation-manipulable-rate`, `unchecked-erc20-transfer`, `unchecked-low-level-call`, `uninitialized-implementation`, `weak-randomness` | |
 | Low | `divide-before-multiply` | Precision loss |
 
-**Accuracy:** on the vulnerable fixtures in `tests/fixtures/vulnerable`, every planted bug is detected, and the hardened
-`tests/fixtures/safe` vault produces zero findings. On OpenZeppelin Contracts (250 production files with default
-exclusions) it reports a single low-severity note. Heuristics still miss logic bugs, such as wrong math or a broken
-invariant. Use the scanner to decide where to read first, not as a substitute for reading the code.
+The external-call and reentrancy detectors perform **one level of interprocedural inlining** (arguments bound to the
+callee's parameters), so a bug hidden behind an internal helper or a `using-for` library forwarder is still found.
+
+**Accuracy:** every planted bug in `tests/fixtures/vulnerable` is detected and the hardened `tests/fixtures/safe`
+contracts produce zero findings. Against an adversarial red-team corpus of 38 exploit-modelled contracts (The DAO,
+Fei Rari, Cream, LiFi, Socket, DODO, Transit Swap, Balancer, Uniswap-V2/V3/V4 callbacks), the scanner flags **25/25**
+vulnerable contracts with **0 false positives** on the 13 safe counterparts. On OpenZeppelin Contracts (250 production
+files) and on real mainnet contracts (WETH, Aave V3, Uniswap routers, DAI) it reports no fund-theft findings. Heuristics
+still miss logic bugs, such as wrong math or a broken invariant. Use the scanner to decide where to read first, not as a
+substitute for reading the code.
 
 ## Workflow
 
