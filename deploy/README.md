@@ -99,3 +99,25 @@ Alchemy/Infura RPC URL in `.env`.
   by factories are not enumerated here. Feed those via **Immunefi Scan** or an address list.
 - The dashboard is single-tenant; one worker drains the queue. That is intentional — it keeps API
   usage within free-tier limits and the results ordered.
+
+## 6. Automatic deploys from GitHub
+
+Every push to `main` reaches the server within about a minute. Nobody has to deploy by hand.
+
+The server **pulls**; GitHub never connects to it. That means no SSH port opened to GitHub and no server key
+stored in GitHub. A systemd timer runs `deploy/autodeploy.sh` every minute. When `origin/main` has a new commit it:
+
+1. checks out and installs the new commit,
+2. runs the test suite. **If any test fails, it rolls back** to the previous commit,
+3. restarts the dashboard,
+4. checks the dashboard health. **If it doesn't come back healthy, it rolls back.**
+
+Install it once on the server:
+
+```bash
+sudo install -m 0755 /opt/cryptobountyprogram/deploy/autodeploy.sh /usr/local/bin/bountyscan-autodeploy
+sudo cp /opt/cryptobountyprogram/deploy/bountyscan-autodeploy.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now bountyscan-autodeploy.timer
+```
+
+Watch deploys with `sudo journalctl -u bountyscan-autodeploy -f`.

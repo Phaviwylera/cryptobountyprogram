@@ -18,3 +18,4 @@ deploy/.env
 deploy/.htpasswd
 deploy/certs/
 data/
+deploy/bountyscan.env
