@@ -217,7 +217,7 @@ async function refresh(){
   const pill = $('#modePill');
   pill.className = 'pill' + (s.mode==='live' ? ' live' : s.mode==='draining' ? ' drain' : '');
   $('#modeText').textContent = s.mode==='live' ? 'LIVE' : s.mode==='draining' ? 'SCANNING QUEUE' : 'IDLE';
-  $('#rpcLabel').textContent = (s.rpc ? 'rpc connected' : 'no rpc') + (s.verify ? ' · independent verification on' : '');
+  $('#rpcLabel').textContent = (s.rpc ? 'rpc connected' : 'no rpc') + (s.verify ? ' · independent verification on' : '') + (s.version ? ' · v'+s.version : '');
   // NOW panel
   $('#stage').textContent = s.stage || (busy ? 'Working…' : 'Idle');
   const bar = $('#stageBar');

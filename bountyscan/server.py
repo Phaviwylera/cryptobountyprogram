@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from . import __version__
 from .auto import AutoConfig, discover_blocks, run_queue
 from .rpc import RPC, RPCError
 from .state import Store
@@ -202,6 +203,7 @@ class Worker:
             "last_error": self.last_error,
             "started_at": self.started_at,
             "verify": self.cfg.verify,
+            "version": __version__,
             "stage": self.stage,
             "stage_age": round(time.time() - self.stage_at, 1),
             "events": list(self.events)[-60:],
