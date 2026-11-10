@@ -276,6 +276,14 @@ def serve(host: str, port: int, out_dir: Path, cache_dir: Path, state: Path,
     rpc = RPC(rpc_url) if rpc_url else None
     cfg = AutoConfig(out_dir=out_dir, cache_dir=cache_dir, api_key=api_key, rpc=rpc, verify=verify, quiet=True)
     Handler.worker = Worker(store, cfg, rpc)
+    # BOUNTYSCAN_AUTOSTART=live resumes the 24/7 live scan after any restart or reboot;
+    # =drain resumes working through whatever is already queued.
+    autostart = os.environ.get("BOUNTYSCAN_AUTOSTART", "").lower()
+    if autostart == "live" and rpc is not None:
+        Handler.worker.start_live(cfg_default_chain(), None,
+                                  int(float(os.environ.get("BOUNTYSCAN_MIN_BALANCE", "0")) * 10**18))
+    elif autostart in ("live", "drain"):
+        Handler.worker.start_drain()
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"bountyscan dashboard on http://{host}:{port}  (rpc={'set' if rpc else 'none'}, verify={verify})")
     try:
