@@ -46,8 +46,8 @@ class ServerSmokeTests(unittest.TestCase):
         status, body = self.get("/")
         self.assertEqual(status, 200)
         self.assertIn(b"bountyscan", body)
-        self.assertIn(b"Live Scan", body)
-        self.assertIn(b"Immunefi Scan", body)
+        self.assertIn(b"LIVE SCAN", body.upper())
+        self.assertIn(b"IMMUNEFI SCAN", body.upper())
 
     def test_status_api(self):
         status, body = self.get("/api/status")

@@ -254,6 +254,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, INDEX_HTML.encode(), "text/html; charset=utf-8")
         if u.path == "/api/status":
             return self._send(200, w.snapshot())
+        if u.path == "/api/meta":
+            from .detectors import DETECTORS
+            return self._send(200, {"version": __version__,
+                                    "detectors": [{"id": d.id, "severity": d.severity, "title": d.title} for d in DETECTORS]})
         if u.path == "/api/results":
             return self._send(200, {"results": [self._row(r) for r in w.store.by_status("vulnerable")]})
         if u.path == "/api/safe":
