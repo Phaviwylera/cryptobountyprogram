@@ -66,3 +66,12 @@ contract VulnerableLending {
         selfdestruct(payable(msg.sender));
     }
 }
+
+// INTENTIONALLY VULNERABLE - V2-fork flash-swap callback with no pool check (added regression).
+contract UnsafePancakeCallback {
+    function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        address to = abi.decode(data, (address));
+        (bool ok, ) = to.call{value: amount0}("");
+        require(ok);
+    }
+}

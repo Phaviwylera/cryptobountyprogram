@@ -61,6 +61,7 @@ class VulnerableFixtureTests(unittest.TestCase):
         self.assertDetected("tx-origin-auth", "upgradeAndCall")
         self.assertDetected("unprotected-selfdestruct", "kill")
         self.assertDetected("unvalidated-flash-callback", "onFlashLoan")
+        self.assertDetected("unvalidated-flash-callback", "pancakeCall")
 
     def test_defi_economic_classes(self):
         self.assertDetected("erc4626-inflation", "deposit")
@@ -92,7 +93,8 @@ class VulnerableFixtureTests(unittest.TestCase):
 class SafeFixtureTests(unittest.TestCase):
     def test_no_findings_on_hardened_vault(self):
         findings = scan([FIXTURES / "safe"], min_severity="info").findings
-        self.assertEqual([], [(f.detector, f.function, f.line) for f in findings])
+        self.assertEqual([], [(f.detector, f.function, f.line) for f in findings],
+                         "hardened fixtures must stay clean (incl. ERC1363 transferAndCall / verified uniswapV2Call)")
 
 
 class ReportAndCliTests(unittest.TestCase):

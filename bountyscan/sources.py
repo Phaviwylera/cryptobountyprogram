@@ -45,10 +45,57 @@ def _safe_relpath(name: str) -> Path:
     return Path(*parts) if parts else Path("Contract.sol")
 
 
-def _get_json(url: str) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": "bountyscan/0.1"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+EXPLORERS = {
+    1: "https://etherscan.io", 11155111: "https://sepolia.etherscan.io", 56: "https://bscscan.com",
+    137: "https://polygonscan.com", 42161: "https://arbiscan.io", 10: "https://optimistic.etherscan.io",
+    8453: "https://basescan.org", 43114: "https://snowtrace.io", 59144: "https://lineascan.build",
+    534352: "https://scrollscan.com", 81457: "https://blastscan.io", 100: "https://gnosisscan.io",
+    250: "https://ftmscan.com", 5000: "https://mantlescan.xyz", 324: "https://era.zksync.network", 146: "https://sonicscan.org",
+}
+
+
+class NotVerified(RuntimeError):
+    """The contract exists but its source is not (yet) verified on the explorer."""
+
+
+class ExplorerFatal(RuntimeError):
+    """Bad API key / unsupported chain on this plan - retrying will not help."""
+
+
+def chain_id_of(chain: str) -> int:
+    key = chain.lower()
+    if key.isdigit():
+        return int(key)
+    if key not in CHAIN_IDS:
+        raise ValueError(f"unknown chain {chain!r}; use one of {sorted(CHAIN_IDS)} or a numeric chain id")
+    return CHAIN_IDS[key]
+
+
+def explorer_url(chain: str, address: str) -> str:
+    base = EXPLORERS.get(chain_id_of(chain), "https://etherscan.io")
+    return f"{base}/address/{address}#code"
+
+
+_last_call = [0.0]
+
+
+def _get_json(url: str, min_interval: float = 0.25) -> dict:
+    """GET with Etherscan free-tier pacing (<= 5 req/s) and retry on rate-limit responses."""
+    import time
+
+    for attempt in range(4):
+        wait = min_interval - (time.monotonic() - _last_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.monotonic()
+        req = urllib.request.Request(url, headers={"User-Agent": "bountyscan/0.2"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if "rate limit" in str(data.get("result", "")).lower():
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        return data
+    return data
 
 
 def fetch_verified_source(address: str, chain: str, dest: Path, api_key: str | None = None, follow_proxy: bool = True) -> Path:
@@ -60,12 +107,13 @@ def fetch_verified_source(address: str, chain: str, dest: Path, api_key: str | N
     if not ADDRESS_RE.match(address):
         raise ValueError(f"not an EVM address: {address!r}")
     chain_key = chain.lower()
-    if chain_key not in CHAIN_IDS and not chain_key.isdigit():
-        raise ValueError(f"unknown chain {chain!r}; use one of {sorted(CHAIN_IDS)} or a numeric chain id")
-    chain_id = int(chain_key) if chain_key.isdigit() else CHAIN_IDS[chain_key]
+    chain_id = chain_id_of(chain_key)
+    out_dir = dest / chain_key / address.lower()
+    if (out_dir / "bountyscan-meta.json").exists():
+        return out_dir  # already fetched
     api_key = api_key or os.environ.get("ETHERSCAN_API_KEY")
     if not api_key:
-        raise RuntimeError("set ETHERSCAN_API_KEY (free at https://etherscan.io/myapikey) or pass --api-key")
+        raise ExplorerFatal("set ETHERSCAN_API_KEY (free at https://etherscan.io/myapikey) or pass --api-key")
 
     query = urllib.parse.urlencode({
         "chainid": chain_id, "module": "contract", "action": "getsourcecode",
@@ -73,13 +121,15 @@ def fetch_verified_source(address: str, chain: str, dest: Path, api_key: str | N
     })
     data = _get_json(f"{ETHERSCAN_V2}?{query}")
     if data.get("status") != "1" or not data.get("result"):
-        raise RuntimeError(f"explorer error for {address}: {data.get('result') or data.get('message')}")
+        msg = str(data.get("result") or data.get("message"))
+        if re.search(r"api.?key|not supported|upgrade|plan", msg, re.I):
+            raise ExplorerFatal(f"explorer refused the request: {msg}")
+        raise RuntimeError(f"explorer error for {address}: {msg}")
     info = data["result"][0]
     source = info.get("SourceCode") or ""
     if not source:
-        raise RuntimeError(f"{address} on {chain} is not verified")
+        raise NotVerified(f"{address} on {chain} is not verified")
 
-    out_dir = dest / chain_key / address.lower()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     sources: dict[str, str]
@@ -105,12 +155,22 @@ def fetch_verified_source(address: str, chain: str, dest: Path, api_key: str | N
         "contract_name": info.get("ContractName"), "compiler": info.get("CompilerVersion"),
         "proxy": info.get("Proxy") == "1", "implementation": info.get("Implementation") or None,
     }
-    (out_dir / "bountyscan-meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
     impl = meta["implementation"]
     if follow_proxy and meta["proxy"] and impl and ADDRESS_RE.match(impl) and impl.lower() != address.lower():
-        fetch_verified_source(impl, chain, out_dir / "implementation", api_key, follow_proxy=False)
+        try:
+            fetch_verified_source(impl, chain, out_dir / "implementation", api_key, follow_proxy=False)
+        except NotVerified:
+            meta["implementation_unverified"] = True
+    # written last: its presence marks a complete, reusable download
+    (out_dir / "bountyscan-meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return out_dir
+
+
+def read_meta(source_dir: Path) -> dict:
+    try:
+        return json.loads((source_dir / "bountyscan-meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def clone_repo(url: str, dest: Path, ref: str | None = None) -> Path:

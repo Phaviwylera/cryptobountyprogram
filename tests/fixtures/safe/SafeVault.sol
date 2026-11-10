@@ -65,3 +65,22 @@ contract SafeVault is ReentrancyGuard, Ownable {
         return uint256(answer);
     }
 }
+
+// ERC1363-style transferAndCall / approveAndCall must NOT be flagged as flash callbacks.
+contract SafeERC1363Like {
+    mapping(address => uint256) public balanceOf;
+    function transferAndCall(address to, uint256 value, bytes calldata data) external returns (bool) {
+        balanceOf[msg.sender] -= value;
+        balanceOf[to] += value;
+        return true;
+    }
+    function approveAndCall(address spender, uint256 value, bytes calldata data) external returns (bool) {
+        return true;
+    }
+    // A flash-swap callback that DOES verify the pool is safe.
+    function uniswapV2Call(address sender, uint256 a0, uint256 a1, bytes calldata data) external {
+        require(msg.sender == pair, "not pair");
+        require(sender == address(this), "not self");
+    }
+    address public pair;
+}

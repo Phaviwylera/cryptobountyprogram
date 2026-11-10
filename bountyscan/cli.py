@@ -94,6 +94,76 @@ def cmd_program(args) -> int:
     return _exit_code(result, args.fail_on)
 
 
+def _store(args):
+    from .state import Store
+    return Store(args.state)
+
+
+def cmd_auto(args) -> int:
+    import os
+
+    from .auto import AutoConfig, discover_blocks, parse_address_lines, run_queue, watch
+    from .program import load_scope
+    from .rpc import RPC
+    from .sources import ExplorerFatal
+
+    store = _store(args)
+    rpc_url = args.rpc_url or os.environ.get("RPC_URL")
+    rpc = RPC(rpc_url) if rpc_url else None
+    cfg = AutoConfig(out_dir=args.out, cache_dir=args.cache, api_key=args.api_key, rpc=rpc,
+                     min_balance_wei=int(args.min_balance * 10**18))
+
+    added = 0
+    for f in args.addresses or []:
+        for chain, addr in parse_address_lines(Path(f).read_text(encoding="utf-8"), args.chain):
+            added += store.enqueue(chain, addr, f"list:{Path(f).name}")
+    for s in args.scope or []:
+        scope = load_scope(Path(s))
+        for a in scope["assets"]:
+            if "address" in a:
+                added += store.enqueue(a["chain"], a["address"], f"program:{scope['program']}")
+    for a in args.address or []:
+        chain, addr = parse_address_lines(a, args.chain)[0]
+        added += store.enqueue(chain, addr, "cli")
+    if args.retry_errors:
+        print(f"Re-queued {store.reset({'error'})} errored contract(s).")
+
+    needs_rpc = args.watch or args.from_block is not None
+    if needs_rpc and rpc is None:
+        print("error: --watch/--from-block need an RPC endpoint (--rpc-url or $RPC_URL)", file=sys.stderr)
+        return 2
+    try:
+        if args.from_block is not None and not args.watch:
+            end = args.to_block if args.to_block is not None else rpc.block_number()
+            print(f"Discovering contracts deployed in {args.chain} blocks {args.from_block}..{end}")
+            added += discover_blocks(store, rpc, args.chain, args.from_block, end, cfg)
+        print(f"Queued {added} new contract(s); {store.pending_count()} pending in total.")
+        if args.watch:
+            watch(store, rpc, args.chain, cfg, poll=args.poll, from_block=args.from_block)
+        else:
+            tally = run_queue(store, cfg, limit=args.limit)
+            print("This run: " + (", ".join(f"{k}={v}" for k, v in sorted(tally.items())) or "nothing due"))
+    except ExplorerFatal as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\nStopped. Progress is saved; run the same command to continue.")
+    print(f"Summary: {args.out / 'SUMMARY.md'}")
+    return 1 if args.fail_on_vulnerable and store.counts().get("vulnerable") else 0
+
+
+def cmd_status(args) -> int:
+    store = _store(args)
+    counts = store.counts()
+    print("  ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "queue is empty")
+    for r in store.by_status("vulnerable"):
+        print(f"  VULNERABLE [{r['max_severity']}] {r['chain']}:{r['address']} {r['name'] or ''} -> {r['report']}")
+    if args.errors:
+        for r in store.by_status("error"):
+            print(f"  ERROR {r['chain']}:{r['address']}: {r['error']}")
+    return 0
+
+
 def cmd_detectors(_args) -> int:
     for d in sorted(DETECTORS, key=lambda d: (SEVERITY_RANK[d.severity], d.id)):
         print(f"{d.severity:9} {d.id:34} {d.title}")
@@ -125,6 +195,31 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--api-key", help="explorer API key (default: $ETHERSCAN_API_KEY)")
     _add_scan_options(g)
     g.set_defaults(func=cmd_program)
+
+    a = sub.add_parser("auto", help="scan contracts one after another: SAFE / VULNERABLE (fund theft only)")
+    a.add_argument("--addresses", action="append", help="file with one `0x...` or `chain:0x...` per line (repeatable)")
+    a.add_argument("--address", action="append", help="single address (repeatable)")
+    a.add_argument("--scope", action="append", help="program scope JSON; its address assets are queued (repeatable)")
+    a.add_argument("--chain", default="ethereum", help="default chain for addresses and block discovery")
+    a.add_argument("--from-block", type=int, help="discover contracts deployed from this block")
+    a.add_argument("--to-block", type=int, help="last block to discover (default: chain head)")
+    a.add_argument("--watch", action="store_true", help="keep following new blocks and scan every new contract")
+    a.add_argument("--poll", type=float, default=15.0, help="seconds between polls in --watch (default 15)")
+    a.add_argument("--rpc-url", help="JSON-RPC endpoint (default: $RPC_URL)")
+    a.add_argument("--api-key", help="explorer API key (default: $ETHERSCAN_API_KEY)")
+    a.add_argument("--min-balance", type=float, default=0.0, help="skip contracts holding less native coin than this (needs RPC)")
+    a.add_argument("--limit", type=int, help="process at most N contracts this run")
+    a.add_argument("--retry-errors", action="store_true", help="re-queue contracts that errored before")
+    a.add_argument("--fail-on-vulnerable", action="store_true", help="exit 1 if any contract is VULNERABLE")
+    a.add_argument("--out", type=Path, default=Path("reports/auto"))
+    a.add_argument("--cache", type=Path, default=Path(".bountyscan"))
+    a.add_argument("--state", type=Path, default=Path(".bountyscan/state.db"))
+    a.set_defaults(func=cmd_auto)
+
+    st = sub.add_parser("status", help="show auto-scan progress and vulnerable contracts")
+    st.add_argument("--state", type=Path, default=Path(".bountyscan/state.db"))
+    st.add_argument("--errors", action="store_true", help="also list errored contracts")
+    st.set_defaults(func=cmd_status)
 
     d = sub.add_parser("detectors", help="list available detectors")
     d.set_defaults(func=cmd_detectors)

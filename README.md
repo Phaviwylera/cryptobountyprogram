@@ -41,7 +41,40 @@ bountyscan scan src --fail-on high --format sarif
 bountyscan detectors                 # list every check
 ```
 
-Each run writes `reports/<name>-<timestamp>/`:
+### Automatic mode: SAFE / VULNERABLE, contract after contract
+
+`bountyscan auto` works through a queue of contracts. For each one it fetches the verified source and checks the balance,
+then scans it. Only **fund-theft** bugs (critical/high) count. Each contract is marked **SAFE** or **VULNERABLE** and the
+scan moves on. Progress is saved in `.bountyscan/state.db`, so a stopped run continues where it left off and no contract
+is scanned twice.
+
+```bash
+export ETHERSCAN_API_KEY=...  RPC_URL=https://ethereum-rpc.publicnode.com
+
+bountyscan auto --addresses targets.txt                  # list: one `0x...` or `chain:0x...` per line
+bountyscan auto --scope programs/acme.json               # every address in a bounty program
+bountyscan auto --from-block 21000000 --to-block 21000500   # every contract deployed in a block range
+bountyscan auto --watch --min-balance 1                  # follow the chain live; skip contracts holding < 1 ETH
+bountyscan status                                        # progress + list of VULNERABLE contracts
+```
+
+Output in `reports/auto/`:
+
+| File | Content |
+|---|---|
+| `SUMMARY.md` | Counts per status and the VULNERABLE contracts, worst first, then by balance |
+| `vulnerable/<chain>/<address>/REPORT.md` | For each finding: **what's wrong** (with the code), **how it can be exploited** step by step, **impact**, and **how to fix it** with example code |
+| `vulnerable/<chain>/<address>/findings.json` | Machine-readable version |
+| `safe.txt` | Contracts with no fund-theft pattern |
+
+Statuses: `safe`, `vulnerable`, `unverified` (retried automatically with back-off: 10 min, 20 min, 40 min, ...),
+`unverified_final`, `low_value` (below `--min-balance`), `no_code`, `error` (re-queue with `--retry-errors`).
+
+Minor bugs are ignored in this mode: precision loss, weak randomness, unchecked returns and stale-oracle hygiene.
+**SAFE means no fund-theft pattern was detected. It is not a guarantee**, because logic bugs need a human. Watch mode sees
+contracts deployed directly by transactions, but not ones created internally by factories.
+
+Each `scan`/`program` run writes `reports/<name>-<timestamp>/`:
 
 | File | Purpose |
 |---|---|

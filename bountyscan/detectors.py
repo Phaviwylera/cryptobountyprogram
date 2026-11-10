@@ -94,7 +94,7 @@ AUTH_BODY_RE = re.compile(
 )
 # `address caller = _msgSender(); if (caller != authority()) revert ...;`
 SENDER_ALIAS_RE = re.compile(rf"\b(\w+)\s*=\s*{SENDER}\s*;")
-REENTRANCY_GUARD_RE = re.compile(r"reentr|^lock$|^nonReentrant|^mutex", re.I)
+REENTRANCY_GUARD_RE = re.compile(r"re.?entr|^lock(ed)?$|nonreentrant|noreenter|noentry|^mutex|synchronized|globallock", re.I)
 # set-once guards: require(_implementation() == address(0)), if (owner != address(0)) revert ...
 ONE_TIME_GUARD_RE = re.compile(
     r"require\s*\([^;]*==\s*address\s*\(\s*0\s*\)|if\s*\([^;{]*!=\s*address\s*\(\s*0\s*\)[^;{]*\)\s*(?:revert|\{\s*revert)"
@@ -170,6 +170,23 @@ def root_identifier(expr: str) -> str:
     return m.group(0) if m else ""
 
 
+def is_immutable(contract, ident: str) -> bool:
+    """Is `ident` a state variable declared immutable or constant (a fixed, trusted address)?"""
+    if not ident:
+        return False
+    return bool(re.search(rf"\b(?:immutable|constant)\b[^;]*\b{re.escape(ident)}\b\s*[=;]"
+                          rf"|\b{re.escape(ident)}\b[^;]*\b(?:immutable|constant)\b", contract.text))
+
+
+def target_whitelisted(fn, target: str) -> bool:
+    """Is the call target parameter gated by a membership/allow-list require in the body?"""
+    body = fn.body or ""
+    return bool(re.search(
+        rf"require\s*\(\s*\w*(?:[Aa]pproved|[Ww]hitelist|[Aa]llow\w*|isValid|trusted)\w*\s*\[\s*{re.escape(target)}\s*\]"
+        rf"|require\s*\(\s*\w+\s*\[\s*{re.escape(target)}\s*\]"
+        rf"|if\s*\(\s*!\s*\w+\s*\[\s*{re.escape(target)}\s*\]\s*\)", body))
+
+
 def entrypoints(project: Project, mutating: bool = True) -> Iterator[Function]:
     for fn in project.functions():
         if fn.is_entrypoint and (fn.is_mutating or not mutating):
@@ -206,6 +223,14 @@ def _privileged(project: Project):
             continue  # user-scoped state, e.g. prefs[msg.sender]
         if not (fn.body or "").strip():
             continue
+        # Permissionless sweep/collect/skim that only moves funds to a FIXED immutable address, with no
+        # address parameter and no privileged state change, cannot redirect funds - an intentional keeper pattern.
+        if re.match(r"^_?(?:sweep|collect|skim|harvest|rescue)\w*$", fn.name, re.I) and not fn.params_of_type("address"):
+            recips = re.findall(r"(?:payable\s*\(\s*)?(\w+)\s*\)?\s*\.(?:transfer|send|call)\s*[\({]"
+                                r"|\.safeTransfer\s*\(\s*(\w+)", fn.body or "")
+            flat = {r for pair in recips for r in pair if r}
+            if flat and all(is_immutable(fn.contract, r) for r in flat):
+                continue
         sev = "critical" if CRITICAL_PRIVILEGED_RE.search(fn.name) else "high"
         yield Hit(fn, fn.offset, f"`{fn.name}` is {fn.visibility or 'public'} with no access control "
                   f"(modifiers: {', '.join(fn.modifiers) or 'none'}).", severity=sev, absolute=True)
@@ -370,7 +395,8 @@ def _selfdestruct(project: Project):
 )
 def _reentrancy(project: Project):
     call_re = re.compile(
-        r"\.call\s*\{|\.call\s*\(|safeTransferETH\s*\(|\.sendValue\s*\(|\b_safeMint\s*\(|\.onERC721Received\s*\(|\.tokensReceived\s*\("
+        r"\.call\s*\{|\.call\s*\(|\.call\s*\.\s*value\s*\(|safeTransferETH\s*\(|\.sendValue\s*\("
+        r"|\b_safeMint\s*\(|\.onERC721Received\s*\(|\.tokensReceived\s*\("
     )
     for fn in entrypoints(project):
         if any(REENTRANCY_GUARD_RE.search(m) for m in fn.modifiers):
@@ -379,13 +405,23 @@ def _reentrancy(project: Project):
         call = call_re.search(body)
         if not call:
             continue
+        # A call to a fixed immutable/constant address is not attacker-controllable reentry.
+        receiver = root_identifier(expression_before(body, call.start())) if body[call.start()] == "." else ""
+        if receiver and is_immutable(fn.contract, receiver):
+            continue
         _, stmt_end = statement_bounds(body, call.start())
-        after = body[stmt_end:]
-        writes = [
-            v for v in project.state_vars
-            if re.search(rf"(?<![.\w]){re.escape(v)}\b\s*(?:\[[^;]*?\]\s*)*(?:\.\w+\s*)*(?:[+\-*/]?=(?!=)|\+\+|--)", after)
-            or re.search(rf"\bdelete\s+{re.escape(v)}\b", after)
-        ]
+        before, after = body[:call.start()], body[stmt_end:]
+        writes = []
+        for v in project.state_vars:
+            w = (re.search(rf"(?<![.\w]){re.escape(v)}\b\s*(?:\[[^;]*?\]\s*)*(?:\.\w+\s*)*(?:[+\-*/]?=(?!=)|\+\+|--)", after)
+                 or re.search(rf"\bdelete\s+{re.escape(v)}\b", after))
+            if not w:
+                continue
+            # Skip an inline-mutex RELEASE: a var set to a bool/guarded at entry and reset after the call.
+            if re.search(rf"(?<![.\w]){re.escape(v)}\b\s*=\s*(?:true|false|1|0|_?(?:ENTERED|NOT_ENTERED|_TRUE|_FALSE))\b", before) \
+               or re.search(rf"require\s*\(\s*!?\s*{re.escape(v)}\b", before):
+                continue
+            writes.append(v)
         if not writes:
             continue
         native = not re.match(r"\b_safeMint|\.onERC721Received|\.tokensReceived", call.group(0))
@@ -416,7 +452,7 @@ def _arbitrary_call(project: Project):
             args, _ = call_args(body, m.end() - 1)
             if target in fn.param_names and args and any(
                 re.search(rf"\b{re.escape(b)}\b", args[0]) for b in bytes_params
-            ):
+            ) and not target_whitelisted(fn, target):
                 yield Hit(fn, m.start(), f"`{target}.{m.group(1)}(...)` uses a caller-supplied target and calldata.")
 
 
@@ -499,12 +535,18 @@ def _unchecked_erc20(project: Project):
     ["https://rekt.news/mango-markets-rekt/", "https://blog.openzeppelin.com/secure-smart-contract-guidelines-the-dangers-of-price-oracles"],
 )
 def _spot_oracle(project: Project):
+    amm_infra = re.compile(r"Router|Library|Pair$|Quoter|Factory|Uniswap|Sushi|Pancake|Swapper|Zap|Aggregator|Lens", re.I)
+    valuation = re.compile(r"collateral|borrow|liquidat|oracle|healthFactor|\bltv\b|getPrice|latestPrice|priceOf|valueOf|totalValue|getValue|exchangeRate|pricePerShare|sharePrice|_?mint\w*\s*\(|debt", re.I)
     for fn in project.functions():
         body = fn.body or ""
         m = re.search(r"\.getReserves\s*\(|\.slot0\s*\(|\bget_dy\s*\(|\.getAmountsOut\s*\(", body)
-        if not m:
+        if not m or fn.contract.kind == "library" or amm_infra.search(fn.contract.name):
             continue
         if re.search(r"observe\s*\(|consult\s*\(|twap|TWAP|cumulative", fn.contract.text):
+            continue
+        if re.search(r"amount\w*Min\w*|min\w*Out\w*|INSUFFICIENT_OUTPUT|slippage", body, re.I):
+            continue  # reserves used to execute a slippage-protected swap, not to value anything
+        if not (valuation.search(fn.name) or valuation.search(fn.contract.text)):
             continue
         yield Hit(fn, m.start(), f"`{fn.name}` reads spot AMM state (`{m.group(0).strip('.( ')}`) with no TWAP in the contract.")
 
@@ -615,8 +657,36 @@ def _sig_replay(project: Project):
 FLASH_CALLBACKS = {
     "onFlashLoan", "executeOperation", "receiveFlashLoan", "uniswapV2Call", "pancakeCall",
     "uniswapV3SwapCallback", "uniswapV3FlashCallback", "pancakeV3SwapCallback", "algebraSwapCallback",
-    "callFunction", "onMorphoFlashLoan", "hook",
+    "callFunction", "onMorphoFlashLoan", "hook", "unlockCallback", "lockAcquired",
 }
+# Named callback families whose name alone is a reliable signal.
+CALLBACK_NAME_RE = re.compile(
+    r"^(?:\w+FlashLoanCall|\w+(?:Swap|Flash|Mint|Pay)Callback|unlockCallback|lockAcquired"
+    r"|receiveFlashLoan|executeOperation|onFlashLoan|onMorpho\w+)$"
+)
+# Known Uniswap-V2-fork flash-swap callbacks end in `Call` (NOT `AndCall`), with signature
+# (address sender, uint amount0, uint amount1, bytes data). ERC677/ERC1363 transferAndCall/
+# approveAndCall are excluded by shape: they start with a token verb and carry no leading address+bytes.
+V2_CALL_NAME_RE = re.compile(r"^[a-z]\w*Call$")
+V2_CALL_EXCLUDE = re.compile(r"^(?:transfer|approve|send|mint|burn|deposit|withdraw|safe|multi|pre|post|try|external|internal|low|static|delegate)\w*", re.I)
+# msg.sender actually compared (to the pool/lender), or validated via a callback-validation helper.
+SENDER_AUTH_RE = re.compile(
+    rf"{SENDER}\s*[!=]=|[!=]=\s*{SENDER}\b|verifyCallback\s*\(|CallbackValidation\.|_verifyCallback\w*\s*\("
+    r"|_validate\w*(?:Pool|Caller|Pair|Sender)\w*\s*\(|require\s*\(\s*\w+\s*\[\s*" + SENDER + r"\s*\]"
+)
+INITIATOR_PARAMS = {"initiator", "sender", "_initiator", "_sender", "origin", "initiator_", "sender_", "borrower"}
+
+
+def _is_callback(fn) -> bool:
+    name = fn.name
+    if name in FLASH_CALLBACKS or CALLBACK_NAME_RE.match(name):
+        return True
+    # V2-fork flash-swap callback: name ends in ...Call, not a token verb, and has the
+    # (address, uint, uint, bytes) shape - first param address, last param bytes.
+    if V2_CALL_NAME_RE.match(name) and not V2_CALL_EXCLUDE.match(name) and "AndCall" not in name:
+        p = fn.params
+        return bool(p) and p[0].type.startswith("address") and any(x.type.startswith("bytes") for x in p)
+    return False
 
 
 @detector(
@@ -624,21 +694,30 @@ FLASH_CALLBACKS = {
     "Flash-loan / swap callback does not authenticate the caller",
     "critical",
     "Anyone can invoke the callback directly with crafted data, making the contract pay out, approve, or execute arbitrary actions with its own funds.",
-    "Require msg.sender to be the expected pool/lender, and that `initiator`/`sender` equals address(this).",
+    "Require msg.sender to be the expected pool/lender (verify via the factory, e.g. getPair/getPool/computeAddress), and that `initiator`/`sender` equals address(this).",
     ["https://rekt.news/dodo-rekt/"],
 )
 def _flash_callback(project: Project):
     for fn in entrypoints(project):
-        if fn.name not in FLASH_CALLBACKS:
+        if not _is_callback(fn):
             continue
         body = fn.body or ""
-        if not (uses_sender(fn) or access_controlled(fn, project)):
-            yield Hit(fn, fn.offset, f"`{fn.name}` never checks msg.sender.", absolute=True)
+        authed = SENDER_AUTH_RE.search(body) or access_controlled(fn, project)
+        pays_sender = re.search(rf"\.(?:transfer|safeTransfer|call\s*\{{[^}}]*value)\s*\(\s*{SENDER}\b", body)
+        if not authed:
+            extra = " and pays msg.sender without verifying it is the pool" if pays_sender else ""
+            yield Hit(fn, fn.offset, f"`{fn.name}` does not compare msg.sender to the expected pool/lender{extra}.", absolute=True)
             continue
-        initiator = next((p for p in fn.param_names if p in ("initiator", "sender", "_initiator", "_sender")), None)
-        if initiator and not re.search(rf"\b{initiator}\b", body):
-            yield Hit(fn, fn.offset, f"`{fn.name}` checks the caller but ignores `{initiator}` - another user can start the loan into this contract.",
-                      severity="high", absolute=True)
+        # Caller is checked; now the initiator/sender argument must be pinned to address(this),
+        # not merely referenced (logging or decoding it proves nothing).
+        initiator = next((p for p in fn.param_names if p.lower() in INITIATOR_PARAMS), None)
+        if initiator:
+            pinned = re.search(
+                rf"(?:require|if)\s*\([^;{{]*(?:\b{re.escape(initiator)}\s*[!=]=\s*(?:address\s*\(\s*this\s*\)|\w+)"
+                rf"|(?:address\s*\(\s*this\s*\)|\w+)\s*[!=]=\s*{re.escape(initiator)}\b)", body)
+            if not pinned:
+                yield Hit(fn, fn.offset, f"`{fn.name}` checks the caller but never pins `{initiator}` to address(this) - "
+                          "another user can start the loan into this contract.", severity="high", absolute=True)
 
 
 # --------------------------------------------------------------------------- arithmetic / randomness
