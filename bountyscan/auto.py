@@ -37,6 +37,24 @@ class AutoConfig:
     retry_base: float = 600.0      # seconds; doubles each attempt (10m, 20m, 40m, ...)
     verify: bool = True            # independent second pass must confirm each finding
     quiet: bool = False
+    on_stage: object = None        # optional callback(stage_text) - the dashboard's live step display
+    on_event: object = None        # optional callback(kind, message) - the dashboard's activity feed
+
+
+def _stage(cfg: AutoConfig, text: str) -> None:
+    if callable(cfg.on_stage):
+        try:
+            cfg.on_stage(text)
+        except Exception:
+            pass
+
+
+def _event(cfg: AutoConfig, kind: str, msg: str) -> None:
+    if callable(cfg.on_event):
+        try:
+            cfg.on_event(kind, msg)
+        except Exception:
+            pass
 
 
 def parse_address_lines(text: str, default_chain: str) -> list[tuple[str, str]]:
@@ -61,7 +79,9 @@ def process(store, row, cfg: AutoConfig) -> str:
     chain, address = row["chain"], row["address"]
 
     balance = None
+    short = f"{address[:8]}…{address[-4:]}"
     if cfg.rpc is not None:
+        _stage(cfg, f"Checking code & balance of {short}")
         try:
             if cfg.rpc.code(address) in ("0x", "0x0", ""):
                 store.update(chain, address, status="no_code")
@@ -74,6 +94,7 @@ def process(store, row, cfg: AutoConfig) -> str:
             store.update(chain, address, status="low_value", balance_wei=str(balance))
             return "low_value"
 
+    _stage(cfg, f"Fetching verified source of {short} from the explorer")
     try:
         src = fetch_verified_source(address, chain, cfg.cache_dir / "onchain", cfg.api_key)
     except NotVerified:
@@ -86,13 +107,15 @@ def process(store, row, cfg: AutoConfig) -> str:
         return "unverified"
 
     meta = read_meta(src)
+    name = meta.get("contract_name") or ""
+    _stage(cfg, f"Scanning {name or short} with all fund-theft detectors")
     result = scan([src], min_severity="high")
     candidates = [f for f in result.findings if is_fund_theft(f)]
-    name = meta.get("contract_name") or ""
 
     theft = candidates
     verdicts = None
     if candidates and cfg.verify:
+        _stage(cfg, f"Independently re-verifying {len(candidates)} candidate(s) in {name or short}")
         try:
             verdicts = verify_findings(candidates, chain, address, cfg.cache_dir, cfg.api_key)
             theft = confirmed_findings(verdicts)
@@ -150,10 +173,12 @@ def run_queue(store, cfg: AutoConfig, limit: int | None = None) -> dict[str, int
 def discover_blocks(store, rpc: RPC, chain: str, start: int, end: int, cfg: AutoConfig) -> int:
     found = 0
     for n in range(start, end + 1):
+        _stage(cfg, f"Reading block {n:,} on {chain} for new contract deployments")
         for addr in rpc.created_contracts(n):
             if ADDRESS_RE.match(addr) and store.enqueue(chain, addr, f"block:{n}"):
                 found += 1
                 _log(cfg, f"  + block {n}: new contract {addr}")
+                _event(cfg, "found", f"New contract {addr} deployed in block {n:,}")
         store.set_cursor(chain, n)
     return found
 

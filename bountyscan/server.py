@@ -17,6 +17,7 @@ The UI is served from /.
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import threading
@@ -49,6 +50,26 @@ class Worker:
         self.last_error = None
         self.started_at = None
         self.scanned = 0
+        # live progress for the dashboard
+        self.stage = "Idle"
+        self.stage_at = time.time()
+        self._seq = 0
+        self.events: collections.deque = collections.deque(maxlen=200)
+        self.batches: list[dict] = []     # Immunefi/program scans: {program, items, started}
+        cfg.on_stage = self.set_stage
+        cfg.on_event = self.add_event
+
+    def set_stage(self, text: str) -> None:
+        self.stage = text
+        self.stage_at = time.time()
+
+    def add_event(self, kind: str, msg: str) -> None:
+        self._seq += 1
+        self.events.append({"id": self._seq, "t": time.time(), "kind": kind, "msg": msg})
+
+    def add_batch(self, program: str, items: list[tuple[str, str]]) -> None:
+        self.batches.append({"program": program, "items": [(c.lower(), a.lower()) for c, a in items], "started": time.time()})
+        self.batches = self.batches[-10:]
 
     def _run(self):
         while not self._stop.is_set():
@@ -57,6 +78,13 @@ class Worker:
                     self._discover_step()
                 did = self._scan_step()
                 if not did:
+                    if self.mode == "draining" and not self.store.pending_count():
+                        self.mode = "idle"
+                        self.set_stage("Idle - queue finished")
+                        self.add_event("info", "All queued contracts processed.")
+                        break
+                    self.set_stage(f"Waiting for new blocks on {self.chain}…" if self.mode == "live"
+                                   else "Waiting for contracts that are not verified yet (retrying on schedule)…")
                     time.sleep(3.0)
             except ExplorerFatalGuard as exc:
                 self.last_error = str(exc)
@@ -99,11 +127,24 @@ class Worker:
             from .contract_report import write_summary
             write_summary(self.store, self.cfg.out_dir)
         self.current = {"chain": row["chain"], "address": row["address"], "status": status}
+        done = self.store.fetch_one(row["chain"], row["address"])
+        name = (done["name"] if done and done["name"] else "")
+        label = f"{row['address']}" + (f" ({name})" if name else "")
+        text = {
+            "vulnerable": f"VULNERABLE - {label}: {done['findings'] if done else '?'} confirmed fund-theft finding(s), worst {done['max_severity'] if done else '?'}. Report saved.",
+            "safe": f"SAFE - {label}: no fund-theft pattern" + (f" {done['error']}" if done and done['error'] else "") + ".",
+            "unverified": f"Not verified on the explorer yet - {label}. Will retry automatically.",
+            "unverified_final": f"Gave up - {label} was never verified.",
+            "no_code": f"Skipped - {label} has no code (self-destructed or EOA).",
+            "low_value": f"Skipped - {label} holds less than the minimum balance.",
+            "error": f"Error - {label}: {done['error'] if done else ''}",
+        }.get(status, f"{status} - {label}")
+        self.add_event(status, text)
         return True
 
     def ensure_thread(self):
+        self._stop.clear()   # a Start right after Stop must cancel the pending stop
         if self._thread is None or not self._thread.is_alive():
-            self._stop.clear()
             self._thread = threading.Thread(target=self._run, daemon=True, name="bountyscan-worker")
             self._thread.start()
 
@@ -115,16 +156,34 @@ class Worker:
         self.min_balance_wei = min_balance_wei
         self.mode = "live"
         self.started_at = self.started_at or time.time()
+        self.set_stage(f"Starting live scan on {chain}…")
+        self.add_event("info", f"Live scan started on {chain}" + (f" from block {from_block:,}" if from_block else " at the chain head") + ".")
         self.ensure_thread()
 
     def start_drain(self):
-        self.mode = "draining"
+        if self.mode != "live":   # live mode already drains the queue too
+            self.mode = "draining"
         self.started_at = self.started_at or time.time()
         self.ensure_thread()
 
     def stop(self):
         self.mode = "idle"
         self._stop.set()
+        self.set_stage("Stopped")
+        self.add_event("info", "Scanning stopped. The current contract finishes, then the worker pauses.")
+
+    def _batch_progress(self) -> list[dict]:
+        out = []
+        for b in self.batches:
+            statuses = []
+            for c, a in b["items"]:
+                r = self.store.fetch_one(c, a)
+                statuses.append(r["status"] if r else "queued")
+            done = sum(s not in ("queued", "unverified") for s in statuses)
+            out.append({"program": b["program"], "total": len(statuses), "done": done,
+                        "waiting_verification": statuses.count("unverified"),
+                        "vulnerable": statuses.count("vulnerable"), "safe": statuses.count("safe")})
+        return out
 
     def snapshot(self):
         # Do NOT take self.lock here: the worker holds it for a whole scan (network fetches,
@@ -143,6 +202,10 @@ class Worker:
             "last_error": self.last_error,
             "started_at": self.started_at,
             "verify": self.cfg.verify,
+            "stage": self.stage,
+            "stage_age": round(time.time() - self.stage_at, 1),
+            "events": list(self.events)[-60:],
+            "batches": self._batch_progress(),
         }
 
 
@@ -228,19 +291,20 @@ class Handler(BaseHTTPRequestHandler):
                 w.stop()
                 return self._send(200, {"ok": True, "mode": w.mode})
             if u.path == "/api/enqueue":
+                from .sources import ADDRESS_RE
                 chain = b.get("chain", cfg_default_chain())
-                added = 0
-                for a in b.get("addresses", []):
-                    from .sources import ADDRESS_RE
-                    a = a.strip()
-                    if ADDRESS_RE.match(a):
-                        added += w.store.enqueue(chain, a, "web")
+                items = [(chain, a.strip()) for a in b.get("addresses", []) if ADDRESS_RE.match(a.strip())]
+                added = sum(w.store.enqueue(c, a, "web") for c, a in items)
+                if items:
+                    w.add_batch("manual list", items)
+                    w.add_event("info", f"Queued {len(items)} contract(s) ({added} new).")
                 w.start_drain()
-                return self._send(200, {"ok": True, "added": added})
+                return self._send(200, {"ok": True, "added": added, "total": len(items)})
             if u.path == "/api/immunefi/scan":
                 added, program = self._queue_immunefi(b)
                 w.start_drain()
-                return self._send(200, {"ok": True, "added": added, "program": program})
+                total = w.batches[-1]["items"].__len__() if w.batches else 0
+                return self._send(200, {"ok": True, "added": added, "program": program, "total": total})
             return self._send(404, {"error": "not found"})
         except Exception as exc:
             return self._send(400, {"error": str(exc)})
@@ -251,10 +315,11 @@ class Handler(BaseHTTPRequestHandler):
             scope = load_scope(Path(b["scope_path"]))
         else:
             scope = {"program": b.get("program", "manual"), "assets": b.get("assets", [])}
-        added = 0
-        for a in scope["assets"]:
-            if "address" in a:
-                added += self.worker.store.enqueue(a["chain"], a["address"], f"immunefi:{scope['program']}")
+        items = [(a["chain"], a["address"]) for a in scope["assets"] if "address" in a and a.get("chain")]
+        added = sum(self.worker.store.enqueue(c, a, f"immunefi:{scope['program']}") for c, a in items)
+        if items:
+            self.worker.add_batch(scope["program"], items)
+            self.worker.add_event("info", f"Program '{scope['program']}': queued {len(items)} in-scope contract(s) ({added} new).")
         return added, scope["program"]
 
     @staticmethod
