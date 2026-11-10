@@ -127,8 +127,10 @@ class Worker:
         self._stop.set()
 
     def snapshot(self):
-        with self.lock:
-            counts = self.store.counts()
+        # Do NOT take self.lock here: the worker holds it for a whole scan (network fetches,
+        # verification) which can take tens of seconds and would freeze the dashboard.
+        # The Store has its own short internal lock, which is all a read needs.
+        counts = self.store.counts()
         return {
             "mode": self.mode,
             "chain": self.chain,

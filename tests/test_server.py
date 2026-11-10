@@ -66,6 +66,14 @@ class ServerSmokeTests(unittest.TestCase):
             _, body = self.get(ep)
             self.assertIn(key, json.loads(body))
 
+    def test_status_responds_while_a_scan_is_running(self):
+        # The worker holds its lock for an entire (slow, networked) scan. The dashboard must not freeze.
+        with Handler.worker.lock:
+            status, body = self.get("/api/status")
+            self.assertEqual(status, 200)
+            _, body = self.get("/api/results")
+            self.assertIn("results", json.loads(body))
+
     def test_live_start_without_rpc_errors_cleanly(self):
         # worker has no rpc; starting live scan should 400, not crash
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/live/start",
