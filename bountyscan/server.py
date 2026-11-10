@@ -196,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/result":
             chain = (q.get("chain") or [""])[0].lower()
             addr = (q.get("addr") or [""])[0].lower()
-            row = w.store.db.execute("SELECT * FROM contracts WHERE chain=? AND address=?", (chain, addr)).fetchone()
+            row = w.store.fetch_one(chain, addr)
             if not row or not row["report"]:
                 return self._send(404, {"error": "no report"})
             rep = Path(row["report"])

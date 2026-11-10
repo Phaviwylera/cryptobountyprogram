@@ -41,6 +41,29 @@ bountyscan scan src --fail-on high --format sarif
 bountyscan detectors                 # list every check
 ```
 
+### Web dashboard (and 24/7 EC2 deployment)
+
+A tech dashboard with two buttons — **Live Scan** and **Immunefi Scan** — and a **Results** page.
+
+```bash
+bountyscan serve --port 8080           # http://127.0.0.1:8080
+```
+
+- **Live Scan** follows the chain continuously: it fetches every newly deployed verified contract,
+  scans it, independently re-confirms any finding, saves a report if vulnerable, and moves to the
+  next — automatically, 24/7.
+- **Immunefi Scan** takes a bounty program's in-scope addresses (or a saved scope file) and scans them.
+- Every confirmed fund-theft finding appears on the Results page with its full report.
+
+To run it on EC2 around the clock (Docker or systemd, behind nginx with a login), see
+**[deploy/README.md](deploy/README.md)** — there is a one-command `deploy/ec2-setup.sh` bootstrap.
+
+Each finding is **independently re-verified** by a second pass (`bountyscan/verifier.py`): the source
+is re-fetched fresh and every finding re-derived with class-specific counter-checks (looking for an
+auth modifier, a reentrancy guard, a nonce, a slippage floor, …). Only findings that reproduce and
+are not refuted are saved; the rest are held back for manual review. This is the "rerun and confirm
+with a separate pass" step — it keeps the Results page to high-confidence leads.
+
 ### Automatic mode: SAFE / VULNERABLE, contract after contract
 
 `bountyscan auto` works through a queue of contracts. For each one it fetches the verified source and checks the balance,

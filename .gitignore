@@ -12,3 +12,9 @@ templates/poc/out/
 templates/poc/cache/
 templates/poc/lib/
 .env
+
+# deployment secrets - never commit
+deploy/.env
+deploy/.htpasswd
+deploy/certs/
+data/

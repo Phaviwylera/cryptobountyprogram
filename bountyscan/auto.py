@@ -115,7 +115,7 @@ def process(store, row, cfg: AutoConfig) -> str:
 
 
 def _describe(status: str, store, chain: str, address: str) -> str:
-    row = store.db.execute("SELECT * FROM contracts WHERE chain=? AND address=?", (chain, address)).fetchone()
+    row = store.fetch_one(chain, address)
     bal = f"  {int(row['balance_wei']) / WEI:.4f} native" if row["balance_wei"] else ""
     name = f" {row['name']}" if row["name"] else ""
     if status == "vulnerable":

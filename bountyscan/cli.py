@@ -152,6 +152,16 @@ def cmd_auto(args) -> int:
     return 1 if args.fail_on_vulnerable and store.counts().get("vulnerable") else 0
 
 
+def cmd_serve(args) -> int:
+    import os
+
+    from .server import serve
+    serve(args.host, args.port, args.out, args.cache, args.state,
+          args.api_key or os.environ.get("ETHERSCAN_API_KEY"),
+          args.rpc_url or os.environ.get("RPC_URL"), verify=not args.no_verify)
+    return 0
+
+
 def cmd_status(args) -> int:
     store = _store(args)
     counts = store.counts()
@@ -215,6 +225,17 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--cache", type=Path, default=Path(".bountyscan"))
     a.add_argument("--state", type=Path, default=Path(".bountyscan/state.db"))
     a.set_defaults(func=cmd_auto)
+
+    sv = sub.add_parser("serve", help="run the web dashboard (Live Scan + Immunefi Scan buttons)")
+    sv.add_argument("--host", default="127.0.0.1", help="bind address (use 0.0.0.0 behind a reverse proxy)")
+    sv.add_argument("--port", type=int, default=8080)
+    sv.add_argument("--rpc-url", help="JSON-RPC endpoint for live scan (default: $RPC_URL)")
+    sv.add_argument("--api-key", help="explorer API key (default: $ETHERSCAN_API_KEY)")
+    sv.add_argument("--no-verify", action="store_true", help="skip the independent confirmation pass")
+    sv.add_argument("--out", type=Path, default=Path("reports/auto"))
+    sv.add_argument("--cache", type=Path, default=Path(".bountyscan"))
+    sv.add_argument("--state", type=Path, default=Path(".bountyscan/state.db"))
+    sv.set_defaults(func=cmd_serve)
 
     st = sub.add_parser("status", help="show auto-scan progress and vulnerable contracts")
     st.add_argument("--state", type=Path, default=Path(".bountyscan/state.db"))

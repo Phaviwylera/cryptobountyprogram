@@ -21,3 +21,8 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - name: Self-scan fixtures (smoke)
         run: python -m bountyscan scan tests/fixtures/vulnerable --out /tmp/reports --format md,json,sarif
+      - name: CLI surface smoke
+        run: |
+          python -m bountyscan serve --help
+          python -m bountyscan auto --help
+          python -m bountyscan detectors

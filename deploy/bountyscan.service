@@ -1,0 +1,27 @@
+[Unit]
+Description=bountyscan DeFi vulnerability dashboard (24/7 live scan)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bountyscan
+WorkingDirectory=/opt/bountyscan
+# Secrets live here, readable only by the service user (chmod 600):
+EnvironmentFile=/opt/bountyscan/deploy/bountyscan.env
+ExecStart=/opt/bountyscan/.venv/bin/bountyscan serve \
+    --host 127.0.0.1 --port 8080 \
+    --out /opt/bountyscan/data/reports \
+    --cache /opt/bountyscan/data/cache \
+    --state /opt/bountyscan/data/state.db
+Restart=always
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/bountyscan/data
+
+[Install]
+WantedBy=multi-user.target

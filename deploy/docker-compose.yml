@@ -1,0 +1,31 @@
+services:
+  bountyscan:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      # set these in deploy/.env (never commit it)
+      ETHERSCAN_API_KEY: ${ETHERSCAN_API_KEY:?set ETHERSCAN_API_KEY in deploy/.env}
+      RPC_URL: ${RPC_URL:?set RPC_URL in deploy/.env}
+    volumes:
+      - bountyscan-data:/data
+    # Only expose to localhost on the host; nginx (below) is the public entry point.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - bountyscan
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./.htpasswd:/etc/nginx/.htpasswd:ro
+      - ./certs:/etc/nginx/certs:ro
+
+volumes:
+  bountyscan-data:
