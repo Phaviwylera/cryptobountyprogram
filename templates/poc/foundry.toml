@@ -1,0 +1,7 @@
+[profile.default]
+src = "src"
+test = "test"
+libs = ["lib"]
+# Forks only. Example:
+#   forge install foundry-rs/forge-std
+#   forge test --fork-url "$RPC_URL" --fork-block-number 21000000 -vvv

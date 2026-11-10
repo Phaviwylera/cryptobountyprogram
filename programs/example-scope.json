@@ -1,0 +1,18 @@
+{
+  "program": "ExampleProtocol",
+  "platform": "immunefi",
+  "submission_url": "https://immunefi.com/bug-bounty/<program-slug>/",
+  "security_contact": "security@example.org",
+  "max_bounty_usd": 100000,
+  "rules": [
+    "Only the assets listed here are in scope - copy them verbatim from the program page.",
+    "PoC required; it must run on a local fork. No testing on mainnet or public testnets.",
+    "No social engineering, phishing, DoS or attacks on third-party infrastructure.",
+    "Do not disclose publicly until the program confirms a fix."
+  ],
+  "assets": [
+    { "name": "Vault (proxy, implementation followed automatically)", "chain": "ethereum", "address": "0x0000000000000000000000000000000000000000" },
+    { "name": "Core repo", "git": "https://github.com/<org>/<repo>", "ref": "main", "subdir": "src" },
+    { "name": "Local checkout", "path": "../../my-local-audit/src" }
+  ]
+}

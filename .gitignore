@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+# fetched sources and scan output can contain program-private material
+.bountyscan/
+reports/
+# foundry
+templates/poc/out/
+templates/poc/cache/
+templates/poc/lib/
+.env
