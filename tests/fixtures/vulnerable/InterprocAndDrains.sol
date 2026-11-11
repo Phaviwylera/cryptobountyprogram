@@ -52,3 +52,17 @@ contract CrossFn {
         payable(msg.sender).transfer(c);
     }
 }
+
+// rescue that pays a CALLER-CHOSEN address - anyone drains it.
+contract CallerRescue {
+    function rescueToken(address tok, address to) external {
+        IERC20(tok).transferFrom(address(this), to, 1);
+    }
+    function rescueNative(address payable to) external {
+        _send(to);
+    }
+    function _send(address payable to) internal {
+        (bool ok, ) = to.call{value: address(this).balance}("");
+        require(ok);
+    }
+}

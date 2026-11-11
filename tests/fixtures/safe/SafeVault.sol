@@ -97,3 +97,21 @@ contract FactoryInitPair {
         token1 = _token1;
     }
 }
+
+// TimeLockEscrow pattern: anyone may trigger rescue, but funds only ever go to the immutable
+// refundAddress (directly or through an internal helper). Must NOT be flagged.
+interface IERC20R { function transfer(address, uint256) external returns (bool); function balanceOf(address) external view returns (uint256); }
+contract FixedBeneficiaryRescue {
+    address public immutable refundAddress;
+    IERC20R public immutable token;
+    constructor(address r, IERC20R t) { refundAddress = r; token = t; }
+    function rescueToken(address wrongToken) external {
+        require(wrongToken != address(token), "escrowed");
+        require(IERC20R(wrongToken).transfer(refundAddress, IERC20R(wrongToken).balanceOf(address(this))));
+    }
+    function rescueNative() external { _sendNative(refundAddress); }
+    function _sendNative(address to) internal {
+        (bool ok, ) = to.call{value: address(this).balance}("");
+        require(ok);
+    }
+}

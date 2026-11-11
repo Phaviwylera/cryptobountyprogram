@@ -64,6 +64,7 @@ class VulnerableFixtureTests(unittest.TestCase):
         self.assertDetected("unvalidated-flash-callback", "pancakeCall")
         self.assertDetected("arbitrary-transferfrom", "pull")
         self.assertDetected("arbitrary-approval", "allow")
+        self.assertDetected("unprotected-privileged-function", "rescueNative")  # pays a caller-chosen address
         self.assertDetected("cross-function-reentrancy", "borrow")
         self.assertDetected("reentrancy", "withdraw")  # state write in internal helper
 

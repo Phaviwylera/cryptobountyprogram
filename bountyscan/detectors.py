@@ -92,35 +92,53 @@ def effective_body(fn: Function, project: Project, depth: int = 1, _seen: frozen
         return body
     seen = _seen | {fn.name}
 
-    def repl(match: re.Match) -> str:
-        name = match.group("name")
+    type_names = {c.name for f in project.files for c in f.contracts if c.kind in ("library", "interface", "contract")}
+
+    def inline(name: str, start: int, args_text: str) -> str | None:
+        """Callee body with parameters bound to this call's arguments, or None to leave the call as is."""
         if name in _INLINE_SKIP:
-            return match.group(0)
+            return None
         callee = project.resolve_call(name)
-        if not (callee and callee is not fn and callee.body
-                and callee.visibility in (None, "internal", "private", "public")):
-            return match.group(0)
+        dotted = start > 0 and body[start - 1] == "."
+        receiver = expression_before(body, start - 1) if dotted else ""
+        self_call = receiver == "this"
+        allowed = ("internal", "private", "public", None) + (("external",) if self_call else ())
+        if not (callee and callee is not fn and callee.body and callee.visibility in allowed):
+            return None
         inner = effective_body(callee, project, depth - 1, seen)
         # Bind the callee's parameter names to the call's actual arguments so a forwarded
         # `data`/`target` reads as the caller's `routerData`/`strategy` (V14/V17 shapes).
-        raw_args = split_top_level(match.group("args"))
-        # `x.f(a)` via `using X for ...` passes the receiver as the first param; but a static library
-        # call `Lib.f(a,b)` does NOT (Lib is a type name, not an argument). Tell them apart by whether
-        # the receiver is a known library/contract name.
-        if match.start("name") > 0 and body[match.start("name") - 1] == ".":
-            receiver = expression_before(body, match.start("name") - 1)
-            recv_root = root_identifier(receiver)
-            type_names = {c.name for f in project.files for c in f.contracts if c.kind in ("library", "interface", "contract")}
-            if receiver and recv_root not in type_names:
-                raw_args = [receiver] + raw_args
+        raw_args = split_top_level(args_text)
+        # `x.f(a)` via `using X for ...` passes the receiver as the first param; a static library
+        # call `Lib.f(a,b)` does not (Lib is a type name), and neither does a `this.f(a)` self-call.
+        if dotted and receiver and root_identifier(receiver) not in type_names and not self_call:
+            raw_args = [receiver] + raw_args
         for p, a in zip(callee.params, raw_args):
             if p.name and a:
                 inner = re.sub(rf"(?<![.\w]){re.escape(p.name)}\b", lambda _m, a=a: a, inner)
         return " { " + inner + " } "
 
-    # Replace `name(...)` and `Lib.name(...)`/`x.name(...)` invocations with the (arg-bound) callee body.
-    pattern = re.compile(r"(?:(?<![.\w])|(?<=\.))(?P<name>[A-Za-z_]\w*)\s*\((?P<args>[^;{}]*)\)")
-    return pattern.sub(repl, body)
+    # Walk the body with real parenthesis matching. A call that is not inlined (a keyword such as
+    # `if`/`require`, or an external call) is kept, but we keep scanning INSIDE its parentheses so
+    # `if (!_tryRelease(to, amount))` still inlines `_tryRelease`.
+    call_start = re.compile(r"(?<!\w)([A-Za-z_]\w*)\s*\(")
+    out, i = [], 0
+    while True:
+        m = call_start.search(body, i)
+        if not m:
+            out.append(body[i:])
+            break
+        open_idx = m.end() - 1
+        close_idx = match_close(body, open_idx, "(", ")")
+        out.append(body[i:m.start()])
+        replacement = inline(m.group(1), m.start(), body[open_idx + 1:close_idx])
+        if replacement is None:
+            out.append(body[m.start():open_idx + 1])
+            i = open_idx + 1
+        else:
+            out.append(replacement)
+            i = close_idx + 1
+    return "".join(out)
 
 
 @dataclass
@@ -269,6 +287,27 @@ def is_immutable(contract, ident: str) -> bool:
                           rf"|\b{re.escape(ident)}\b[^;]*\b(?:immutable|constant)\b", contract.text))
 
 
+PAYOUT_RE = re.compile(
+    r"payable\s*\(\s*(\w+)\s*\)\s*\.\s*(?:transfer|send|call)\b"     # payable(x).transfer(...)
+    r"|(\w+)\s*\.\s*call\s*\{\s*value"                              # x.call{value: ...}
+    r"|\.\s*safeTransfer\s*\(\s*(\w+)\s*,"                          # token.safeTransfer(x, amt)
+    r"|\.\s*transfer\s*\(\s*(\w+)\s*,"                              # token.transfer(x, amt)
+    r"|sendValue\s*\(\s*(?:payable\s*\(\s*)?(\w+)"                  # Address.sendValue(x, amt)
+    r"|safeTransferETH\s*\(\s*(\w+)"                                # SafeTransferLib.safeTransferETH(x, amt)
+    r"|\bcall\s*\(\s*gas\s*\(\s*\)\s*,\s*(\w+)\s*,"                 # assembly { call(gas(), x, amt, ...) }
+)
+
+
+def payout_recipients(body: str) -> set[str]:
+    """Root identifiers that receive value (ETH or tokens) in a body."""
+    out = set()
+    for m in PAYOUT_RE.finditer(body):
+        r = next((g for g in m.groups() if g), None)
+        if r and r not in ("this", "address"):
+            out.add(r)
+    return out
+
+
 def target_whitelisted(fn, target: str) -> bool:
     """Is the call target parameter gated by a membership/allow-list require in the body?"""
     body = fn.body or ""
@@ -314,13 +353,14 @@ def _privileged(project: Project):
             continue  # user-scoped state, e.g. prefs[msg.sender]
         if not (fn.body or "").strip():
             continue
-        # Permissionless sweep/collect/skim that only moves funds to a FIXED immutable address, with no
-        # address parameter and no privileged state change, cannot redirect funds - an intentional keeper pattern.
-        if re.match(r"^_?(?:sweep|collect|skim|harvest|rescue)\w*$", fn.name, re.I) and not fn.params_of_type("address"):
-            recips = re.findall(r"(?:payable\s*\(\s*)?(\w+)\s*\)?\s*\.(?:transfer|send|call)\s*[\({]"
-                                r"|\.safeTransfer\s*\(\s*(\w+)", fn.body or "")
-            flat = {r for pair in recips for r in pair if r}
-            if flat and all(is_immutable(fn.contract, r) for r in flat):
+        # Permissionless sweep/rescue/collect/skim that only moves funds to a FIXED immutable/constant
+        # address cannot redirect funds: anyone can trigger it, but the money goes to its owner.
+        # Look through internal helpers (`_sendSurplus(refundAddress)`); an address parameter is fine
+        # (e.g. which token to rescue) as long as it is never the recipient.
+        if re.match(r"^_?(?:sweep|collect|skim|harvest|rescue|recover)\w*$", fn.name, re.I):
+            recipients = payout_recipients(effective_body(fn, project, depth=3))
+            if recipients and all(is_immutable(fn.contract, r) for r in recipients) \
+                    and not (recipients & fn.params_of_type("address")):
                 continue
         sev = "critical" if CRITICAL_PRIVILEGED_RE.search(fn.name) else "high"
         yield Hit(fn, fn.offset, f"`{fn.name}` is {fn.visibility or 'public'} with no access control "
@@ -581,7 +621,8 @@ def _hook_reentrancy(project: Project):
         for v in project.state_vars:
             written_after = (re.search(rf"(?<![.\w]){re.escape(v)}\b\s*(?:\[[^;]*?\]\s*)*(?:[+\-*/]?=(?!=)|\+\+|--)", after)
                              or re.search(rf"\bdelete\s+{re.escape(v)}\b", after))
-            checked_before = re.search(rf"(?:require|assert|if)\s*\([^;{{]*\b{re.escape(v)}\b", before)
+            check_re = rf"(?:require|assert|if)\s*\([^;{{]*\b{re.escape(v)}\b"
+            checked_before = re.search(check_re, before) or re.search(check_re, fn.body or "")
             if written_after and checked_before:
                 yield Hit(fn, fn.offset,
                           f"`{fn.name}` transfers/mints (hook can re-enter) before updating `{v}`, which it checked beforehand - "
@@ -755,7 +796,10 @@ def _delegatecall(project: Project):
             if not target:
                 args, _ = call_args(eff, m.end() - 1)
                 target = root_identifier(args[0]) if args else ""
-            if target in fn.param_names and not is_role_controlled(fn, project) and not ONE_TIME_GUARD_RE.search(eff):
+            # Guards are read from the ORIGINAL source: inlining `_implementation()` inside a
+            # `require(... == address(0))` would otherwise hide a one-time-init guard.
+            guarded = ONE_TIME_GUARD_RE.search(body) or ONE_TIME_GUARD_RE.search(eff)
+            if target in fn.param_names and not is_role_controlled(fn, project) and not guarded:
                 note = "" if in_original else f" (forwarded through a helper/library from `{fn.name}`)"
                 yield Hit(fn, orig_dc.start() if in_original else fn.offset,
                           f"delegatecall target `{target}` is a function parameter{note}.", absolute=not in_original)
