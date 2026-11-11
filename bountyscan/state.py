@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS contracts (
     PRIMARY KEY (chain, address)
 );
 CREATE TABLE IF NOT EXISTS cursors (chain TEXT PRIMARY KEY, block INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS scan_cache (source_hash TEXT PRIMARY KEY, status TEXT NOT NULL, ref_address TEXT, at REAL);
 """
+LIVE_PRIORITY = 1e9   # live/Immunefi items jump the queue; backfill items are ordered by value
 
 # queued -> safe | vulnerable | unverified (retried) | low_value | no_code | error
 TERMINAL = {"safe", "vulnerable", "low_value", "no_code", "unverified_final", "error"}
@@ -43,9 +46,50 @@ class Store:
             self.db.executescript(SCHEMA)
             # additive migrations for databases created by older versions
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(contracts)")}
-            for name, decl in (("value_usd", "REAL"), ("holdings", "TEXT"), ("value_checked", "REAL")):
+            for name, decl in (("value_usd", "REAL"), ("holdings", "TEXT"), ("value_checked", "REAL"),
+                               ("priority", f"REAL NOT NULL DEFAULT {LIVE_PRIORITY}"), ("txs", "INTEGER")):
                 if name not in cols:
                     self.db.execute(f"ALTER TABLE contracts ADD COLUMN {name} {decl}")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_due ON contracts(status, priority DESC, next_try)")
+            self.db.commit()
+
+    # ---- queue with priority (backfill) -------------------------------------------------
+    def enqueue_with(self, chain: str, address: str, origin: str, **fields) -> bool:
+        """Insert if new and set extra columns (priority, value_usd, name, txs ...). Existing rows untouched."""
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO contracts (chain, address, origin, updated) VALUES (?, ?, ?, ?)",
+                (chain.lower(), address.lower(), origin, time.time()))
+            if cur.rowcount == 1 and fields:
+                cols = ", ".join(f"{k} = ?" for k in fields)
+                self.db.execute(f"UPDATE contracts SET {cols} WHERE chain = ? AND address = ?",
+                                (*fields.values(), chain.lower(), address.lower()))
+            self.db.commit()
+            return cur.rowcount == 1
+
+    # ---- small key/value store (backfill progress) ---------------------------------------
+    def get_meta(self, key: str, default=None):
+        import json
+        with self._lock:
+            row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def set_meta(self, key: str, value) -> None:
+        import json
+        with self._lock:
+            self.db.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (key, json.dumps(value)))
+            self.db.commit()
+
+    # ---- identical-source scan cache ------------------------------------------------------
+    def cached_verdict(self, source_hash: str):
+        with self._lock:
+            return self.db.execute("SELECT status, ref_address FROM scan_cache WHERE source_hash = ?", (source_hash,)).fetchone()
+
+    def cache_verdict(self, source_hash: str, status: str, ref_address: str) -> None:
+        with self._lock:
+            self.db.execute("INSERT OR IGNORE INTO scan_cache (source_hash, status, ref_address, at) VALUES (?, ?, ?, ?)",
+                            (source_hash, status, ref_address, time.time()))
             self.db.commit()
 
     def enqueue(self, chain: str, address: str, origin: str) -> bool:
@@ -58,7 +102,8 @@ class Store:
             return cur.rowcount == 1
 
     def due(self, limit: int | None = None) -> list[sqlite3.Row]:
-        q = "SELECT * FROM contracts WHERE status IN ('queued', 'unverified') AND next_try <= ? ORDER BY next_try, rowid"
+        q = ("SELECT * FROM contracts WHERE status IN ('queued', 'unverified') AND next_try <= ? "
+             "ORDER BY priority DESC, next_try, rowid")
         with self._lock:
             return self.db.execute(q + (f" LIMIT {int(limit)}" if limit else ""), (time.time(),)).fetchall()
 

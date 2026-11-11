@@ -173,6 +173,100 @@ def read_meta(source_dir: Path) -> dict:
         return {}
 
 
+# ---------------------------------------------------------------- Blockscout (no API key)
+BLOCKSCOUT = {
+    1: "https://eth.blockscout.com", 8453: "https://base.blockscout.com", 42161: "https://arbitrum.blockscout.com",
+    10: "https://optimism.blockscout.com", 137: "https://polygon.blockscout.com", 100: "https://gnosis.blockscout.com",
+    534352: "https://scroll.blockscout.com", 11155111: "https://eth-sepolia.blockscout.com",
+}
+_bs_last = [0.0]
+_bs_lock = __import__("threading").Lock()
+
+
+def _bs_get(url: str, min_interval: float = 0.25) -> dict:
+    """GET a Blockscout API URL, politely paced (~4 req/s across all threads), retrying on rate limits."""
+    import time
+    import urllib.error
+
+    for attempt in range(5):
+        with _bs_lock:
+            wait = min_interval - (time.monotonic() - _bs_last[0])
+            if wait > 0:
+                time.sleep(wait)
+            _bs_last[0] = time.monotonic()
+        req = urllib.request.Request(url, headers={"User-Agent": "bountyscan/0.8", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=40) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise NotVerified(url) from exc
+            if exc.code in (429, 500, 502, 503, 504) and attempt < 4:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt < 4:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise
+    return {}
+
+
+def blockscout_base(chain: str) -> str:
+    cid = chain_id_of(chain)
+    if cid not in BLOCKSCOUT:
+        raise ValueError(f"no Blockscout instance configured for {chain}")
+    return BLOCKSCOUT[cid]
+
+
+def blockscout_verified_page(chain: str, cursor: int | None) -> tuple[list[dict], int | None]:
+    """One page (50) of verified contracts, newest first. Returns (items, next_cursor)."""
+    url = f"{blockscout_base(chain)}/api/v2/smart-contracts"
+    if cursor:
+        url += f"?smart_contract_id={int(cursor)}&items_count=50"
+    data = _bs_get(url)
+    npp = data.get("next_page_params") or {}
+    return data.get("items") or [], (int(npp["smart_contract_id"]) if npp.get("smart_contract_id") else None)
+
+
+def fetch_blockscout_source(address: str, chain: str, dest: Path, follow_proxy: bool = True) -> Path:
+    """Verified source from Blockscout into dest/<chain>/<address>/ (same layout as the Etherscan fetch).
+    Follows one level of proxy to its implementation. No API key, no Etherscan quota."""
+    if not ADDRESS_RE.match(address):
+        raise ValueError(f"not an EVM address: {address!r}")
+    out_dir = dest / chain.lower() / address.lower()
+    if (out_dir / "bountyscan-meta.json").exists():
+        return out_dir
+    d = _bs_get(f"{blockscout_base(chain)}/api/v2/smart-contracts/{address}")
+    if not d.get("is_verified") or not (d.get("source_code") or d.get("additional_sources")):
+        raise NotVerified(f"{address} not verified on Blockscout")
+    if (d.get("language") or "solidity").lower() != "solidity":
+        raise NotVerified(f"{address} is {d.get('language')}, not Solidity")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = [(d.get("file_path") or f"{d.get('name') or 'Contract'}.sol", d.get("source_code") or "")]
+    files += [(s.get("file_path") or "extra.sol", s.get("source_code") or "") for s in (d.get("additional_sources") or [])]
+    for name, content in files:
+        if not name.endswith(".sol"):
+            name += ".sol"
+        target = out_dir / _safe_relpath(name)
+        if out_dir.resolve() not in target.resolve().parents:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8", newline="")
+    impls = [i.get("address_hash") for i in (d.get("implementations") or []) if i.get("address_hash")]
+    meta = {"address": address, "chain": chain.lower(), "chain_id": chain_id_of(chain), "source": "blockscout",
+            "contract_name": d.get("name"), "compiler": d.get("compiler_version"),
+            "proxy": bool(d.get("proxy_type")), "implementation": impls[0] if impls else None}
+    if follow_proxy and impls and ADDRESS_RE.match(impls[0]) and impls[0].lower() != address.lower():
+        try:
+            fetch_blockscout_source(impls[0], chain, out_dir / "implementation", follow_proxy=False)
+        except (NotVerified, ValueError):
+            meta["implementation_unverified"] = True
+    (out_dir / "bountyscan-meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return out_dir
+
+
 def clone_repo(url: str, dest: Path, ref: str | None = None) -> Path:
     """Shallow-clone a git repo (https only) into dest/<name>."""
     if not url.startswith("https://"):

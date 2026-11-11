@@ -19,8 +19,9 @@ from .contract_report import write_contract_report, write_summary
 from .detectors import SEVERITY_RANK
 from .remediation import is_fund_theft
 from .rpc import RPC, RPCError
-from .scanner import scan
-from .sources import ADDRESS_RE, ExplorerFatal, NotVerified, chain_id_of, fetch_verified_source, read_meta
+from .scanner import relevant_contracts, scan
+from .sources import (ADDRESS_RE, ExplorerFatal, NotVerified, chain_id_of, fetch_blockscout_source,
+                      fetch_verified_source, read_meta)
 from .value import describe as describe_value, holdings as read_holdings
 from .verifier import confirmed_findings, verify_findings
 
@@ -102,12 +103,20 @@ def process(store, row, cfg: AutoConfig) -> str:
     else:
         value_fields = {}
 
-    _stage(cfg, f"Fetching verified source of {short} from the explorer")
+    backfill = (row["origin"] or "").startswith("backfill")
+    _stage(cfg, f"Fetching verified source of {short}" + (" from Blockscout" if backfill else " from the explorer"))
     try:
-        src = fetch_verified_source(address, chain, cfg.cache_dir / "onchain", cfg.api_key)
+        if backfill:
+            # Blockscout listed it as verified: read source there (no Etherscan quota), Etherscan as fallback.
+            try:
+                src = fetch_blockscout_source(address, chain, cfg.cache_dir / "onchain")
+            except (NotVerified, ValueError, OSError):
+                src = fetch_verified_source(address, chain, cfg.cache_dir / "onchain", cfg.api_key)
+        else:
+            src = fetch_verified_source(address, chain, cfg.cache_dir / "onchain", cfg.api_key)
     except NotVerified:
         attempts = row["attempts"] + 1
-        if attempts >= cfg.max_attempts:
+        if backfill or attempts >= cfg.max_attempts:   # months-old and still unverified: will not change
             store.update(chain, address, status="unverified_final", attempts=attempts)
             return "unverified_final"
         store.update(chain, address, status="unverified", attempts=attempts,
@@ -116,9 +125,26 @@ def process(store, row, cfg: AutoConfig) -> str:
 
     meta = read_meta(src)
     name = meta.get("contract_name") or ""
+
+    # Identical source already judged SAFE (clones, factory pairs): reuse the verdict, skip the scan.
+    shash = source_hash(src)
+    hit = store.cached_verdict(shash) if hasattr(store, "cached_verdict") else None
+    if hit and hit[0] == "safe":
+        store.update(chain, address, status="safe", name=name, findings=0, max_severity=None,
+                     balance_wei=None if balance is None else str(balance),
+                     error=f"(identical source to {hit[1]})", **value_fields)
+        _discard_source(src, cfg)
+        return "safe"
+
     _stage(cfg, f"Scanning {name or short} with all fund-theft detectors")
     result = scan([src], min_severity="high")
-    candidates = [f for f in result.findings if is_fund_theft(f)]
+    # Only the deployed contract (and, for a proxy, its implementation) plus what they inherit count.
+    roots = [meta.get("contract_name")]
+    impl_meta = read_meta(src / "implementation" / chain / str(meta.get("implementation") or "").lower()) \
+        if meta.get("implementation") else {}
+    roots.append(impl_meta.get("contract_name"))
+    keep = relevant_contracts(result.files, [r for r in roots if r])
+    candidates = [f for f in result.findings if is_fund_theft(f) and (keep is None or f.contract in keep)]
 
     theft = candidates
     verdicts = None
@@ -136,6 +162,9 @@ def process(store, row, cfg: AutoConfig) -> str:
             extra = f" ({len(candidates)} candidate(s) not confirmed by second pass)"
         store.update(chain, address, status="safe", name=name, findings=0, max_severity=None,
                      balance_wei=None if balance is None else str(balance), error=extra or None, **value_fields)
+        if hasattr(store, "cache_verdict"):
+            store.cache_verdict(shash, "safe", address)
+        _discard_source(src, cfg)
         return "safe"
 
     report = write_contract_report(chain, address, meta, theft, balance, src, cfg.out_dir, verdicts=verdicts, holdings=held)
@@ -143,6 +172,32 @@ def process(store, row, cfg: AutoConfig) -> str:
     store.update(chain, address, status="vulnerable", name=name, findings=len(theft), max_severity=worst,
                  balance_wei=None if balance is None else str(balance), report=str(report), error=None, **value_fields)
     return "vulnerable"
+
+
+def _discard_source(src: Path, cfg: AutoConfig) -> None:
+    """SAFE contracts don't need their source kept: a 6-month backfill would otherwise fill the disk.
+    Vulnerable ones keep theirs (the report quotes it). Only ever deletes inside the cache directory."""
+    import shutil
+    try:
+        root = (Path(cfg.cache_dir) / "onchain").resolve()
+        target = Path(src).resolve()
+        if root in target.parents:
+            shutil.rmtree(target, ignore_errors=True)
+            shutil.rmtree((Path(cfg.cache_dir) / "verify").resolve() / target.parent.name / target.name, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def source_hash(src_dir: Path) -> str:
+    """Stable hash of every .sol file (path + content) under a fetched source directory."""
+    import hashlib
+    h = hashlib.sha256()
+    for p in sorted(Path(src_dir).rglob("*.sol")):
+        h.update(p.relative_to(src_dir).as_posix().encode())
+        h.update(b"\0")
+        h.update(p.read_bytes().replace(b"\r\n", b"\n"))
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def value_columns(held: dict | None) -> dict:

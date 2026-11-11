@@ -24,6 +24,30 @@ class ScanResult:
         return out
 
 
+def relevant_contracts(files: list[SourceFile], roots: list[str]) -> set[str] | None:
+    """The deployed contract(s) plus everything they inherit from.
+
+    Verified bundles often include mocks, tests and unrelated contracts; findings there are not
+    findings in the deployed code. Returns None (= don't filter) when no root can be located."""
+    by_name = {}
+    for f in files:
+        for c in f.contracts:
+            by_name.setdefault(c.name, c)
+    todo = [r for r in roots if r in by_name]
+    if not todo:
+        return None
+    seen: set[str] = set()
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        c = by_name.get(name)
+        if c:
+            todo += [i.split(".")[-1].strip() for i in c.inherits]
+    return seen
+
+
 def scan(
     paths: list[str | Path],
     include_deps: bool = False,

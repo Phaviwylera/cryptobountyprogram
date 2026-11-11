@@ -55,6 +55,8 @@ INDEX_HTML = r"""<!doctype html>
   .cmd{flex:1;appearance:none;cursor:pointer;font:700 11.5px var(--mono);letter-spacing:.8px;padding:10px 12px;
     border:1px solid var(--line2);background:rgba(10,13,18,.92);color:var(--ink);transition:all .2s}
   .cmd:hover{border-color:var(--c,var(--teal));color:var(--c,var(--teal));box-shadow:0 0 18px -6px var(--c,var(--teal))}
+  .cmd.back{--c:var(--purple)} .cmd.back.running{border-color:var(--purple);color:var(--purple);animation:glowp 2s ease-in-out infinite}
+  @keyframes glowp{50%{box-shadow:0 0 22px -4px var(--purple)}}
   .cmd.live{--c:var(--teal)} .cmd.imm{--c:var(--cyan)} .cmd.stop{--c:var(--pink);flex:0 0 44px} .cmd.gear{--c:var(--yellow);flex:0 0 44px}
   .cmd.running{border-color:var(--teal);color:var(--teal);animation:glow 2s ease-in-out infinite}
   .cmd:disabled{cursor:default}
@@ -156,6 +158,7 @@ INDEX_HTML = r"""<!doctype html>
   <span class="opt"><span class="k">WAIT</span><span class="v" id="tWait" style="color:var(--orange)">0</span></span>
   <span><span class="k">VALUE SEEN</span><span class="v" id="tValue" style="color:var(--cyan)">$0</span></span>
   <a href="#findings"><span class="k">AT RISK</span><span class="v" id="tRisk" style="color:var(--pink)">$0</span></a>
+  <span class="opt"><span class="k">BACKFILL</span><span class="v" id="tBack" style="color:var(--purple)">-</span></span>
   <span class="opt"><span class="k">T</span><span class="v" id="tT">0.00</span></span>
   <span class="opt"><span class="k">FRAME</span><span class="v" id="tFrame">0000</span></span>
   <span class="brand" id="tBrand">bountyscan.live</span>
@@ -178,6 +181,15 @@ INDEX_HTML = r"""<!doctype html>
       <label>Min value held, USD (0 = scan all)</label><input id="liveMinUsd" value="0" inputmode="decimal">
       <div style="color:var(--dim);font-size:10px;margin-top:4px">native coin + USDC, USDT, DAI, USDS, USDe, WETH, stETH, wstETH, WBTC · priced by Chainlink</div>
       <label>Start from block (blank = chain head)</label><input id="liveFromBlock" placeholder="latest">
+    </div>
+    <div class="drow">
+      <button class="cmd back" id="btnBack">◷ BACKFILL 6 MONTHS</button>
+      <button class="cmd gear" id="btnBackGear" title="Backfill settings" style="--c:var(--purple)">⚙</button>
+    </div>
+    <div class="drawer" id="drBack">
+      <label>History window (days)</label><input id="bfDays" value="180" inputmode="numeric">
+      <label>Alive = at least N transactions (or any balance / market cap)</label><input id="bfTxs" value="10" inputmode="numeric">
+      <div style="color:var(--dim);font-size:10px;margin-top:6px">Lists every contract verified on Blockscout in the window, keeps the alive ones, prices them, and scans the richest first. Resumes after restarts.</div>
     </div>
     <button class="cmd imm" id="btnImm">◆ IMMUNEFI SCAN</button>
     <div class="drawer" id="drImm">
@@ -590,9 +602,25 @@ function updateChrome(s){
   const lb = $('#btnLive');
   if (!lb.dataset.busy){ if (s.mode === 'live'){ lb.classList.add('running'); lb.textContent = '● LIVE · CRAWLING'; lb.disabled = true; }
     else { lb.classList.remove('running'); lb.textContent = '▶ LIVE SCAN'; lb.disabled = false; } }
+  // backfill (historical scan)
+  const bf = s.backfill || {};
+  const bb = $('#btnBack');
+  if (bf.active && bf.running){ bb.classList.add('running'); bb.textContent = `◷ BACKFILL · ${bf.percent}%`; }
+  else { bb.classList.remove('running'); bb.textContent = bf.active && !bf.done ? `◷ RESUME BACKFILL · ${bf.percent}%` : '◷ BACKFILL 6 MONTHS'; }
+  $('#tBack').textContent = bf.active ? (bf.done ? 'done' : bf.percent + '%') : '-';
+  let bfCard = '';
+  if (bf.active){
+    const reached = bf.reached ? String(bf.reached).slice(0,10) : '…';
+    const state = bf.done ? '<span style="color:var(--teal)">listing complete</span>' : bf.running ? 'listing' : 'paused';
+    bfCard = `<div class="batch" style="border-color:rgba(154,124,255,.35)"><div class="t"><span style="color:var(--purple)">◷ backfill ${bf.days}d · ${esc(bf.chain)}</span><b>${bf.percent}%</b></div>
+      <div class="bar"><i style="width:${bf.percent}%;background:var(--purple)"></i></div>
+      <div class="t" style="margin-top:5px"><span>${state} · reached ${reached}</span><span>${usd(bf.value_queued_usd||0)} queued</span></div>
+      <div class="t"><span>${Number(bf.listed||0).toLocaleString('en-US')} listed</span><span>${Number(bf.alive||0).toLocaleString('en-US')} alive</span><span>${Number(bf.queued||0).toLocaleString('en-US')} queued</span></div>
+      ${bf.last_error ? `<div class="t" style="color:var(--orange)">${esc(bf.last_error).slice(0,80)}</div>` : ''}</div>`;
+  }
   // program batches
   const bs = (s.batches || []).filter(b=>b.total).slice(-2).reverse();
-  $('#batches').innerHTML = bs.map(b => { const pct = Math.round(100*b.done/b.total);
+  $('#batches').innerHTML = bfCard + bs.map(b => { const pct = Math.round(100*b.done/b.total);
     return `<div class="batch"><div class="t"><span>◆ ${esc(b.program)}</span><b>${b.done}/${b.total} · ${pct}%</b></div>
       <div class="bar"><i style="width:${pct}%;background:${b.done>=b.total?'var(--teal)':'var(--cyan)'}"></i></div>
       <div class="t" style="margin-top:5px"><span style="color:var(--pink)">${b.vulnerable} vuln</span><span style="color:var(--teal)">${b.safe} safe</span><span>${b.waiting_verification} awaiting source</span></div></div>`; }).join('');
@@ -699,6 +727,17 @@ $('#btnLive').onclick = async () => {
   const r = await api('/api/live/start','POST',{chain:$('#liveChain').value, min_value_usd:parseFloat($('#liveMinUsd').value||'0')||0, from_block: fb ? parseInt(fb) : null});
   delete b.dataset.busy;
   r.error ? toast('could not start · ' + r.error, true) : toast('live crawl started on ' + $('#liveChain').value);
+  poll();
+};
+$('#btnBackGear').onclick = () => $('#drBack').classList.toggle('open');
+$('#btnBack').onclick = async () => {
+  const running = S && S.backfill && S.backfill.running;
+  const b = $('#btnBack'); b.disabled = true;
+  const r = running ? await api('/api/backfill/stop','POST',{})
+    : await api('/api/backfill/start','POST',{chain:$('#liveChain').value, days:parseInt($('#bfDays').value||'180'), min_txs:parseInt($('#bfTxs').value||'10')});
+  b.disabled = false;
+  if (r.error) toast('backfill · ' + r.error, true);
+  else toast(running ? 'backfill paused · progress saved' : `backfill running · last ${$('#bfDays').value} days of verified contracts, richest first`);
   poll();
 };
 $('#btnStop').onclick = async () => { await api('/api/live/stop','POST',{}); toast('stopping · current contract finishes first'); poll(); };

@@ -75,6 +75,32 @@ class AutoModeTests(unittest.TestCase):
             run_queue(self.store, self.cfg)
             self.assertEqual(run_queue(self.store, self.cfg), {})
 
+    def test_identical_source_reuses_safe_verdict(self):
+        twin = "0x" + "55" * 20
+        mapping = {SAFE: "safe", twin: "safe"}
+
+        def fetch(address, chain, dest, api_key=None):
+            out = Path(dest) / address.lower()
+            if not out.exists():
+                import shutil
+                shutil.copytree(FIXTURES / mapping[address.lower()], out)
+                (out / "bountyscan-meta.json").write_text("{}", encoding="utf-8")
+            return out
+
+        self.store.enqueue("ethereum", SAFE, "test")
+        self.store.enqueue("ethereum", twin, "test")
+        with mock.patch.object(auto, "fetch_verified_source", fetch):
+            self.assertEqual(run_queue(self.store, self.cfg), {"safe": 2})
+        note = self.store.fetch_one("ethereum", twin)["error"]
+        self.assertIn("identical source", note)
+
+    def test_backfill_unverified_is_final_immediately(self):
+        self.store.enqueue_with("ethereum", PENDING, "backfill:blockscout", priority=1.0)
+        with mock.patch.object(auto, "fetch_blockscout_source", fake_fetch), \
+                mock.patch.object(auto, "fetch_verified_source", fake_fetch):
+            run_queue(self.store, self.cfg)
+        self.assertEqual(self.store.counts(), {"unverified_final": 1})
+
     def test_unverified_gives_up_after_max_attempts(self):
         self.cfg.max_attempts = 2
         self.store.enqueue("ethereum", PENDING, "test")
@@ -99,3 +125,16 @@ class AutoModeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelevanceTests(unittest.TestCase):
+    def test_only_deployed_contract_and_parents_count(self):
+        from bountyscan.scanner import relevant_contracts
+        from bountyscan.solidity import parse_source
+        src = ("pragma solidity ^0.8.0; contract Base {} contract Mid is Base {} contract Vault is Mid {}"
+               " contract UnrelatedMock { function setX(uint x) external {} }")
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "B.sol"; p.write_text(src, encoding="utf-8")
+            files = [parse_source(p)]
+        self.assertEqual(relevant_contracts(files, ["Vault"]), {"Vault", "Mid", "Base"})
+        self.assertIsNone(relevant_contracts(files, ["NotInBundle"]))

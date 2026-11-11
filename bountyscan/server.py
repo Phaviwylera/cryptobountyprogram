@@ -61,6 +61,13 @@ class Worker:
         self.batches: list[dict] = []     # Immunefi/program scans: {program, items, started}
         cfg.on_stage = self.set_stage
         cfg.on_event = self.add_event
+        from .backfill import Backfill
+        self.backfill = Backfill(store, rpc, on_event=self.add_event, on_queue=self._backfill_has_work)
+
+    def _backfill_has_work(self) -> None:
+        # Backfill queued contracts: make sure the scan worker is running to drain them.
+        if self.mode == "idle":
+            self.start_drain()
 
     def set_stage(self, text: str) -> None:
         self.stage = text
@@ -83,7 +90,7 @@ class Worker:
                     self._recheck_vulnerable_value()
                 did = self._scan_step()
                 if not did:
-                    if self.mode == "draining" and not self.store.pending_count():
+                    if self.mode == "draining" and not self.store.pending_count() and not self.backfill.running:
                         self.mode = "idle"
                         self.set_stage("Idle - queue finished")
                         self.add_event("info", "All queued contracts processed.")
@@ -237,6 +244,7 @@ class Worker:
             "events": list(self.events)[-60:],
             "batches": self._batch_progress(),
             "value": self.store.value_stats(),
+            "backfill": self.backfill.snapshot(),
             "min_value_usd": self.min_value_usd,
         }
 
@@ -326,6 +334,15 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/live/stop":
                 w.stop()
                 return self._send(200, {"ok": True, "mode": w.mode})
+            if u.path == "/api/backfill/start":
+                days = max(1, min(3650, int(b.get("days", 180) or 180)))
+                min_txs = max(0, int(b.get("min_txs", 10) or 0))
+                w.backfill.start(b.get("chain", cfg_default_chain()), days, min_txs)
+                w.start_drain()
+                return self._send(200, {"ok": True, "backfill": w.backfill.snapshot()})
+            if u.path == "/api/backfill/stop":
+                w.backfill.stop()
+                return self._send(200, {"ok": True, "backfill": w.backfill.snapshot()})
             if u.path == "/api/enqueue":
                 from .sources import ADDRESS_RE
                 chain = b.get("chain", cfg_default_chain())
@@ -393,6 +410,18 @@ def serve(host: str, port: int, out_dir: Path, cache_dir: Path, state: Path,
                                   int(float(os.environ.get("BOUNTYSCAN_MIN_BALANCE", "0")) * 10**18),
                                   float(os.environ.get("BOUNTYSCAN_MIN_VALUE_USD", "0")))
     elif autostart in ("live", "drain"):
+        Handler.worker.start_drain()
+    # Resume an unfinished backfill after a restart (or start one from BOUNTYSCAN_BACKFILL_DAYS).
+    bf = Handler.worker.backfill.state
+    if bf and not bf.get("done") and not bf.get("paused"):
+        Handler.worker.backfill.start(bf["chain"], bf["days"], bf["min_txs"])
+        Handler.worker.start_drain()
+    elif os.environ.get("BOUNTYSCAN_BACKFILL_DAYS") and not bf:
+        Handler.worker.backfill.start(cfg_default_chain(), int(os.environ["BOUNTYSCAN_BACKFILL_DAYS"]),
+                                      int(os.environ.get("BOUNTYSCAN_BACKFILL_MIN_TXS", "10")))
+        Handler.worker.start_drain()
+    # Never leave queued work stranded after a restart (e.g. backfill listing finished, queue not empty).
+    if Handler.worker.mode == "idle" and store.pending_count():
         Handler.worker.start_drain()
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"bountyscan dashboard on http://{host}:{port}  (rpc={'set' if rpc else 'none'}, verify={verify})")

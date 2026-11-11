@@ -100,6 +100,84 @@ def holdings(rpc: RPC, chain_id: int, address: str, native_wei: int | None) -> d
     return {"usd": round(total, 2) if (priced or has_table) else None, "items": items, "priced": priced}
 
 
+# ---------------------------------------------------------------- bulk (Multicall3)
+MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"   # same address on every major EVM chain
+AGGREGATE3 = "82ad56cb"          # aggregate3((address,bool,bytes)[])
+GET_ETH_BALANCE = "4d2301cc"     # getEthBalance(address)
+
+
+def _word(n: int) -> str:
+    return "%064x" % n
+
+
+def encode_aggregate3(calls: list[tuple[str, bytes]]) -> str:
+    """ABI-encode aggregate3 with allowFailure=true for every (target, calldata)."""
+    elems = []
+    for target, data in calls:
+        padded = data + b"\0" * ((-len(data)) % 32)
+        elems.append(_word(int(target, 16)) + _word(1) + _word(0x60) + _word(len(data)) + padded.hex())
+    offsets, pos = [], 32 * len(elems)
+    for e in elems:
+        offsets.append(_word(pos))
+        pos += len(e) // 2
+    return "0x" + AGGREGATE3 + _word(0x20) + _word(len(elems)) + "".join(offsets) + "".join(elems)
+
+
+def decode_aggregate3(hexdata: str) -> list[tuple[bool, bytes]]:
+    b = bytes.fromhex(hexdata[2:] if hexdata.startswith("0x") else hexdata)
+    word = lambda off: int.from_bytes(b[off:off + 32], "big")
+    arr = word(0)
+    n = word(arr)
+    out = []
+    for i in range(n):
+        el = arr + 32 + word(arr + 32 + 32 * i)
+        ok = bool(word(el))
+        boff = el + word(el + 32)
+        ln = word(boff)
+        out.append((ok, b[boff + 32: boff + 32 + ln]))
+    return out
+
+
+def holdings_many(rpc: RPC, chain_id: int, addresses: list[str], chunk: int = 40) -> dict[str, dict]:
+    """Value held by many contracts using Multicall3 - one eth_call per `chunk` addresses.
+    Returns {address_lower: holdings dict} (same shape as holdings())."""
+    px = prices(rpc, chain_id)
+    toks = TOKENS.get(chain_id, [])
+    out: dict[str, dict] = {}
+    for i in range(0, len(addresses), chunk):
+        group = [a.lower() for a in addresses[i:i + chunk]]
+        calls = []
+        for a in group:
+            pad = bytes.fromhex("0" * 24 + a[2:])
+            calls.append((MULTICALL3, bytes.fromhex(GET_ETH_BALANCE) + pad))
+            calls += [(tok, bytes.fromhex(BALANCE_OF[2:]) + pad) for _, tok, _, _ in toks]
+        try:
+            res = decode_aggregate3(_call(rpc, MULTICALL3, encode_aggregate3(calls)))
+        except (RPCError, ValueError, IndexError):
+            continue
+        per = 1 + len(toks)
+        for j, a in enumerate(group):
+            row = res[j * per:(j + 1) * per]
+            if len(row) != per:
+                continue
+            items, total = [], 0.0
+            native = int.from_bytes(row[0][1], "big") if row[0][0] and row[0][1] else 0
+            if native:
+                kind = NATIVE_KIND.get(chain_id)
+                usd = native / 1e18 * px[kind] if kind in px else None
+                items.append({"symbol": "native", "amount": native / 1e18, "usd": usd})
+                total += usd or 0
+            for (ok, data), (sym, _, dec, kind) in zip(row[1:], toks):
+                raw = int.from_bytes(data[:32], "big") if ok and len(data) >= 32 else 0
+                if raw:
+                    usd = raw / 10**dec * px[kind] if kind in px else None
+                    items.append({"symbol": sym, "amount": raw / 10**dec, "usd": usd})
+                    total += usd or 0
+            items.sort(key=lambda x: -(x["usd"] or 0))
+            out[a] = {"usd": round(total, 2), "items": items, "priced": bool(items)}
+    return out
+
+
 def describe(h: dict | None) -> str:
     if not h:
         return "unknown"

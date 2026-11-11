@@ -173,7 +173,8 @@ AUTH_BODY_RE = re.compile(
     r"_check(?:Owner|Role|Auth|Admin|Caller|Sender|Permission|Canonical)\w*\s*\(|hasRole\s*\(|_?only\w*\s*\(|_authorize\w*|_?isAuthorized|requiresAuth"
     r"|_require\w*(?:Owner|Admin|Role|Auth)\w*\s*\("
     rf"|require\s*\([^;]*{SENDER}|if\s*\([^;{{]*{SENDER}[^;{{]*\)\s*(?:revert|\{{\s*revert)"
-)
+    rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
+    , re.M)
 # `address caller = _msgSender(); if (caller != authority()) revert ...;`
 SENDER_ALIAS_RE = re.compile(rf"\b(\w+)\s*=\s*{SENDER}\s*;")
 REENTRANCY_GUARD_RE = re.compile(r"re.?entr|^lock(ed)?$|nonreentrant|noreenter|noentry|^mutex$|^guard(ed)?$|synchronized|globallock", re.I)
@@ -259,7 +260,9 @@ ROLE_BODY_RE = re.compile(
     r"|_?isAuthorized|requiresAuth|_require\w*(?:Owner|Admin|Role|Auth)\w*\s*\("
     rf"|require\s*\([^;{{]*{SENDER}\s*==|require\s*\([^;{{]*==\s*{SENDER}\b"
     rf"|if\s*\([^;{{]*{SENDER}\s*[!=]=\s*\w[^;{{]*\)\s*(?:revert|\{{\s*revert)"
-)
+    # positive guard wrapping the action: `if (msg.sender == owner) selfdestruct(owner);` (legacy style)
+    rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
+    , re.M)
 
 
 def is_role_controlled(fn: Function, project: Project) -> bool:
@@ -275,6 +278,25 @@ def is_role_controlled(fn: Function, project: Project) -> bool:
         return True
     for alias in re.findall(rf"\b(\w+)\s*=\s*{SENDER}\s*;", body):
         if re.search(rf"(?:require|if)\s*\([^;{{]*\b{re.escape(alias)}\b\s*[!=]=", body):
+            return True
+    return False
+
+
+def calls_guarded_helper(fn: Function, project: Project) -> bool:
+    """True when the function calls (in its own body) a helper that checks the caller -
+    e.g. ENS `setRecord` -> `setOwner(...)` which carries `authorised(node)`. An unauthorised
+    caller reverts inside the helper, so the outer function is protected too."""
+    body = fn.body or ""
+    for name in set(CALL_IN_BODY_RE.findall(body)):
+        if name in _INLINE_SKIP or name == fn.name:
+            continue
+        callee = project.resolve_call(name)
+        if not callee or callee is fn or callee.contract.name not in {fn.contract.name, *fn.contract.inherits} \
+                and callee.contract.file is not fn.contract.file:
+            continue
+        if any(m in project.auth_modifiers or AUTH_MODIFIER_RE.search(m) for m in callee.modifiers):
+            return True
+        if callee.body and ROLE_BODY_RE.search(callee.body):
             return True
     return False
 
@@ -347,7 +369,7 @@ def _privileged(project: Project):
     for fn in entrypoints(project):
         if not PRIVILEGED_NAME_RE.match(fn.name) or fn.name in USER_SCOPED_SETTERS:
             continue
-        if fn.name.startswith("initialize") or access_controlled(fn, project):
+        if fn.name.startswith("initialize") or access_controlled(fn, project) or calls_guarded_helper(fn, project):
             continue
         if re.search(rf"\[\s*{SENDER}\s*\]", fn.body or ""):
             continue  # user-scoped state, e.g. prefs[msg.sender]
@@ -357,10 +379,15 @@ def _privileged(project: Project):
         # address cannot redirect funds: anyone can trigger it, but the money goes to its owner.
         # Look through internal helpers (`_sendSurplus(refundAddress)`); an address parameter is fine
         # (e.g. which token to rescue) as long as it is never the recipient.
-        if re.match(r"^_?(?:sweep|collect|skim|harvest|rescue|recover)\w*$", fn.name, re.I):
+        # Applies to any fund-moving name (withdrawFees, claim..., distribute...): what matters is WHERE the
+        # money goes. A protocol-designated recipient (immutable, constant, or a storage variable whose
+        # setter is checked separately) is fine; a caller-chosen one (param / msg.sender) is not.
+        if re.match(r"^_?(?:sweep|collect|skim|harvest|rescue|recover|withdraw|claim|distribute|payout|release|flush)\w*$",
+                    fn.name, re.I):
             recipients = payout_recipients(effective_body(fn, project, depth=3))
-            if recipients and all(is_immutable(fn.contract, r) for r in recipients) \
-                    and not (recipients & fn.params_of_type("address")):
+            fixed = lambda r: is_immutable(fn.contract, r) or (r in project.state_vars and r not in fn.param_names)
+            if recipients and all(fixed(r) for r in recipients) and not (recipients & fn.params_of_type("address")) \
+                    and not re.search(rf"{SENDER}", " ".join(recipients)):
                 continue
         sev = "critical" if CRITICAL_PRIVILEGED_RE.search(fn.name) else "high"
         yield Hit(fn, fn.offset, f"`{fn.name}` is {fn.visibility or 'public'} with no access control "
@@ -664,6 +691,10 @@ def _arbitrary_call(project: Project):
             # (e.g. swaps[i].callTo), i.e. its root identifier is one of the function's parameters.
             target_user = target_root in fn.param_names or any(
                 re.search(rf"(?<![.\w]){re.escape(p)}\b\s*[\[.]", target_expr) for p in calldata_params)
+            # The code fixes WHICH function is called (receiver hooks, `abi.encodeCall(IFoo.bar, ...)`): the
+            # caller only supplies arguments, so it is not an arbitrary call (ERC721 onERC721Received).
+            if re.match(r"\s*abi\s*\.\s*encode(?:WithSelector|Call|WithSignature)\s*\(\s*(?!bytes4\s*\()", args[0]):
+                continue
             # Calldata is caller-controlled if it is a bytes param or a .bytesField of a calldata param.
             data_user = any(re.search(rf"\b{re.escape(b)}\b", args[0]) for b in bytes_params) or \
                 re.search(r"\.\s*\w*[Dd]ata\b|\.\s*callData\b|\[\s*\w+\s*\]\s*\.\s*\w+", args[0])
@@ -975,9 +1006,18 @@ def _sig_replay(project: Project):
         if not m or fn.contract.kind == "library":
             continue  # stateless helpers (e.g. ECDSA) cannot hold nonces themselves
         ctext = fn.contract.text
-        if not re.search(r"nonce|used\w*\s*\[|executed\s*\[|claimed\s*\[|consumed\s*\[|_useNonce|isUsed", ctext, re.I):
+        # ERC-4337 smart accounts: the EntryPoint enforces the nonce and the userOpHash binds chainid +
+        # EntryPoint address, so replay protection lives outside the account contract by design.
+        if re.search(r"UserOperation|userOpHash|IEntryPoint|_validateSignature", ctext) and \
+                re.search(r"userOp|UserOperation", body + ctext):
+            continue
+        # replay protection comes under many names: nonces, sequence ids (BitGo), used/executed/claimed
+        # digests, invalidated hashes, cancelled orders, bitmaps (Permit2)...
+        if not re.search(r"nonce|sequence|used\w*\s*\[|executed\s*\[|claimed\s*\[|consumed\s*\[|_useNonce|isUsed"
+                         r"|replay|invalidat|cancelled\s*\[|filled\s*\[|spent\s*\[|bitmap|processed\s*\[|redeemed\s*\[", ctext, re.I):
             yield Hit(fn, m.start(), f"`{fn.name}` verifies a signature but the contract tracks no nonce/used-digest.")
-        elif not re.search(r"block\.chainid|chainid\s*\(|_hashTypedDataV4|DOMAIN_SEPARATOR|_domainSeparator|EIP712", ctext):
+        elif not re.search(r"block\.chainid|chainid\s*\(|_hashTypedDataV4|DOMAIN_SEPARATOR|_domainSeparator|EIP712"
+                           r"|getNetworkId|networkId|chainId", ctext):   # BitGo binds via a per-chain network id
             yield Hit(fn, m.start(), f"`{fn.name}` signed digest does not bind chainid (cross-chain replay).", severity="medium")
         if "ecrecover" in m.group(0) and not re.search(r"address\s*\(\s*0\s*\)", body):
             yield Hit(fn, m.start(), "`ecrecover` result is not checked against address(0); invalid signatures may authorize an unset signer.", severity="medium")
@@ -1065,23 +1105,39 @@ def _overflow(project: Project):
             continue
         for c in f.contracts:
             for fn in c.functions:
-                if not fn.is_entrypoint or not fn.body:
+                # Only state-changing code an outsider can call matters: views can't steal, and
+                # admin-only paths (onlyWallet/onlyOwner) aren't attacker-controlled.
+                if not fn.is_entrypoint or not fn.body or not fn.is_mutating or is_role_controlled(fn, project):
                     continue
                 body = fn.body
-                uint_params = fn.params_of_type("uint")
-                for m in re.finditer(r"([\w\])]\s*)(\+=|-=|\*=|\*(?!=)|-(?![=>-]))\s*([\w.]+)", body):
-                    op, operand = m.group(2), m.group(3)
-                    before = body[: m.start()]
-                    bounded = re.search(r"(?:require|assert|if)\s*\([^;]*(?:>=|<=|>|<)", before)
-                    if op in ("-=", "-") and bounded:
-                        continue  # e.g. require(balance >= wad); balance -= wad;
-                    if op == "+=" and (operand not in uint_params or bounded):
-                        continue  # msg.value / bounded amounts cannot realistically overflow
-                    if op in ("*", "*=") and not ({operand} | set(re.findall(r"\w+", m.group(1))) & uint_params):
-                        continue
-                    yield Hit(fn, m.start(), f"`{op}` in `{fn.name}` under pragma `{f.pragma}` without SafeMath or a prior bound check.",
-                              confidence="low")
-                    break
+                uint_params = {p for p in fn.params_of_type("uint")}
+                if not uint_params:
+                    continue
+                state = project.state_vars
+                hit = None
+                # (a) batchOverflow: a multiplication involving an attacker-chosen amount (BEC, CVE-2018-10299)
+                for m in re.finditer(r"([\w\])]+)\s*(\*=|\*(?!\*))\s*([\w.]+)", body):
+                    left = set(re.findall(r"\w+", m.group(1))); right = m.group(3).split(".")[0]
+                    if (left | {right}) & uint_params:
+                        hit = (m.start(), f"multiplication with caller-chosen amount in `{fn.name}` can overflow")
+                        break
+                # (b)/(c) a balance-like state mapping credited or debited by a caller-chosen amount
+                if not hit:
+                    for m in re.finditer(r"\b(\w+)\s*\[[^\]]*\]\s*(\+=|-=)\s*(\w+)|"
+                                         r"\b(\w+)\s*\[([^\]]*)\]\s*=\s*\4\s*\[\5\]\s*([+-])\s*(\w+)", body):
+                        var = m.group(1) or m.group(4)
+                        op = m.group(2) or (m.group(6) + "=")
+                        amt = m.group(3) or m.group(7)
+                        if var not in state or amt not in uint_params:
+                            continue
+                        before = body[:m.start()]
+                        if re.search(rf"(?:require|assert|if)\s*\([^;]*\b(?:{re.escape(var)}|{re.escape(amt)})\b[^;]*(?:>=|<=|>|<)", before):
+                            continue      # bounded first, e.g. require(balances[from] >= value)
+                        hit = (m.start(), f"`{var}` {'credited' if op == '+=' else 'debited'} by caller-chosen `{amt}` "
+                                          f"in `{fn.name}` with no bound check")
+                        break
+                if hit:
+                    yield Hit(fn, hit[0], hit[1] + f" (pragma `{f.pragma}`, no SafeMath).", confidence="low")
 
 
 @detector(
