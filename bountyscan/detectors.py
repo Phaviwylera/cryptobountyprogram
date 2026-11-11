@@ -179,7 +179,7 @@ AUTH_BODY_RE = re.compile(
     r"|_require\w*(?:Owner|Admin|Role|Auth)\w*\s*\("
     rf"|require\s*\([^;]*{SENDER}|if\s*\([^;{{]*{SENDER}[^;{{]*\)\s*(?:revert|\{{\s*revert)"
     rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
-    rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w*\s*\(\s*{SENDER}"
+    rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w+\s*\(\s*{SENDER}"   # named helper, not bare require(
     , re.M)
 # `address caller = _msgSender(); if (caller != authority()) revert ...;`
 SENDER_ALIAS_RE = re.compile(rf"\b(\w+)\s*=\s*{SENDER}\s*;")
@@ -269,7 +269,7 @@ ROLE_BODY_RE = re.compile(
     # positive guard wrapping the action: `if (msg.sender == owner) selfdestruct(owner);` (legacy style)
     rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
     # a guard helper invoked ON the caller: requireMaster(msg.sender), _checkCaller(msg.sender), onlyX(msg.sender)
-    rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w*\s*\(\s*{SENDER}"
+    rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w+\s*\(\s*{SENDER}"   # named helper, not bare require(
     , re.M)
 
 
