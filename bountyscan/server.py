@@ -399,9 +399,17 @@ class Handler(BaseHTTPRequestHandler):
 def serve(host: str, port: int, out_dir: Path, cache_dir: Path, state: Path,
           api_key: str | None, rpc_url: str | None, verify: bool = True):
     store = Store(state)
+    # New detection rules -> re-judge every VULNERABLE verdict the old rules produced (front of the queue),
+    # so false positives fixed in a release disappear from the results without any manual step.
+    rejudge = 0
+    if store.get_meta("rules_version") != __version__:
+        rejudge = store.requeue_status("vulnerable", 2e9)
+        store.set_meta("rules_version", __version__)
     rpc = RPC(rpc_url) if rpc_url else None
     cfg = AutoConfig(out_dir=out_dir, cache_dir=cache_dir, api_key=api_key, rpc=rpc, verify=verify, quiet=True)
     Handler.worker = Worker(store, cfg, rpc)
+    if rejudge:
+        Handler.worker.add_event("info", f"Rules updated to v{__version__}: re-checking {rejudge} VULNERABLE contract(s) first.")
     # BOUNTYSCAN_AUTOSTART=live resumes the 24/7 live scan after any restart or reboot;
     # =drain resumes working through whatever is already queued.
     autostart = os.environ.get("BOUNTYSCAN_AUTOSTART", "").lower()

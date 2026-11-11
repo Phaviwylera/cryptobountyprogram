@@ -109,6 +109,18 @@ class AutoModeTests(unittest.TestCase):
             run_queue(self.store, self.cfg)
         self.assertEqual(self.store.counts(), {"unverified_final": 1})
 
+    def test_requeue_vulnerable_for_rejudging(self):
+        self.store.enqueue("ethereum", VULN, "test")
+        self.store.enqueue("ethereum", SAFE, "test")
+        with mock.patch.object(auto, "fetch_verified_source", fake_fetch):
+            run_queue(self.store, self.cfg)
+        self.assertEqual(self.store.requeue_status("vulnerable", 2e9), 1)
+        due = self.store.due()
+        self.assertEqual([r["address"] for r in due], [VULN])
+        self.assertEqual(due[0]["priority"], 2e9)
+        with mock.patch.object(auto, "fetch_verified_source", fake_fetch):
+            self.assertEqual(run_queue(self.store, self.cfg), {"vulnerable": 1})
+
     def test_minor_bugs_do_not_make_a_contract_vulnerable(self):
         minor = Path(self.tmp.name) / "minor"
         minor.mkdir()

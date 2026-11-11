@@ -92,6 +92,16 @@ class Store:
                             (source_hash, status, ref_address, time.time()))
             self.db.commit()
 
+    def requeue_status(self, status: str, priority: float) -> int:
+        """Send every row with `status` back to the queue (front of it), e.g. to re-judge VULNERABLE
+        verdicts after the detection rules change. Returns the number of rows re-queued."""
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE contracts SET status = 'queued', priority = ?, next_try = 0, attempts = 0, updated = ? "
+                "WHERE status = ?", (priority, time.time(), status))
+            self.db.commit()
+            return cur.rowcount
+
     def enqueue(self, chain: str, address: str, origin: str) -> bool:
         with self._lock:
             cur = self.db.execute(
