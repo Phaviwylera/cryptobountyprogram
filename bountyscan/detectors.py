@@ -298,7 +298,32 @@ def calls_guarded_helper(fn: Function, project: Project) -> bool:
             return True
         if callee.body and ROLE_BODY_RE.search(callee.body):
             return True
+        # guard helpers by name (Manifold `requireExtension()`, `_checkCaller()`, `ensureAdmin()`):
+        # a require/if on msg.sender inside a helper whose name says it is a check
+        if re.match(r"^_?(?:require|check|only|ensure|validate|assert|verify|auth)\w*$", callee.name, re.I) and \
+                callee.body and re.search(rf"(?:require|if)\s*\([^;]*{SENDER}", callee.body):
+            return True
     return False
+
+
+def family_text(contract, project: Project) -> str:
+    """Source text of a contract, everything it inherits, and everything that inherits from it."""
+    by_name = {c.name: c for f in project.files for c in f.contracts}
+    fam, todo = set(), [contract.name]
+    while todo:                                    # ancestors
+        n = todo.pop()
+        if n in fam or n not in by_name:
+            continue
+        fam.add(n)
+        todo += [i.split(".")[-1].strip() for i in by_name[n].inherits]
+    changed = True
+    while changed:                                 # descendants
+        changed = False
+        for c in by_name.values():
+            if c.name not in fam and any(i.split(".")[-1].strip() in fam for i in c.inherits):
+                fam.add(c.name)
+                changed = True
+    return "\n".join(by_name[n].text for n in fam if n in by_name)
 
 
 def is_immutable(contract, ident: str) -> bool:
@@ -352,6 +377,13 @@ PRIVILEGED_NAME_RE = re.compile(
     r"sweep\w*|rescue\w*|recover\w*|emergency\w*|drain\w*|withdraw(?:All|Fees?|Tokens?|ETH|Eth|Funds|Treasury|Reserves?|Stuck\w*|Protocol\w*)|"
     r"pause|unpause|kill|destroy|shutdown|migrate\w*|grant\w*|addMinter|add(?:Admin|Operator|Keeper)|update(?:Price|Oracle|Rate)\w*|configure\w*)$"
 )
+REPLAY_GUARD_RE = re.compile(
+    r"\w*nonce\w*\s*(?:\[[^\]]*\]\s*)*(?:\+\+|\+=|\|=|=\s*\w*nonce\w*\s*(?:\[[^\]]*\]\s*)*\+)"   # nonce++ / nonces[a]++ / bitmap |=
+    r"|\+\+\s*\w*nonce\w*"                                                                      # ++nonce
+    r"|_use\w*Nonce\s*\(|incrementNonce|invalidateNonce|_invalidate\w*"                       # OZ Nonces, Permit2
+    r"|\b\w*(?:used|executed|claimed|consumed|processed|redeemed|filled|spent|cancelled|seen)\w*"
+    r"\s*(?:\[[^\]]*\]\s*)+=\s*(?:true|1\b|block\.)"                                            # used[digest] = true
+    r"|sequence|replay|invalidat", re.I)
 PRICE_SOURCE_RE = re.compile(
     r"latestRoundData|latestAnswer|getExpiryPrice|getPrice\w*\s*\(|getUnderlyingPrice|updatePriceFeeds|"
     r"parsePriceFeedUpdates|getUpdateFee|get_virtual_price|getRate\s*\(|pricePerShare|exchangeRate\w*\s*\(|"
@@ -374,6 +406,14 @@ def _privileged(project: Project):
         if not PRIVILEGED_NAME_RE.match(fn.name) or fn.name in USER_SCOPED_SETTERS:
             continue
         if fn.name.startswith("initialize") or access_controlled(fn, project) or calls_guarded_helper(fn, project):
+            continue
+        # Metadata setters (token URI, name, symbol, description) cannot move funds.
+        if re.search(r"URI|Uri|Metadata|Description|Image|Symbol|Name(?!d)|Banner|Logo", fn.name):
+            continue
+        # Delegate-forwarding wallets (exchange deposit wallets: `sweeperOf(t).delegatecall(msg.data)`): the
+        # logic - and its caller check - lives in the registered delegate, which is analysed on its own.
+        fwd = re.search(r"([\w.()\[\]]+)\s*\.\s*delegatecall\s*\(\s*msg\.data\s*\)", fn.body or "")
+        if fwd and root_identifier(fwd.group(1)) not in fn.param_names:
             continue
         if re.search(rf"\[\s*{SENDER}\s*\]", fn.body or ""):
             continue  # user-scoped state, e.g. prefs[msg.sender]
@@ -1017,7 +1057,13 @@ def _sig_replay(project: Project):
         m = re.search(r"\becrecover\s*\(|ECDSA\.recover\s*\(|\.recover\s*\(", body)
         if not m or fn.contract.kind == "library":
             continue  # stateless helpers (e.g. ECDSA) cannot hold nonces themselves
-        ctext = fn.contract.text
+        # The nonce often lives in a child (GnosisSafe holds `nonce`, SignatureDecoder recovers), so
+        # judge the whole family: the contract, what it inherits, and what inherits from it.
+        ctext = family_text(fn.contract, project)
+        # ERC-1271 validators (isValidSignature, return 0x1626ba7e): they answer "did my key sign this?"
+        # for an external protocol, which owns the nonce/order bookkeeping (AirSwap, Permit2, Seaport).
+        if re.search(r"0x1626ba7e|isValidSignature", body + " " + fn.name) or fn.name == "isValidSignature":
+            continue
         # ERC-4337 smart accounts: the EntryPoint enforces the nonce and the userOpHash binds chainid +
         # EntryPoint address, so replay protection lives outside the account contract by design.
         if re.search(r"UserOperation|userOpHash|IEntryPoint|_validateSignature", ctext) and \
@@ -1025,13 +1071,18 @@ def _sig_replay(project: Project):
             continue
         # replay protection comes under many names: nonces, sequence ids (BitGo), used/executed/claimed
         # digests, invalidated hashes, cancelled orders, bitmaps (Permit2)...
-        if not re.search(r"nonce|sequence|used\w*\s*\[|executed\s*\[|claimed\s*\[|consumed\s*\[|_useNonce|isUsed"
-                         r"|replay|invalidat|cancelled\s*\[|filled\s*\[|spent\s*\[|bitmap|processed\s*\[|redeemed\s*\[", ctext, re.I):
-            yield Hit(fn, m.start(), f"`{fn.name}` verifies a signature but the contract tracks no nonce/used-digest.")
+        # A nonce only protects if it is CONSUMED: incremented, marked used, or a bitmap bit set.
+        # A declared-but-never-incremented nonce is itself the bug.
+        if not REPLAY_GUARD_RE.search(ctext):
+            declared = re.search(r"\bnonce", ctext, re.I)
+            yield Hit(fn, m.start(), f"`{fn.name}` verifies a signature but nothing consumes a nonce or marks the digest used"
+                                     + (" (a nonce is declared but never incremented)." if declared else "."))
         elif not re.search(r"block\.chainid|chainid\s*\(|_hashTypedDataV4|DOMAIN_SEPARATOR|_domainSeparator|EIP712"
                            r"|getNetworkId|networkId|chainId", ctext):   # BitGo binds via a per-chain network id
             yield Hit(fn, m.start(), f"`{fn.name}` signed digest does not bind chainid (cross-chain replay).", severity="medium")
-        if "ecrecover" in m.group(0) and not re.search(r"address\s*\(\s*0\s*\)", body):
+        # A helper that just returns ecrecover leaves the zero-check to its caller.
+        if "ecrecover" in m.group(0) and not re.search(r"address\s*\(\s*0\s*\)", body) \
+                and not re.search(r"return\s+ecrecover\s*\(", body):
             yield Hit(fn, m.start(), "`ecrecover` result is not checked against address(0); invalid signatures may authorize an unset signer.", severity="medium")
 
 

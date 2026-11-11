@@ -62,3 +62,40 @@ contract PythAdapterLike {
         pyth.updatePriceFeeds{value: pyth.getUpdateFee(d)}(d);
     }
 }
+
+// ERC-1271 validator (AirSwap RFQ style): the consuming protocol owns the nonce bookkeeping.
+contract Erc1271Bot {
+    address internal _rfqSigner;
+    function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4) {
+        return _validateSignature(hash, signature);
+    }
+    function _validateSignature(bytes32 hash, bytes memory signature) internal view returns (bytes4) {
+        address recovered = ECDSA.recover(hash, signature);
+        require(recovered != address(0) && recovered == _rfqSigner);
+        return 0x1626ba7e;
+    }
+}
+
+// Gnosis Safe layout: signatures recovered in a parent, replay nonce kept by the child.
+contract SigDecoder {
+    function recoverKey(bytes32 messageHash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {
+        return ecrecover(messageHash, v, r, s);
+    }
+}
+contract SafeLike is SigDecoder {
+    uint256 public nonce;
+    address public owner;
+    function execTransaction(bytes32 txHash, uint8 v, bytes32 r, bytes32 s) external {
+        bytes32 h = keccak256(abi.encode(txHash, nonce++, block.chainid));
+        require(recoverKey(h, v, r, s) == owner);
+    }
+}
+
+// Manifold creator style: metadata setters gated by a requireExtension() helper.
+contract CreatorLike {
+    mapping(address => bool) internal _extensions;
+    mapping(address => string) internal _base;
+    function requireExtension() internal view { require(_extensions[msg.sender], "Must be registered extension"); }
+    function setBaseTokenURIExtension(string calldata uri) external { requireExtension(); _base[msg.sender] = uri; }
+    function setRoyaltiesExtension(address payable receiver) external { requireExtension(); receiver; }
+}
