@@ -41,6 +41,12 @@ class Store:
         self._lock = threading.RLock()
         with self._lock:
             self.db.executescript(SCHEMA)
+            # additive migrations for databases created by older versions
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(contracts)")}
+            for name, decl in (("value_usd", "REAL"), ("holdings", "TEXT"), ("value_checked", "REAL")):
+                if name not in cols:
+                    self.db.execute(f"ALTER TABLE contracts ADD COLUMN {name} {decl}")
+            self.db.commit()
 
     def enqueue(self, chain: str, address: str, origin: str) -> bool:
         with self._lock:
@@ -81,6 +87,15 @@ class Store:
     def by_status(self, status: str) -> list[sqlite3.Row]:
         with self._lock:
             return self.db.execute("SELECT * FROM contracts WHERE status = ? ORDER BY updated DESC", (status,)).fetchall()
+
+    def value_stats(self) -> dict:
+        """USD held by scanned contracts, and by the vulnerable ones (only rows with a known value)."""
+        with self._lock:
+            seen, priced = self.db.execute(
+                "SELECT COALESCE(SUM(value_usd),0), COUNT(value_usd) FROM contracts WHERE status IN ('safe','vulnerable')").fetchone()
+            vuln = self.db.execute("SELECT COALESCE(SUM(value_usd),0) FROM contracts WHERE status='vulnerable'").fetchone()[0]
+            top = self.db.execute("SELECT COALESCE(MAX(value_usd),0) FROM contracts WHERE status IN ('safe','vulnerable')").fetchone()[0]
+        return {"seen_usd": seen, "priced": priced, "vulnerable_usd": vuln, "max_usd": top}
 
     def fetch_one(self, chain: str, address: str) -> sqlite3.Row | None:
         with self._lock:

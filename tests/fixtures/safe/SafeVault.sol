@@ -84,3 +84,16 @@ contract SafeERC1363Like {
     }
     address public pair;
 }
+
+// Factory-gated initializer (UniswapV2Pair pattern) - protected, must NOT be flagged.
+contract FactoryInitPair {
+    address public factory;
+    address public token0;
+    address public token1;
+    constructor() { factory = msg.sender; }
+    function initialize(address _token0, address _token1) external {
+        require(msg.sender == factory, "FORBIDDEN");
+        token0 = _token0;
+        token1 = _token1;
+    }
+}

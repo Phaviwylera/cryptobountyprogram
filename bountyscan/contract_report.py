@@ -40,7 +40,8 @@ def _rel(path: str, src_dir: Path) -> str:
 
 
 def write_contract_report(chain: str, address: str, meta: dict, findings: list[Finding], balance_wei: int | None,
-                          src_dir: Path, out_dir: Path, verdicts=None) -> Path:
+                          src_dir: Path, out_dir: Path, verdicts=None, holdings=None) -> Path:
+    from .value import describe as describe_value
     vmap = {}
     if verdicts:
         for v in verdicts:
@@ -61,7 +62,7 @@ def write_contract_report(chain: str, address: str, meta: dict, findings: list[F
         f"| Chain / address | {chain} / [`{address}`]({explorer_url(chain, address)}) |",
         f"| Contract | {name} (compiler {meta.get('compiler') or '?'}) |",
         f"| Proxy | {'yes, implementation ' + str(meta.get('implementation')) if meta.get('proxy') else 'no'} |",
-        f"| Native balance at scan | {'unknown' if balance_wei is None else f'{balance_wei / WEI:.6f}'} |",
+        f"| Value held at scan | {describe_value(holdings) if holdings else ('unknown' if balance_wei is None else f'{balance_wei / WEI:.6f} native')} |",
         f"| Scanned | {now} |",
         "",
         "> These are fund-theft **candidates** from static analysis. Before telling anyone: confirm the call path,",
@@ -127,7 +128,7 @@ def write_summary(store, out_dir: Path) -> Path:
     counts = store.counts()
     vulns = store.by_status("vulnerable")
     rank = {"critical": 0, "high": 1}
-    vulns = sorted(vulns, key=lambda r: (rank.get(r["max_severity"], 9), -int(r["balance_wei"] or 0)))
+    vulns = sorted(vulns, key=lambda r: (-(r["value_usd"] or 0), rank.get(r["max_severity"], 9)))
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     total = sum(counts.values())
     lines = [
@@ -150,9 +151,9 @@ def write_summary(store, out_dir: Path) -> Path:
     if not vulns:
         lines.append("None so far.")
     else:
-        lines += ["| Worst | Findings | Chain | Address | Contract | Native balance | Report |", "|---|---|---|---|---|---|---|"]
+        lines += ["| Worst | Findings | Chain | Address | Contract | Value held (USD) | Report |", "|---|---|---|---|---|---|---|"]
         for r in vulns:
-            bal = f"{int(r['balance_wei']) / WEI:.4f}" if r["balance_wei"] else "?"
+            bal = f"${r['value_usd']:,.2f}" if r["value_usd"] is not None else "?"
             rel = Path(r["report"]).resolve()
             try:
                 rel = rel.relative_to(out_dir.resolve())

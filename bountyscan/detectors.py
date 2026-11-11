@@ -414,7 +414,9 @@ def _initializer(project: Project):
         body = fn.body or ""
         if re.search(r"initiali[sz]ed|_initializing|inited|require\s*\(\s*!?\s*\w*[Ii]nit", body) or ONE_TIME_GUARD_RE.search(body):
             continue
-        if access_controlled(fn, project) and not uses_sender(fn):
+        # A real caller check (`require(msg.sender == factory)`, onlyOwner, ...) protects it.
+        # `owner = msg.sender` alone does not - that is the classic front-runnable initializer.
+        if is_role_controlled(fn, project) or (access_controlled(fn, project) and not uses_sender(fn)):
             continue
         yield Hit(fn, fn.offset, f"`{fn.name}` has no initializer guard; it can be front-run or called again.", absolute=True)
 

@@ -61,7 +61,11 @@ class RPC:
         out = []
         for tx in self.block(number, True).get("transactions", []):
             if isinstance(tx, dict) and tx.get("to") is None:
-                addr = self.receipt(tx["hash"]).get("contractAddress")
+                rc = self.receipt(tx["hash"])
+                # A reverted creation still reports a contractAddress, but nothing was deployed there.
+                if rc.get("status") not in ("0x1", 1):
+                    continue
+                addr = rc.get("contractAddress")
                 if addr:
                     out.append(addr)
         return out

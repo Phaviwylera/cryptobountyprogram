@@ -20,7 +20,8 @@ from .detectors import SEVERITY_RANK
 from .remediation import is_fund_theft
 from .rpc import RPC, RPCError
 from .scanner import scan
-from .sources import ADDRESS_RE, ExplorerFatal, NotVerified, fetch_verified_source, read_meta
+from .sources import ADDRESS_RE, ExplorerFatal, NotVerified, chain_id_of, fetch_verified_source, read_meta
+from .value import describe as describe_value, holdings as read_holdings
 from .verifier import confirmed_findings, verify_findings
 
 WEI = 10**18
@@ -33,7 +34,8 @@ class AutoConfig:
     api_key: str | None = None
     rpc: RPC | None = None
     min_balance_wei: int = 0
-    max_attempts: int = 6          # unverified retries before giving up
+    min_value_usd: float = 0.0     # skip contracts holding less than this (native + major tokens, USD)
+    max_attempts: int = 6         # unverified retries before giving up
     retry_base: float = 600.0      # seconds; doubles each attempt (10m, 20m, 40m, ...)
     verify: bool = True            # independent second pass must confirm each finding
     quiet: bool = False
@@ -79,20 +81,26 @@ def process(store, row, cfg: AutoConfig) -> str:
     chain, address = row["chain"], row["address"]
 
     balance = None
+    held = None
     short = f"{address[:8]}…{address[-4:]}"
     if cfg.rpc is not None:
-        _stage(cfg, f"Checking code & balance of {short}")
+        _stage(cfg, f"Checking code & value held by {short}")
         try:
             if cfg.rpc.code(address) in ("0x", "0x0", ""):
                 store.update(chain, address, status="no_code")
                 return "no_code"
             balance = cfg.rpc.balance(address)
-        except RPCError as exc:
-            balance = None
+            held = read_holdings(cfg.rpc, chain_id_of(chain), address, balance)
+        except (RPCError, ValueError) as exc:
             _log(cfg, f"    rpc warning: {exc}")
-        if balance is not None and balance < cfg.min_balance_wei:
-            store.update(chain, address, status="low_value", balance_wei=str(balance))
+        value_fields = value_columns(held)
+        too_little = (balance is not None and balance < cfg.min_balance_wei) or \
+            (cfg.min_value_usd > 0 and held is not None and held["usd"] is not None and held["usd"] < cfg.min_value_usd)
+        if too_little:
+            store.update(chain, address, status="low_value", balance_wei=None if balance is None else str(balance), **value_fields)
             return "low_value"
+    else:
+        value_fields = {}
 
     _stage(cfg, f"Fetching verified source of {short} from the explorer")
     try:
@@ -127,14 +135,31 @@ def process(store, row, cfg: AutoConfig) -> str:
         if candidates and (verdicts is not None):
             extra = f" ({len(candidates)} candidate(s) not confirmed by second pass)"
         store.update(chain, address, status="safe", name=name, findings=0, max_severity=None,
-                     balance_wei=None if balance is None else str(balance), error=extra or None)
+                     balance_wei=None if balance is None else str(balance), error=extra or None, **value_fields)
         return "safe"
 
-    report = write_contract_report(chain, address, meta, theft, balance, src, cfg.out_dir, verdicts=verdicts)
+    report = write_contract_report(chain, address, meta, theft, balance, src, cfg.out_dir, verdicts=verdicts, holdings=held)
     worst = min(theft, key=lambda f: SEVERITY_RANK[f.severity]).severity
     store.update(chain, address, status="vulnerable", name=name, findings=len(theft), max_severity=worst,
-                 balance_wei=None if balance is None else str(balance), report=str(report), error=None)
+                 balance_wei=None if balance is None else str(balance), report=str(report), error=None, **value_fields)
     return "vulnerable"
+
+
+def value_columns(held: dict | None) -> dict:
+    """DB columns for a holdings snapshot (empty when value could not be read)."""
+    if held is None:
+        return {}
+    import json
+    return {"value_usd": held["usd"], "holdings": json.dumps(held["items"]), "value_checked": time.time()}
+
+
+def recheck_value(store, row, rpc: RPC) -> tuple[float | None, float | None]:
+    """Re-read what a contract holds now. Returns (old_usd, new_usd)."""
+    old = row["value_usd"]
+    bal = rpc.balance(row["address"])
+    held = read_holdings(rpc, chain_id_of(row["chain"]), row["address"], bal)
+    store.update(row["chain"], row["address"], balance_wei=str(bal), **value_columns(held))
+    return old, held["usd"]
 
 
 def _describe(status: str, store, chain: str, address: str) -> str:

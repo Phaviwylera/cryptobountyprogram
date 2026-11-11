@@ -148,7 +148,7 @@ def fetch_verified_source(address: str, chain: str, dest: Path, api_key: str | N
         if out_dir.resolve() not in target.resolve().parents:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        target.write_text(content, encoding="utf-8", newline="")   # keep line endings exact (line numbers)
 
     meta = {
         "address": address, "chain": chain_key, "chain_id": chain_id,

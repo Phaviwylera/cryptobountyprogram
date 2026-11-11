@@ -154,6 +154,8 @@ INDEX_HTML = r"""<!doctype html>
   <span><span class="k">SAFE</span><span class="v" id="tSafe" style="color:var(--teal)">0</span></span>
   <a href="#findings"><span class="k">VULN</span><span class="v" id="tVuln" style="color:var(--pink)">0</span></a>
   <span class="opt"><span class="k">WAIT</span><span class="v" id="tWait" style="color:var(--orange)">0</span></span>
+  <span><span class="k">VALUE SEEN</span><span class="v" id="tValue" style="color:var(--cyan)">$0</span></span>
+  <a href="#findings"><span class="k">AT RISK</span><span class="v" id="tRisk" style="color:var(--pink)">$0</span></a>
   <span class="opt"><span class="k">T</span><span class="v" id="tT">0.00</span></span>
   <span class="opt"><span class="k">FRAME</span><span class="v" id="tFrame">0000</span></span>
   <span class="brand" id="tBrand">bountyscan.live</span>
@@ -173,7 +175,8 @@ INDEX_HTML = r"""<!doctype html>
     <div class="drawer" id="drGear">
       <label>Chain</label>
       <select id="liveChain"><option>ethereum</option><option>base</option><option>arbitrum</option><option>optimism</option><option>polygon</option><option>bsc</option><option>avalanche</option></select>
-      <label>Min native balance (0 = scan all)</label><input id="liveMinBal" value="0" inputmode="decimal">
+      <label>Min value held, USD (0 = scan all)</label><input id="liveMinUsd" value="0" inputmode="decimal">
+      <div style="color:var(--dim);font-size:10px;margin-top:4px">native coin + USDC, USDT, DAI, USDS, USDe, WETH, stETH, wstETH, WBTC · priced by Chainlink</div>
       <label>Start from block (blank = chain head)</label><input id="liveFromBlock" placeholder="latest">
     </div>
     <button class="cmd imm" id="btnImm">◆ IMMUNEFI SCAN</button>
@@ -216,6 +219,9 @@ const api = (p,m,b) => fetch(p,{method:m||'GET',headers:{'Content-Type':'applica
   .then(async r => { const j = await r.json().catch(()=>({})); if(!r.ok && !j.error) j.error = 'HTTP '+r.status; return j; });
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const short = a => a ? a.slice(0,6)+'…'+a.slice(-4) : '';
+const usd = v => v == null ? '?' : v >= 1e9 ? '$'+(v/1e9).toFixed(2)+'B' : v >= 1e6 ? '$'+(v/1e6).toFixed(2)+'M'
+  : v >= 1e3 ? '$'+(v/1e3).toFixed(1)+'K' : '$'+Number(v).toFixed(v < 10 ? 2 : 0);
+const holdTxt = h => (h||[]).slice(0,3).map(i => `${Number(i.amount).toLocaleString('en-US',{maximumSignificantDigits:4})} ${i.symbol}`).join(' · ');
 const rgb = hex => { const n = parseInt(hex.slice(1),16); return [(n>>16)&255,(n>>8)&255,n&255].join(','); };
 
 /* ---------------- phases (the real pipeline) ---------------- */
@@ -408,7 +414,8 @@ function render(now){
     g.fillText(c.name || short(c.addr), lx, ly);
     g.font = '400 10px JetBrains Mono, monospace'; g.fillStyle = '#5d6878';
     const VERB = {discover:'discovered', fetch:'fetching source', scan:'scanning · detectors', verify:'verifying · 2nd pass', next:'queued'};
-    g.fillText(isA && phase !== 'report' ? VERB[phase] : (STATUS_TXT[status] || status), lx, ly+13);
+    const worth = c.usd != null ? ' · ' + usd(c.usd) : '';
+    g.fillText((isA && phase !== 'report' ? VERB[phase] : (STATUS_TXT[status] || status)) + worth, lx, ly+13);
     g.globalAlpha = 1;
   }
 
@@ -510,7 +517,8 @@ function drawRadar(){
 
 /* ---------------- polling ---------------- */
 const KIND = {found:['find','#f2c14e'], safe:['safe','#4fd1b5'], vulnerable:['VULN','#ff5c8a'], unverified:['wait','#c99a3c'],
-  no_code:['skip','#5d6878'], low_value:['skip','#5d6878'], unverified_final:['drop','#5d6878'], error:['err','#ff5c8a'], info:['info','#3fb8e6']};
+  no_code:['skip','#5d6878'], low_value:['skip','#5d6878'], unverified_final:['drop','#5d6878'], error:['err','#ff5c8a'], info:['info','#3fb8e6'],
+  funded:['FUND','#ff8a5c']};
 const ADDR_RE = /0x[0-9a-fA-F]{40}/;
 
 function phaseOf(s){
@@ -534,8 +542,11 @@ async function poll(){
     const m = (e.msg || '').match(ADDR_RE); const isNew = !seen.has(e.id); seen.add(e.id);
     if (!m) continue;
     const nm = (e.msg.match(/\(([^)]+)\)/) || [])[1] || '';
-    const status = e.kind === 'found' ? 'queued' : e.kind;
-    if (KIND[e.kind] && e.kind !== 'info') upsert(m[0], nm ? {status, name:nm} : {status});
+    const status = e.kind === 'found' ? 'queued' : e.kind === 'funded' ? 'vulnerable' : e.kind;
+    const held = e.msg.match(/(?:Holds|holds) \$([\d,]+(?:\.\d+)?)/);
+    const patch = {status}; if (nm) patch.name = nm; if (held) patch.usd = parseFloat(held[1].replace(/,/g,''));
+    if (KIND[e.kind] && e.kind !== 'info') upsert(m[0], patch);
+    if (isNew && !firstPoll && e.kind === 'funded') toast('$ ' + e.msg, true);
     if (isNew && !firstPoll && e.kind !== 'found' && e.kind !== 'info'){ newResults++; lastResult = performance.now(); }
     if (isNew && !firstPoll && e.kind === 'vulnerable'){ toast('⚑ ' + e.msg, true);
       api(`/api/result?chain=${s.chain}&addr=${m[0].toLowerCase()}`).then(r => { if (r.findings) findingsCache[m[0].toLowerCase()] = r.findings.findings || []; }); }
@@ -557,6 +568,7 @@ function updateChrome(s){
   const total = Object.values(c).reduce((a,b)=>a+b,0);
   $('#tFound').textContent = total; $('#tScanned').textContent = (c.safe||0)+(c.vulnerable||0);
   $('#tSafe').textContent = c.safe||0; $('#tVuln').textContent = c.vulnerable||0; $('#tWait').textContent = c.unverified||0;
+  const vs = s.value || {}; $('#tValue').textContent = usd(vs.seen_usd || 0); $('#tRisk').textContent = usd(vs.vulnerable_usd || 0);
   if (s.mode === 'idle') $('#tT').textContent = '0.00';
   document.querySelectorAll('.tab').forEach((t,i)=>{ const k = t.dataset.k, ai = PHI[phase];
     t.className = 'tab ' + (s.mode === 'idle' ? 'future' : i === ai ? 'on' : i < ai ? 'past' : 'future');
@@ -654,15 +666,20 @@ async function loadTable(){
   if (ftab === 'safe') safeHeld = rows.filter(r => (r.error||'').includes('not confirmed')).length;
   const w = $('#fTable');
   if (!rows.length){ w.innerHTML = `<div class="empty">${ftab==='results' ? 'no confirmed vulnerabilities yet · the crawler keeps going' : 'nothing here yet'}</div>`; return; }
+  rows.sort((a,b) => (b.value_usd||0) - (a.value_usd||0));
+  const valCell = r => `<td style="color:${(r.value_usd||0) >= 1000 ? 'var(--yellow)' : 'var(--dim)'}">${usd(r.value_usd)}</td><td style="color:var(--dim)">${esc(holdTxt(r.holdings)) || (r.value_usd === 0 ? 'holds nothing' : '-')}</td>`;
   if (ftab === 'results'){
-    w.innerHTML = `<table><thead><tr><th>severity</th><th>findings</th><th>chain</th><th>address</th><th>contract</th><th>balance</th></tr></thead><tbody>` +
+    w.innerHTML = `<table><thead><tr><th>severity</th><th>findings</th><th>value held</th><th>holdings</th><th>chain</th><th>address</th><th>contract</th></tr></thead><tbody>` +
       rows.map(r => `<tr class="click" data-c="${esc(r.chain)}" data-a="${esc(r.address)}"><td><span class="sev ${esc(r.max_severity)}">${esc(r.max_severity)}</span></td>
-        <td>${r.findings||0}</td><td>${esc(r.chain)}</td><td>${esc(r.address)}</td><td>${esc(r.name||'')}</td><td>${r.balance==null?'?':r.balance.toFixed(4)}</td></tr>`).join('') + '</tbody></table>';
+        <td>${r.findings||0}</td>${valCell(r)}<td>${esc(r.chain)}</td><td>${esc(r.address)}</td><td>${esc(r.name||'')}</td></tr>`).join('') + '</tbody></table>';
     w.querySelectorAll('tr.click').forEach(tr => tr.onclick = () => openReport(tr.dataset.c, tr.dataset.a));
   } else {
-    w.innerHTML = `<table><thead><tr><th>chain</th><th>address</th><th>contract</th><th>note</th></tr></thead><tbody>` +
-      rows.map(r => `<tr><td>${esc(r.chain)}</td><td>${esc(r.address)}</td><td>${esc(r.name||'')}</td><td style="color:var(--dim)">${esc(r.error||'clear')}</td></tr>`).join('') + '</tbody></table>';
+    w.innerHTML = `<table><thead><tr><th>value held</th><th>holdings</th><th>chain</th><th>address</th><th>contract</th><th>note</th></tr></thead><tbody>` +
+      rows.map(r => `<tr>${valCell(r)}<td>${esc(r.chain)}</td><td>${esc(r.address)}</td><td>${esc(r.name||'')}</td><td style="color:var(--dim)">${esc(r.error||'clear')}</td></tr>`).join('') + '</tbody></table>';
   }
+  $('#fNote').textContent = ftab === 'results'
+    ? 'confirmed by the independent second pass · sorted by value held · re-checked every 10 min'
+    : 'value = native coin + major tokens, priced by Chainlink';
 }
 async function openReport(chain, addr){
   const d = await api(`/api/result?chain=${chain}&addr=${addr}`);
@@ -679,7 +696,7 @@ $('#btnImm').onclick = () => $('#drImm').classList.toggle('open');
 $('#btnLive').onclick = async () => {
   const b = $('#btnLive'); b.dataset.busy = 1; b.textContent = '… STARTING'; b.disabled = true;
   const fb = $('#liveFromBlock').value.trim();
-  const r = await api('/api/live/start','POST',{chain:$('#liveChain').value, min_balance:parseFloat($('#liveMinBal').value||'0')||0, from_block: fb ? parseInt(fb) : null});
+  const r = await api('/api/live/start','POST',{chain:$('#liveChain').value, min_value_usd:parseFloat($('#liveMinUsd').value||'0')||0, from_block: fb ? parseInt(fb) : null});
   delete b.dataset.busy;
   r.error ? toast('could not start · ' + r.error, true) : toast('live crawl started on ' + $('#liveChain').value);
   poll();

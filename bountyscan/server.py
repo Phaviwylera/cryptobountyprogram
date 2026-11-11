@@ -47,6 +47,8 @@ class Worker:
         self.chain = cfg_default_chain()
         self.cursor: int | None = None
         self.min_balance_wei = 0
+        self.min_value_usd = 0.0
+        self._last_recheck = 0.0
         self.current = None
         self.last_error = None
         self.started_at = None
@@ -77,6 +79,8 @@ class Worker:
             try:
                 if self.mode == "live" and self.rpc is not None:
                     self._discover_step()
+                if self.rpc is not None and time.time() - self._last_recheck > 600:
+                    self._recheck_vulnerable_value()
                 did = self._scan_step()
                 if not did:
                     if self.mode == "draining" and not self.store.pending_count():
@@ -110,6 +114,25 @@ class Worker:
                 discover_blocks(self.store, self.rpc, self.chain, self.cursor + 1, end, self.cfg)
             self.cursor = end
 
+    FUNDED_ALERT_USD = 1000.0
+
+    def _recheck_vulnerable_value(self) -> None:
+        """Funds often arrive after deployment. Re-read what every vulnerable contract holds;
+        alert when one crosses the funded threshold - that is the one worth a PoC and a report."""
+        from .auto import recheck_value
+        from .sources import chain_id_of
+        self._last_recheck = time.time()
+        for row in self.store.by_status("vulnerable")[:100]:
+            try:
+                if chain_id_of(row["chain"]) != chain_id_of(self.chain):
+                    continue      # this RPC only reads its own chain
+                old, new = recheck_value(self.store, row, self.rpc)
+            except Exception:
+                continue
+            if new is not None and new >= self.FUNDED_ALERT_USD and (old or 0) < self.FUNDED_ALERT_USD:
+                self.add_event("funded", f"FUNDED - vulnerable {row['address']}"
+                               + (f" ({row['name']})" if row["name"] else "") + f" now holds ${new:,.0f}. Prioritise this one.")
+
     def _scan_step(self) -> bool:
         with self.lock:
             rows = self.store.due(1)
@@ -119,6 +142,7 @@ class Worker:
             self.current = {"chain": row["chain"], "address": row["address"]}
             from .auto import process
             self.cfg.min_balance_wei = self.min_balance_wei
+            self.cfg.min_value_usd = self.min_value_usd
             try:
                 status = process(self.store, row, self.cfg)
             except Exception as exc:
@@ -131,13 +155,16 @@ class Worker:
         done = self.store.fetch_one(row["chain"], row["address"])
         name = (done["name"] if done and done["name"] else "")
         label = f"{row['address']}" + (f" ({name})" if name else "")
+        worth = ""
+        if done and done["value_usd"] is not None:
+            worth = f" Holds ${done['value_usd']:,.2f}."
         text = {
-            "vulnerable": f"VULNERABLE - {label}: {done['findings'] if done else '?'} confirmed fund-theft finding(s), worst {done['max_severity'] if done else '?'}. Report saved.",
-            "safe": f"SAFE - {label}: no fund-theft pattern" + (f" {done['error']}" if done and done['error'] else "") + ".",
+            "vulnerable": f"VULNERABLE - {label}: {done['findings'] if done else '?'} confirmed fund-theft finding(s), worst {done['max_severity'] if done else '?'}.{worth} Report saved.",
+            "safe": f"SAFE - {label}: no fund-theft pattern" + (f" {done['error']}" if done and done['error'] else "") + f".{worth}",
             "unverified": f"Not verified on the explorer yet - {label}. Will retry automatically.",
             "unverified_final": f"Gave up - {label} was never verified.",
             "no_code": f"Skipped - {label} has no code (self-destructed or EOA).",
-            "low_value": f"Skipped - {label} holds less than the minimum balance.",
+            "low_value": f"Skipped - {label} holds less than the minimum value.{worth}",
             "error": f"Error - {label}: {done['error'] if done else ''}",
         }.get(status, f"{status} - {label}")
         self.add_event(status, text)
@@ -149,12 +176,13 @@ class Worker:
             self._thread = threading.Thread(target=self._run, daemon=True, name="bountyscan-worker")
             self._thread.start()
 
-    def start_live(self, chain, from_block, min_balance_wei):
+    def start_live(self, chain, from_block, min_balance_wei, min_value_usd: float = 0.0):
         if self.rpc is None:
             raise RuntimeError("live scan needs an RPC endpoint (set RPC_URL)")
         self.chain = chain
         self.cursor = (from_block - 1) if from_block is not None else None
         self.min_balance_wei = min_balance_wei
+        self.min_value_usd = max(0.0, float(min_value_usd or 0))
         self.mode = "live"
         self.started_at = self.started_at or time.time()
         self.set_stage(f"Starting live scan on {chain}…")
@@ -208,6 +236,8 @@ class Worker:
             "stage_age": round(time.time() - self.stage_at, 1),
             "events": list(self.events)[-60:],
             "batches": self._batch_progress(),
+            "value": self.store.value_stats(),
+            "min_value_usd": self.min_value_usd,
         }
 
 
@@ -290,9 +320,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/live/start":
                 chain = b.get("chain", cfg_default_chain())
                 fb = b.get("from_block")
-                mb = int(float(b.get("min_balance", 0)) * 10**18)
-                w.start_live(chain, fb, mb)
-                return self._send(200, {"ok": True, "mode": w.mode})
+                mb = int(float(b.get("min_balance", 0) or 0) * 10**18)
+                w.start_live(chain, fb, mb, float(b.get("min_value_usd", 0) or 0))
+                return self._send(200, {"ok": True, "mode": w.mode, "min_value_usd": w.min_value_usd})
             if u.path == "/api/live/stop":
                 w.stop()
                 return self._send(200, {"ok": True, "mode": w.mode})
@@ -336,9 +366,15 @@ class Handler(BaseHTTPRequestHandler):
                 bal = int(r["balance_wei"]) / 10**18
             except ValueError:
                 bal = None
+        keys = r.keys()
+        try:
+            holdings = json.loads(r["holdings"]) if "holdings" in keys and r["holdings"] else []
+        except ValueError:
+            holdings = []
         return {
             "chain": r["chain"], "address": r["address"], "name": r["name"], "status": r["status"],
             "max_severity": r["max_severity"], "findings": r["findings"], "balance": bal,
+            "value_usd": r["value_usd"] if "value_usd" in keys else None, "holdings": holdings,
             "origin": r["origin"], "error": r["error"],
         }
 
@@ -354,7 +390,8 @@ def serve(host: str, port: int, out_dir: Path, cache_dir: Path, state: Path,
     autostart = os.environ.get("BOUNTYSCAN_AUTOSTART", "").lower()
     if autostart == "live" and rpc is not None:
         Handler.worker.start_live(cfg_default_chain(), None,
-                                  int(float(os.environ.get("BOUNTYSCAN_MIN_BALANCE", "0")) * 10**18))
+                                  int(float(os.environ.get("BOUNTYSCAN_MIN_BALANCE", "0")) * 10**18),
+                                  float(os.environ.get("BOUNTYSCAN_MIN_VALUE_USD", "0")))
     elif autostart in ("live", "drain"):
         Handler.worker.start_drain()
     httpd = ThreadingHTTPServer((host, port), Handler)
