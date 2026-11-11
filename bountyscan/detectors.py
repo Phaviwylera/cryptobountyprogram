@@ -185,7 +185,8 @@ def detector(id: str, title: str, severity: str, impact: str, recommendation: st
 
 SENDER = r"(?:msg\.sender|_msgSender\(\))"
 AUTH_MODIFIER_RE = re.compile(
-    r"only|auth|admin|owner|role|gov|restricted|guardian|keeper|operator|whitelist|allowlist|permission|requires",
+    r"only|auth|admin|owner|role|gov|restricted|guardian|keeper|operator|whitelist|allowlist|permission|requires"
+    r"|checkAccess|hasAccess|accessControl",   # `modifier checkAccess(UPGRADER_ROLE)` (Privacy Pools PoolVault)
     re.I,
 )
 AUTH_BODY_RE = re.compile(
@@ -196,6 +197,10 @@ AUTH_BODY_RE = re.compile(
     # AND-compound form `if (msg.sender == initializer && state == 0) { ... }` (narrowing conditions only).
     rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*(?:\)|&&)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*(?:\)|&&)"
     rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w+\s*\(\s*{SENDER}"   # named helper, not bare require(
+    # External/contract authorization PREDICATE in a guard: `if (controller.isSweeper(msg.sender))`,
+    # `require(registry.hasAccess(msg.sender))`, `if (!auth.canCall(msg.sender, ...))` - exchange sweeper
+    # wallets and access-controller registries delegate the caller check to another contract.
+    rf"|(?:require|if)\s*\(\s*!?\s*[\w.]+\.\s*(?:is|has|can|check|allowed|verify|only)\w*\s*\([^;{{]*{SENDER}"
     , re.M)
 # `address caller = _msgSender(); if (caller != authority()) revert ...;`
 SENDER_ALIAS_RE = re.compile(rf"\b(\w+)\s*=\s*{SENDER}\s*;")
@@ -308,6 +313,8 @@ ROLE_BODY_RE = re.compile(
     rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*(?:\)|&&)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*(?:\)|&&)"
     # a guard helper invoked ON the caller: requireMaster(msg.sender), _checkCaller(msg.sender), onlyX(msg.sender)
     rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w+\s*\(\s*{SENDER}"   # named helper, not bare require(
+    # external/contract authorization predicate: if (controller.isSweeper(msg.sender)) / require(x.hasRole(.., msg.sender))
+    rf"|(?:require|if)\s*\(\s*!?\s*[\w.]+\.\s*(?:is|has|can|check|allowed|verify|only)\w*\s*\([^;{{]*{SENDER}"
     , re.M)
 
 
