@@ -99,3 +99,56 @@ contract CreatorLike {
     function setBaseTokenURIExtension(string calldata uri) external { requireExtension(); _base[msg.sender] = uri; }
     function setRoyaltiesExtension(address payable receiver) external { requireExtension(); receiver; }
 }
+
+// Signature-gated rescue (relayer flow) with a consumed per-id nonce.
+contract SignedRescue {
+    address public signer;
+    mapping(bytes32 => uint64) public rescueNonces;
+    function _checkSignature(bytes32 digest, bytes calldata sig) internal view {
+        require(ECDSA.recover(digest, sig) == signer && signer != address(0));
+    }
+    function rescue(bytes32 id, address to, uint64 nonce, bytes calldata sig) external {
+        require(nonce == rescueNonces[id]);
+        _checkSignature(keccak256(abi.encode(id, to, nonce, block.chainid)), sig);
+        rescueNonces[id]++;
+        (bool ok, ) = to.call{value: 1}("");
+        require(ok);
+    }
+}
+
+// Voucher consumed by recording the minted id against it (non-boolean "used" marker).
+contract VoucherGateway {
+    address public signer;
+    mapping(bytes32 => uint256) public consumedInto;
+    uint256 public issued;
+    function claim(bytes32 inscription, address recipient, bytes calldata sig) external returns (uint256 id) {
+        require(ECDSA.recover(keccak256(abi.encode(inscription, recipient, block.chainid)), sig) == signer);
+        require(consumedInto[inscription] == 0);
+        id = ++issued;
+        consumedInto[inscription] = id;
+    }
+}
+
+// Uniswap v4 hook keeper poke: settles pending claims, pays nobody.
+interface IPoolManagerLike { function unlock(bytes calldata) external returns (bytes memory); }
+contract HookPoke {
+    IPoolManagerLike public poolManager; uint256 public pending;
+    function sweep() external { if (pending != 0) poolManager.unlock(abi.encode(uint8(2))); }
+}
+
+// Sweep to an immutable SINK after claiming from ANOTHER contract named LOCKS (external call, not inlined).
+interface ILocksLike { function claim(uint256) external; }
+interface IERC20Like { function balanceOf(address) external view returns (uint256); function transfer(address, uint256) external returns (bool); }
+contract LaunchSweep {
+    ILocksLike public immutable LOCKS; IERC20Like public immutable RESERVE; address public immutable SINK; uint256 anchorLock;
+    constructor(ILocksLike l, IERC20Like r, address s) { LOCKS = l; RESERVE = r; SINK = s; }
+    function sweep() external returns (uint256 got) {
+        uint256 before = RESERVE.balanceOf(address(this));
+        LOCKS.claim(anchorLock);
+        got = RESERVE.balanceOf(address(this)) - before;
+        require(RESERVE.transfer(SINK, got));
+    }
+}
+// an unrelated contract in the same bundle whose claim() pays the caller - must NOT leak into LaunchSweep
+contract OtherLocks { mapping(address => uint256) bal;
+    function claim(uint256 id) external { uint256 a = bal[msg.sender]; bal[msg.sender] = 0; (bool ok, ) = msg.sender.call{value: a}(""); require(ok); id; } }

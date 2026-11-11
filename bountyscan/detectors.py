@@ -105,6 +105,11 @@ def effective_body(fn: Function, project: Project, depth: int = 1, _seen: frozen
         allowed = ("internal", "private", "public", None) + (("external",) if self_call else ())
         if not (callee and callee is not fn and callee.body and callee.visibility in allowed):
             return None
+        # `X.f(...)` on anything but `this` is either a library call (using-for / Lib.f) or a call into
+        # ANOTHER contract. We only know the code of the former: never paste a same-named function from
+        # some other contract in the bundle (LOCKS.claim() is not this bundle's claim()).
+        if dotted and not self_call and callee.contract.kind != "library":
+            return None
         inner = effective_body(callee, project, depth - 1, seen)
         # Bind the callee's parameter names to the call's actual arguments so a forwarded
         # `data`/`target` reads as the caller's `routerData`/`strategy` (V14/V17 shapes).
@@ -382,7 +387,7 @@ REPLAY_GUARD_RE = re.compile(
     r"|\+\+\s*\w*nonce\w*"                                                                      # ++nonce
     r"|_use\w*Nonce\s*\(|incrementNonce|invalidateNonce|_invalidate\w*"                       # OZ Nonces, Permit2
     r"|\b\w*(?:used|executed|claimed|consumed|processed|redeemed|filled|spent|cancelled|seen)\w*"
-    r"\s*(?:\[[^\]]*\]\s*)+=\s*(?:true|1\b|block\.)"                                            # used[digest] = true
+    r"\s*(?:\[[^\]]*\]\s*)+=\s*(?!0\b|false\b|address\s*\(\s*0)"                              # used[h] = true / consumedInto[x] = id
     r"|sequence|replay|invalidat", re.I)
 PRICE_SOURCE_RE = re.compile(
     r"latestRoundData|latestAnswer|getExpiryPrice|getPrice\w*\s*\(|getUnderlyingPrice|updatePriceFeeds|"
@@ -406,6 +411,11 @@ def _privileged(project: Project):
         if not PRIVILEGED_NAME_RE.match(fn.name) or fn.name in USER_SCOPED_SETTERS:
             continue
         if fn.name.startswith("initialize") or access_controlled(fn, project) or calls_guarded_helper(fn, project):
+            continue
+        # Authorised by signature instead of msg.sender (meta-tx, relayer rescue, vouchers): still gated.
+        # Whether that signature can be replayed is the signature-replay detector's job.
+        if re.search(r"_check\w*Signature\w*\s*\(|_verify\w*Sig\w*\s*\(|SignatureChecker|isValidSignatureNow|"
+                     r"ECDSA\s*\.\s*recover|\becrecover\s*\(|MerkleProof\s*\.\s*verify", fn.body or ""):
             continue
         # Metadata setters (token URI, name, symbol, description) cannot move funds.
         if re.search(r"URI|Uri|Metadata|Description|Image|Symbol|Name(?!d)|Banner|Logo", fn.name):
@@ -432,6 +442,10 @@ def _privileged(project: Project):
             fixed = lambda r: is_immutable(fn.contract, r) or (r in project.state_vars and r not in fn.param_names)
             if recipients and all(fixed(r) for r in recipients) and not (recipients & fn.params_of_type("address")) \
                     and not re.search(rf"{SENDER}", " ".join(recipients)):
+                continue
+            # Keeper poke (Uniswap v4 hook `sweep()` settling claims): pays nobody it can be told about -
+            # no recipient at all, no address argument, and the caller's identity is never used.
+            if not recipients and not fn.params_of_type("address") and not re.search(SENDER, fn.body or ""):
                 continue
         # Permissionless "oracle poke" (Opyn setExpiryPriceInOracle, Pyth updatePrice): anyone may call it,
         # but the price is READ from a trusted source (feed / signed update), never supplied by the caller.
