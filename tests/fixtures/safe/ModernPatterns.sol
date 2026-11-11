@@ -152,3 +152,46 @@ contract LaunchSweep {
 // an unrelated contract in the same bundle whose claim() pays the caller - must NOT leak into LaunchSweep
 contract OtherLocks { mapping(address => uint256) bal;
     function claim(uint256 id) external { uint256 a = bal[msg.sender]; bal[msg.sender] = 0; (bool ok, ) = msg.sender.call{value: a}(""); require(ok); id; } }
+
+// User-scoped via a msg.sender alias: you can only set your own keys.
+contract KeyRegistry {
+    mapping(address => bytes32) internal _masterKeyOf;
+    function setMasterKeyAndSignKey(string memory masterKey) external {
+        address caller = msg.sender;
+        _masterKeyOf[caller] = keccak256(bytes(masterKey));
+    }
+}
+
+// Migration charges the caller: they burn their own tokens.
+interface IBurnable { function transferFrom(address, address, uint256) external returns (bool); function burn(uint256) external; }
+contract MigrationGate {
+    IBurnable public sourceToken; mapping(bytes32 => bool) public consumed;
+    function migrate(address recipient, uint256 amount, bytes32 nonce) external returns (bytes32 id) {
+        id = keccak256(abi.encode(msg.sender, nonce)); require(!consumed[id]); consumed[id] = true;
+        require(sourceToken.transferFrom(msg.sender, address(this), amount));
+        sourceToken.burn(amount); recipient;
+    }
+}
+
+// Liquidation recovery anyone may run: the executor it pays must be allowlisted.
+contract RecoveryTreasury {
+    mapping(address => bool) public allowedHotswapExecutor;
+    function recoverCollateral(uint256 cid, address asset, address executor, uint256 offered) external {
+        if (offered == 0 || !allowedHotswapExecutor[executor]) revert();
+        require(IBurnable(asset).transferFrom(address(this), executor, offered));
+        cid;
+    }
+}
+
+// Signer recovered in an internal view helper; the entrypoint marks each trade id consumed.
+contract BridgeVault {
+    address public agent; mapping(bytes32 => bool) public bridged;
+    function _getSigner(bytes32 tradeId, bytes memory sig) internal view returns (address) {
+        return ECDSA.recover(keccak256(abi.encode(tradeId, block.chainid, address(this))), sig);
+    }
+    function bridge(bytes32 tradeId, bytes calldata sig) external {
+        if (bridged[tradeId]) revert();
+        require(_getSigner(tradeId, sig) == agent);
+        bridged[tradeId] = true;
+    }
+}

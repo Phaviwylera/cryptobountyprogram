@@ -344,6 +344,7 @@ PAYOUT_RE = re.compile(
     r"|(\w+)\s*\.\s*call\s*\{\s*value"                              # x.call{value: ...}
     r"|\.\s*safeTransfer\s*\(\s*(\w+)\s*,"                          # token.safeTransfer(x, amt)
     r"|\.\s*transfer\s*\(\s*(\w+)\s*,"                              # token.transfer(x, amt)
+    r"|\.\s*(?:safeT|t)ransferFrom\s*\(\s*[^,()]+(?:\([^()]*\))?\s*,\s*(\w+)\s*,"   # token.transferFrom(from, x, amt)
     r"|sendValue\s*\(\s*(?:payable\s*\(\s*)?(\w+)"                  # Address.sendValue(x, amt)
     r"|safeTransferETH\s*\(\s*(\w+)"                                # SafeTransferLib.safeTransferETH(x, amt)
     r"|\bcall\s*\(\s*gas\s*\(\s*\)\s*,\s*(\w+)\s*,"                 # assembly { call(gas(), x, amt, ...) }
@@ -425,9 +426,17 @@ def _privileged(project: Project):
         fwd = re.search(r"([\w.()\[\]]+)\s*\.\s*delegatecall\s*\(\s*msg\.data\s*\)", fn.body or "")
         if fwd and root_identifier(fwd.group(1)) not in fn.param_names:
             continue
-        if re.search(rf"\[\s*{SENDER}\s*\]", fn.body or ""):
+        body = fn.body or ""
+        if re.search(rf"\[\s*{SENDER}\s*\]", body):
             continue  # user-scoped state, e.g. prefs[msg.sender]
-        if not (fn.body or "").strip():
+        # ... also through an alias: `address caller = msg.sender; _keyOf[caller] = ...`
+        if any(re.search(rf"\[\s*{re.escape(a)}\s*\]", body) for a in SENDER_ALIAS_RE.findall(body)):
+            continue
+        # A user action that charges the caller (migrate / deposit own tokens) is not an admin function.
+        aliases = "|".join([SENDER] + [re.escape(a) for a in SENDER_ALIAS_RE.findall(body)])
+        if re.search(rf"[Tt]ransferFrom\s*\(\s*(?:{aliases})\s*,", body):
+            continue
+        if not body.strip():
             continue
         # Permissionless sweep/rescue/collect/skim that only moves funds to a FIXED immutable/constant
         # address cannot redirect funds: anyone can trigger it, but the money goes to its owner.
@@ -446,6 +455,19 @@ def _privileged(project: Project):
             # Keeper poke (Uniswap v4 hook `sweep()` settling claims): pays nobody it can be told about -
             # no recipient at all, no address argument, and the caller's identity is never used.
             if not recipients and not fn.params_of_type("address") and not re.search(SENDER, fn.body or ""):
+                continue
+            # General rule: flag only when the CALLER can steer where money goes - a payout to an address
+            # parameter that is not allowlisted, or to the caller. Allowlisted executors
+            # (`allowedHotswapExecutor[executor]`) and token-identity params (asset/token) are not recipients.
+            eff3 = effective_body(fn, project, depth=3)
+            addr = fn.params_of_type("address")
+            allow = {p for p in addr if re.search(
+                rf"\w*(?:allow|approv|whitelist|trusted|valid|registered|enabled|supported|isExecutor)\w*\s*\[\s*{re.escape(p)}\s*\]",
+                eff3, re.I)}
+            tokenish = {p for p in addr if re.search(r"token|asset|currency|collateral|underlying|erc20|pool|vault|market", p, re.I)}
+            steerable = (addr - allow) & (recipients | ({p for p in addr} if not recipients else set())) - tokenish
+            to_caller = bool(recipients & {"msg", "_msgSender", *SENDER_ALIAS_RE.findall(eff3)})
+            if not steerable and not to_caller:
                 continue
         # Permissionless "oracle poke" (Opyn setExpiryPriceInOracle, Pyth updatePrice): anyone may call it,
         # but the price is READ from a trusted source (feed / signed update), never supplied by the caller.
@@ -1066,11 +1088,20 @@ def _slippage(project: Project):
     ["https://swcregistry.io/docs/SWC-121", "https://swcregistry.io/docs/SWC-117"],
 )
 def _sig_replay(project: Project):
-    for fn in project.functions():
-        body = fn.body or ""
-        m = re.search(r"\becrecover\s*\(|ECDSA\.recover\s*\(|\.recover\s*\(", body)
-        if not m or fn.contract.kind == "library":
-            continue  # stateless helpers (e.g. ECDSA) cannot hold nonces themselves
+    recover_re = re.compile(r"\becrecover\s*\(|ECDSA\.recover\s*\(|\.recover\s*\(|_?recoverKey\s*\(")
+    # Replay is a property of the STATE-CHANGING function that consumes a signature, not of a view or
+    # internal helper that merely recovers a signer (that helper may be used safely by its caller).
+    for fn in entrypoints(project):
+        if fn.contract.kind == "library":
+            continue
+        own = fn.body or ""
+        body = effective_body(fn, project, depth=2)
+        m = recover_re.search(body)
+        if not m:
+            continue
+        in_own = recover_re.search(own)
+        if in_own:
+            m = in_own
         # The nonce often lives in a child (GnosisSafe holds `nonce`, SignatureDecoder recovers), so
         # judge the whole family: the contract, what it inherits, and what inherits from it.
         ctext = family_text(fn.contract, project)
@@ -1087,16 +1118,21 @@ def _sig_replay(project: Project):
         # digests, invalidated hashes, cancelled orders, bitmaps (Permit2)...
         # A nonce only protects if it is CONSUMED: incremented, marked used, or a bitmap bit set.
         # A declared-but-never-incremented nonce is itself the bug.
-        if not REPLAY_GUARD_RE.search(ctext):
+        off, absolute = (m.start(), False) if in_own else (fn.offset, True)
+        # Consuming the signature also counts when the entrypoint (or its helpers) marks it - e.g. a
+        # per-trade id `if (bridged[tradeId]) revert; bridged[tradeId] = true` in the caller's own code.
+        guarded = REPLAY_GUARD_RE.search(ctext) or REPLAY_GUARD_RE.search(body)
+        if not guarded:
             declared = re.search(r"\bnonce", ctext, re.I)
-            yield Hit(fn, m.start(), f"`{fn.name}` verifies a signature but nothing consumes a nonce or marks the digest used"
-                                     + (" (a nonce is declared but never incremented)." if declared else "."))
+            yield Hit(fn, off, f"`{fn.name}` acts on a signature but nothing consumes a nonce or marks the digest used"
+                               + (" (a nonce is declared but never incremented)." if declared else "."), absolute=absolute)
         elif not re.search(r"block\.chainid|chainid\s*\(|_hashTypedDataV4|DOMAIN_SEPARATOR|_domainSeparator|EIP712"
-                           r"|getNetworkId|networkId|chainId", ctext):   # BitGo binds via a per-chain network id
-            yield Hit(fn, m.start(), f"`{fn.name}` signed digest does not bind chainid (cross-chain replay).", severity="medium")
-        # A helper that just returns ecrecover leaves the zero-check to its caller.
-        if "ecrecover" in m.group(0) and not re.search(r"address\s*\(\s*0\s*\)", body) \
-                and not re.search(r"return\s+ecrecover\s*\(", body):
+                           r"|getNetworkId|networkId|chainId", ctext + body):   # BitGo binds via a per-chain network id
+            yield Hit(fn, off, f"`{fn.name}` signed digest does not bind chainid (cross-chain replay).", severity="medium",
+                      absolute=absolute)
+        # Zero-address check: only judged where ecrecover is called directly (a helper returning it defers).
+        if in_own and "ecrecover" in m.group(0) and not re.search(r"address\s*\(\s*0\s*\)", own) \
+                and not re.search(r"return\s+ecrecover\s*\(", own):
             yield Hit(fn, m.start(), "`ecrecover` result is not checked against address(0); invalid signatures may authorize an unset signer.", severity="medium")
 
 
