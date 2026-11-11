@@ -84,3 +84,11 @@ contract OpenPriceSetter {
         price[asset] = newPrice;
     }
 }
+
+// Real backfill findings that must stay caught:
+// CellarStaking-style: anyone can swap the staking token.
+contract OpenStakingToken { address public stakingToken;
+    function setStakingToken(address t) external { stakingToken = t; } }
+// BitStake-style: pulls fee tokens from ANY approving user.
+contract FeePuller { IERC20 public feeToken; address public collector;
+    function depositNFT(address from, uint256 id, uint256 amountF) public { id; feeToken.transferFrom(from, collector, amountF); } }

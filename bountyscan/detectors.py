@@ -179,6 +179,7 @@ AUTH_BODY_RE = re.compile(
     r"|_require\w*(?:Owner|Admin|Role|Auth)\w*\s*\("
     rf"|require\s*\([^;]*{SENDER}|if\s*\([^;{{]*{SENDER}[^;{{]*\)\s*(?:revert|\{{\s*revert)"
     rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
+    rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w*\s*\(\s*{SENDER}"
     , re.M)
 # `address caller = _msgSender(); if (caller != authority()) revert ...;`
 SENDER_ALIAS_RE = re.compile(rf"\b(\w+)\s*=\s*{SENDER}\s*;")
@@ -267,6 +268,8 @@ ROLE_BODY_RE = re.compile(
     rf"|if\s*\([^;{{]*{SENDER}\s*[!=]=\s*\w[^;{{]*\)\s*(?:revert|\{{\s*revert)"
     # positive guard wrapping the action: `if (msg.sender == owner) selfdestruct(owner);` (legacy style)
     rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
+    # a guard helper invoked ON the caller: requireMaster(msg.sender), _checkCaller(msg.sender), onlyX(msg.sender)
+    rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w*\s*\(\s*{SENDER}"
     , re.M)
 
 
@@ -307,6 +310,11 @@ def calls_guarded_helper(fn: Function, project: Project) -> bool:
         # a require/if on msg.sender inside a helper whose name says it is a check
         if re.match(r"^_?(?:require|check|only|ensure|validate|assert|verify|auth)\w*$", callee.name, re.I) and \
                 callee.body and re.search(rf"(?:require|if)\s*\([^;]*{SENDER}", callee.body):
+            return True
+        # calldata timelocks (Morpho Vault V2 `timelocked()`): only calldata a curator submitted, after
+        # the delay, can execute - the gate is keyed on msg.data rather than msg.sender
+        if callee.body and (re.search(r"timelock", callee.name, re.I)
+                            or re.search(r"(?:require|if)\s*\([^;]*msg\.data", callee.body)):
             return True
     return False
 
@@ -389,7 +397,8 @@ REPLAY_GUARD_RE = re.compile(
     r"|_use\w*Nonce\s*\(|incrementNonce|invalidateNonce|_invalidate\w*"                       # OZ Nonces, Permit2
     r"|\b\w*(?:used|executed|claimed|consumed|processed|redeemed|filled|spent|cancelled|seen)\w*"
     r"\s*(?:\[[^\]]*\]\s*)+=\s*(?!0\b|false\b|address\s*\(\s*0)"                              # used[h] = true / consumedInto[x] = id
-    r"|sequence|replay|invalidat", re.I)
+    r"|sequence|replay|invalidat"
+    r"|\bage\s*<=|Stale\w*|\b(?:last|latest|current)\w*(?:Timestamp|Age|Round|Epoch)\w*\s*>=", re.I)  # monotonic (Chronicle)
 PRICE_SOURCE_RE = re.compile(
     r"latestRoundData|latestAnswer|getExpiryPrice|getPrice\w*\s*\(|getUnderlyingPrice|updatePriceFeeds|"
     r"parsePriceFeedUpdates|getUpdateFee|get_virtual_price|getRate\s*\(|pricePerShare|exchangeRate\w*\s*\(|"
@@ -420,6 +429,13 @@ def _privileged(project: Project):
             continue
         # Metadata setters (token URI, name, symbol, description) cannot move funds.
         if re.search(r"URI|Uri|Metadata|Description|Image|Symbol|Name(?!d)|Banner|Logo", fn.name):
+            continue
+        # renounceX() acting on the caller only gives up the caller's own role.
+        if fn.name.lower().startswith("renounce") and uses_sender(fn):
+            continue
+        # Keeper / upkeep: no value the caller can choose (no named params) and the caller's identity
+        # is unused - e.g. Chainlink Automation `performUpkeep`-style functions gated by checkUpkeep().
+        if (not [p for p in fn.params if p.name] and not uses_sender(fn)) or re.search(r"\bcheckUpkeep\s*\(", fn.body or ""):
             continue
         # Delegate-forwarding wallets (exchange deposit wallets: `sweeperOf(t).delegatecall(msg.data)`): the
         # logic - and its caller check - lives in the registered delegate, which is analysed on its own.
@@ -498,7 +514,13 @@ def _mint(project: Project):
         m = re.search(r"\b_mint\s*\(|\b(?:_balances|balanceOf|balances)\s*\[[^\]]+\]\s*\+=", body)
         if not m:
             continue
-        if re.search(r"msg\.value|transferFrom\s*\(|safeTransferFrom\s*\(|_burn\s*\(|\bburn\w*\s*\(|SIGNATURE|MerkleProof|ecrecover|\.recover\s*\(", body):
+        eff = effective_body(fn, project, depth=2)
+        if re.search(r"msg\.value|transferFrom\s*\(|safeTransferFrom\s*\(|_burn\s*\(|\bburn\w*\s*\(|SIGNATURE|MerkleProof|ecrecover|\.recover\s*\("
+                     r"|_deposit\s*\(|_pull\w*\s*\(|claimable|pending\w*\[", eff):
+            continue
+        # A mint helper charged to the caller (ERC-7540 `_mint(shares, receiver, msg.sender)` claims the
+        # caller's own pending deposit) is accounting, not free minting.
+        if re.search(rf"\b_mint\s*\([^;]*{SENDER}", body):
             continue
         if not fn.params_of_type("uint"):
             continue  # e.g. AMM LP mint(address to) that prices from balances
@@ -517,9 +539,10 @@ def _burn_from(project: Project):
         if not fn.name.lower().startswith("burn") or access_controlled(fn, project):
             continue
         body = fn.body or ""
+        eff = effective_body(fn, project, depth=2)    # `_spend(from, value)` hides the allowance check
         for m in re.finditer(r"\b_burn\s*\(\s*(\w+)", body):
             if m.group(1) in fn.params_of_type("address") and not re.search(
-                r"allowance|_spendAllowance|_approve|isApprovedForAll|_isApprovedOrOwner|getApproved", body
+                r"allowance|_spendAllowance|_spend\w*\s*\(|_approve|isApprovedForAll|_isApprovedOrOwner|getApproved", eff
             ):
                 yield Hit(fn, m.start(), f"`_burn({m.group(1)}, ...)` burns from a caller-chosen address with no allowance check.")
 
@@ -545,11 +568,20 @@ def _arbitrary_withdraw(project: Project):
         if SIGNATURE_CHECK_RE.search(body) or re.search(r"allowance|_spendAllowance", body):
             continue
         recipients = fn.params_of_type("address")
+        eff = effective_body(fn, project, depth=2)
         for m in pay_re.finditer(body):
             to = next((g for g in m.groups() if g), "")
-            if to in recipients:
-                yield Hit(fn, m.start(), f"`{fn.name}` sends funds to parameter `{to}` and never references msg.sender.")
-                break
+            if to not in recipients:
+                continue
+            # Paying `account` from `account`'s OWN balance (LQDXStaker.unstake(account, ...)): a stranger can
+            # force the payout (griefing) but cannot redirect it - the owner is both debited and paid.
+            owner_paid = re.search(rf"\[\s*{re.escape(to)}\s*\]", eff) or re.search(
+                rf"\b\w*(?:claim|balance|available|stake|deposit|position|account|user|_update|_burn|_debit)\w*\s*\(\s*{re.escape(to)}\s*[,)]",
+                eff, re.I)
+            if owner_paid:
+                continue
+            yield Hit(fn, m.start(), f"`{fn.name}` sends funds to parameter `{to}` and never references msg.sender.")
+            break
 
 
 @detector(
@@ -569,6 +601,13 @@ def _initializer(project: Project):
         body = fn.body or ""
         if re.search(r"initiali[sz]ed|_initializing|inited|require\s*\(\s*!?\s*\w*[Ii]nit", body) or ONE_TIME_GUARD_RE.search(body):
             continue
+        # Versioned one-time guard: `require(newMultiplier == 0); newMultiplier = ...` (or `if (x != 0) revert`)
+        once = re.search(r"(?:require\s*\(\s*(\w+)\s*==\s*(?:0|false|address\s*\(\s*0\s*\))\s*[,)]"
+                         r"|if\s*\(\s*(\w+)\s*!=\s*(?:0|address\s*\(\s*0\s*\))\s*\)\s*revert)", body)
+        if once:
+            v = once.group(1) or once.group(2)
+            if re.search(rf"(?<![.\w]){re.escape(v)}\s*=(?!=)", body[once.end():]):
+                continue
         # A real caller check (`require(msg.sender == factory)`, onlyOwner, ...) protects it.
         # `owner = msg.sender` alone does not - that is the classic front-runnable initializer.
         if is_role_controlled(fn, project) or (access_controlled(fn, project) and not uses_sender(fn)):
@@ -609,6 +648,10 @@ def _uninit_impl(project: Project):
 def _tx_origin(project: Project):
     for fn in project.functions():
         body = fn.body or ""
+        # ERC-4337 paymasters identify the BUNDLER (an operator server, not a person who can be phished)
+        # by tx.origin - that is the standard pattern, not phishable owner auth.
+        if re.search(r"UserOperation|[Pp]aymaster|[Bb]undler|handleOps", fn.contract.text):
+            continue
         for m in re.finditer(r"tx\.origin\s*[!=]=|[!=]=\s*tx\.origin", body):
             s, e = statement_bounds(body, m.start())
             if re.search(rf"tx\.origin\s*[!=]=\s*{SENDER}|{SENDER}\s*[!=]=\s*tx\.origin", body[s:e]):
@@ -648,6 +691,10 @@ def _reentrancy(project: Project):
     )
     for fn in entrypoints(project):
         if any(REENTRANCY_GUARD_RE.search(m) for m in fn.modifiers):
+            continue
+        # Role-gated entrypoints (OZ TimelockController.execute with EXECUTOR_ROLE) cannot be re-entered by
+        # an outsider: the re-entrant call would fail the same role check.
+        if is_role_controlled(fn, project):
             continue
         body = fn.body or ""
         # Inline one level so a call (or a state-write) hidden in an internal helper is visible.
@@ -1122,6 +1169,13 @@ def _sig_replay(project: Project):
         # Consuming the signature also counts when the entrypoint (or its helpers) marks it - e.g. a
         # per-trade id `if (bridged[tradeId]) revert; bridged[tradeId] = true` in the caller's own code.
         guarded = REPLAY_GUARD_RE.search(ctext) or REPLAY_GUARD_RE.search(body)
+        # Self-signed: the recovered signer must BE the caller (2FA / password-style schemes). Nobody else can
+        # submit that signature, so "replaying" it only re-does the caller's own action.
+        aliases = "|".join([SENDER] + [re.escape(a) for a in SENDER_ALIAS_RE.findall(body)])
+        rec_vars = re.findall(r"(\w+)\s*=\s*[^;]*(?:ecrecover|\.recover)\s*\(", body)
+        if any(re.search(rf"\b{re.escape(v)}\s*[!=]=\s*(?:{aliases})\b|(?:{aliases})\s*[!=]=\s*{re.escape(v)}\b", body)
+               for v in rec_vars) or re.search(rf"recover\s*\([^;]*\)\s*[!=]=\s*(?:{aliases})\b", body):
+            guarded = True
         if not guarded:
             declared = re.search(r"\bnonce", ctext, re.I)
             yield Hit(fn, off, f"`{fn.name}` acts on a signature but nothing consumes a nonce or marks the digest used"
