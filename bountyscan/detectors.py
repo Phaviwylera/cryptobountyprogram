@@ -177,7 +177,7 @@ AUTH_MODIFIER_RE = re.compile(
 AUTH_BODY_RE = re.compile(
     r"_check(?:Owner|Role|Auth|Admin|Caller|Sender|Permission|Canonical)\w*\s*\(|hasRole\s*\(|_?only\w*\s*\(|_authorize\w*|_?isAuthorized|requiresAuth"
     r"|_require\w*(?:Owner|Admin|Role|Auth)\w*\s*\("
-    rf"|require\s*\([^;]*{SENDER}|if\s*\([^;{{]*{SENDER}[^;{{]*\)\s*(?:revert|\{{\s*revert)"
+    rf"|require\s*\([^;]*{SENDER}|if\s*\([^;{{]*{SENDER}[^;{{]*\)\s*(?:revert|throw|\{{\s*(?:revert|throw))"
     rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
     rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w+\s*\(\s*{SENDER}"   # named helper, not bare require(
     , re.M)
@@ -265,7 +265,8 @@ ROLE_BODY_RE = re.compile(
     r"_check(?:Owner|Role|Auth|Admin|Caller|Sender|Permission)\w*\s*\(|hasRole\s*\(|_?only\w*\s*\(|_authorize\w*"
     r"|_?isAuthorized|requiresAuth|_require\w*(?:Owner|Admin|Role|Auth)\w*\s*\("
     rf"|require\s*\([^;{{]*{SENDER}\s*==|require\s*\([^;{{]*==\s*{SENDER}\b"
-    rf"|if\s*\([^;{{]*{SENDER}\s*[!=]=\s*\w[^;{{]*\)\s*(?:revert|\{{\s*revert)"
+    rf"|if\s*\([^;{{]*{SENDER}\s*[!=]=\s*\w[^;{{]*\)\s*(?:revert|throw|\{{\s*(?:revert|throw))"   # throw: solidity <0.5
+    rf"|if\s*\([^;{{]*\b\w[\w.()]*\s*!=\s*{SENDER}[^;{{]*\)\s*(?:revert|throw|\{{\s*(?:revert|throw))"
     # positive guard wrapping the action: `if (msg.sender == owner) selfdestruct(owner);` (legacy style)
     rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
     # a guard helper invoked ON the caller: requireMaster(msg.sender), _checkCaller(msg.sender), onlyX(msg.sender)
@@ -395,7 +396,7 @@ REPLAY_GUARD_RE = re.compile(
     r"\w*nonce\w*\s*(?:\[[^\]]*\]\s*)*(?:\+\+|\+=|\|=|=\s*\w*nonce\w*\s*(?:\[[^\]]*\]\s*)*\+)"   # nonce++ / nonces[a]++ / bitmap |=
     r"|\+\+\s*\w*nonce\w*"                                                                      # ++nonce
     r"|_use\w*Nonce\s*\(|incrementNonce|invalidateNonce|_invalidate\w*"                       # OZ Nonces, Permit2
-    r"|\b\w*(?:used|executed|claimed|consumed|processed|redeemed|filled|spent|cancelled|seen)\w*"
+    r"|\b\w*(?:used|executed|claimed|consumed|processed|redeemed|fill(?:ed|s)?|spent|cancelled|seen)\w*"   # orderFills[u][h] (EtherDelta)
     r"\s*(?:\[[^\]]*\]\s*)+=\s*(?!0\b|false\b|address\s*\(\s*0)"                              # used[h] = true / consumedInto[x] = id
     r"|sequence|replay|invalidat"
     r"|\bage\s*<=|Stale\w*|\b(?:last|latest|current)\w*(?:Timestamp|Age|Round|Epoch)\w*\s*>=", re.I)  # monotonic (Chronicle)
@@ -1032,6 +1033,19 @@ def _unchecked_erc20(project: Project):
 def _spot_oracle(project: Project):
     amm_infra = re.compile(r"Router|Library|Pair$|Quoter|Factory|Uniswap|Sushi|Pancake|Swapper|Zap|Aggregator|Lens", re.I)
     valuation = re.compile(r"collateral|borrow|liquidat|oracle|healthFactor|\bltv\b|getPrice|latestPrice|priceOf|valueOf|totalValue|getValue|exchangeRate|pricePerShare|sharePrice|_?mint\w*\s*\(|debt", re.I)
+    slippage = re.compile(r"amount\w*Min\w*|min\w*Out\w*|minReceiv\w*|minReturn\w*|INSUFFICIENT_OUTPUT|slippage", re.I)
+    # Reading reserves to pair liquidity at the current ratio (what UniswapV2Router.addLiquidity does) values nothing.
+    lp_provision = re.compile(r"\.mint\s*\(\s*address\s*\(\s*this\s*\)\s*\)|addLiquidity\w*\s*\(|quote\s*\(")
+    by_contract: dict[str, list[Function]] = {}
+    for f in project.functions():
+        by_contract.setdefault(f.contract.name, []).append(f)
+
+    def callers(fn: Function) -> list[Function]:
+        """Functions of the same contract family that call `fn` directly."""
+        fam = {fn.contract.name, *(i.split(".")[-1].strip() for i in fn.contract.inherits)}
+        pat = re.compile(rf"(?<![.\w]){re.escape(fn.name)}\s*\(")
+        return [g for name in fam for g in by_contract.get(name, []) if g is not fn and g.body and pat.search(g.body)]
+
     for fn in project.functions():
         body = fn.body or ""
         m = re.search(r"\.getReserves\s*\(|\.slot0\s*\(|\bget_dy\s*\(|\.getAmountsOut\s*\(", body)
@@ -1039,9 +1053,14 @@ def _spot_oracle(project: Project):
             continue
         if re.search(r"observe\s*\(|consult\s*\(|twap|TWAP|cumulative", fn.contract.text):
             continue
-        if re.search(r"amount\w*Min\w*|min\w*Out\w*|INSUFFICIENT_OUTPUT|slippage", body, re.I):
-            continue  # reserves used to execute a slippage-protected swap, not to value anything
-        if not (valuation.search(fn.name) or valuation.search(fn.contract.text)):
+        # An internal helper (`_reserves()`, `getCheapestToken()`) is judged by how its callers use it.
+        users = callers(fn) if fn.visibility in ("internal", "private") else []
+        scope = [body] + [g.body for g in users]
+        if any(slippage.search(b) or lp_provision.search(b) for b in scope):
+            continue  # reserves used to execute a slippage-protected swap / pair liquidity, not to value anything
+        # The spot quote must feed a valuation in THIS function or its callers - a valuation word elsewhere in
+        # the contract (an unrelated _mint) does not make a routing/quote helper an oracle.
+        if not (valuation.search(fn.name) or any(valuation.search(b) for b in scope)):
             continue
         yield Hit(fn, m.start(), f"`{fn.name}` reads spot AMM state (`{m.group(0).strip('.( ')}`) with no TWAP in the contract.")
 
@@ -1176,6 +1195,12 @@ def _sig_replay(project: Project):
         if any(re.search(rf"\b{re.escape(v)}\s*[!=]=\s*(?:{aliases})\b|(?:{aliases})\s*[!=]=\s*{re.escape(v)}\b", body)
                for v in rec_vars) or re.search(rf"recover\s*\([^;]*\)\s*[!=]=\s*(?:{aliases})\b", body):
             guarded = True
+        # One-shot state flag: `require(!charged)` / `require(charged == false)` ... `charged = true;` - the
+        # function (and therefore the signature) can only ever take effect once.
+        for flag in re.findall(r"require\s*\(\s*(?:!\s*(\w+)\s*\)|(\w+)\s*==\s*false\s*\))", body):
+            name = flag[0] or flag[1]
+            if re.search(rf"\b{re.escape(name)}\s*=\s*true\s*;", body):
+                guarded = True
         if not guarded:
             declared = re.search(r"\bnonce", ctext, re.I)
             yield Hit(fn, off, f"`{fn.name}` acts on a signature but nothing consumes a nonce or marks the digest used"
