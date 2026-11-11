@@ -220,6 +220,19 @@ def access_controlled(fn: Function, project: Project) -> bool:
     for alias in SENDER_ALIAS_RE.findall(body):
         if re.search(rf"(?:require|if)\s*\([^;{{]*\b{re.escape(alias)}\b\s*[!=]=", body):
             return True
+    # Two-step boolean guard (Solady/Solmate `Auth.setAuthority` / `setOwner`): the authorization
+    # decision is computed into a flag that then gates a revert -
+    #   bool ok = msg.sender == $.owner || auth.canCall(msg.sender, ...);  if (!ok) revert Unauthorized();
+    # Require the RHS to carry msg.sender AND an auth comparison/predicate so a plain success flag
+    # (`bool ok = token.transfer(msg.sender, amt); require(ok);`) is NOT mistaken for a caller check.
+    for mb in re.finditer(r"\bbool\s+(\w+)\s*=\s*([^;]*);", body):
+        var, rhs = mb.group(1), mb.group(2)
+        if not re.search(SENDER, rhs) or not re.search(
+                r"==|!=|canCall|hasRole|isAuthorized|\bowner|\badmin|authori[sz]ed|requiresAuth", rhs, re.I):
+            continue
+        if re.search(rf"if\s*\(\s*!\s*{re.escape(var)}\s*\)|require\s*\(\s*{re.escape(var)}\b"
+                     rf"|\b{re.escape(var)}\s*==\s*false\b", body):
+            return True
     # Auth may live inside an internal/library helper (ReserveManager delegates to
     # `ReserveAccrualLib.setFee` which asserts `msg.sender == s.modules.waterfall`; MEV bots'
     # `uniswapV3SwapCallback` forwards to `_v3Callback` which pins msg.sender to the pool).
