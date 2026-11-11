@@ -352,6 +352,10 @@ PRIVILEGED_NAME_RE = re.compile(
     r"sweep\w*|rescue\w*|recover\w*|emergency\w*|drain\w*|withdraw(?:All|Fees?|Tokens?|ETH|Eth|Funds|Treasury|Reserves?|Stuck\w*|Protocol\w*)|"
     r"pause|unpause|kill|destroy|shutdown|migrate\w*|grant\w*|addMinter|add(?:Admin|Operator|Keeper)|update(?:Price|Oracle|Rate)\w*|configure\w*)$"
 )
+PRICE_SOURCE_RE = re.compile(
+    r"latestRoundData|latestAnswer|getExpiryPrice|getPrice\w*\s*\(|getUnderlyingPrice|updatePriceFeeds|"
+    r"parsePriceFeedUpdates|getUpdateFee|get_virtual_price|getRate\s*\(|pricePerShare|exchangeRate\w*\s*\(|"
+    r"consult\s*\(|observe\s*\(")
 CRITICAL_PRIVILEGED_RE = re.compile(r"upgrade|owner|admin|sweep|rescue|recover|emergency|drain|withdraw|oracle|price|grant|minter|migrate|kill|destroy", re.I)
 USER_SCOPED_SETTERS = {"setApprovalForAll", "setApproval", "setDelegate", "setOperator", "setUserPreferences"}
 
@@ -388,6 +392,14 @@ def _privileged(project: Project):
             fixed = lambda r: is_immutable(fn.contract, r) or (r in project.state_vars and r not in fn.param_names)
             if recipients and all(fixed(r) for r in recipients) and not (recipients & fn.params_of_type("address")) \
                     and not re.search(rf"{SENDER}", " ".join(recipients)):
+                continue
+        # Permissionless "oracle poke" (Opyn setExpiryPriceInOracle, Pyth updatePrice): anyone may call it,
+        # but the price is READ from a trusted source (feed / signed update), never supplied by the caller.
+        # Only a numeric caller-supplied value (other than a timestamp / id) could set a price.
+        if re.search(r"price|oracle|rate|expiry", fn.name, re.I):
+            numeric = [p for p in fn.params if re.match(r"u?int", p.type)
+                       and not re.search(r"time|expiry|epoch|round|id$|index|deadline", p.name, re.I)]
+            if not numeric and PRICE_SOURCE_RE.search(effective_body(fn, project, depth=2)):
                 continue
         sev = "critical" if CRITICAL_PRIVILEGED_RE.search(fn.name) else "high"
         yield Hit(fn, fn.offset, f"`{fn.name}` is {fn.visibility or 'public'} with no access control "

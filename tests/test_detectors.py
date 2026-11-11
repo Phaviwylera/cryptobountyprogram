@@ -65,6 +65,8 @@ class VulnerableFixtureTests(unittest.TestCase):
         self.assertDetected("arbitrary-transferfrom", "pull")
         self.assertDetected("arbitrary-approval", "allow")
         self.assertDetected("unprotected-privileged-function", "rescueNative")  # pays a caller-chosen address
+        self.assertDetected("unprotected-privileged-function", "recover")       # PaymentHub (real finding)
+        self.assertDetected("unprotected-privileged-function", "setPrice")      # caller-supplied price
         self.assertDetected("cross-function-reentrancy", "borrow")
         self.assertDetected("reentrancy", "withdraw")  # state write in internal helper
 

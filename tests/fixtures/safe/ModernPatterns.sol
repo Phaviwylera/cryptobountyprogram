@@ -44,3 +44,21 @@ contract SimpleAccountLike {
         return 0;
     }
 }
+
+// Opyn-style pricer and Pyth adapter: permissionless pokes; the price comes from a trusted source.
+interface IOracleLike { function getExpiryPrice(address, uint256) external view returns (uint256, bool); function setExpiryPrice(address, uint256, uint256) external; }
+interface IPythLike { function getUpdateFee(bytes[] calldata) external view returns (uint256); function updatePriceFeeds(bytes[] calldata) external payable; }
+contract PokePricer {
+    IOracleLike public oracle; address public underlying; address public lpToken;
+    function setExpiryPriceInOracle(uint256 _expiryTimestamp) external {
+        (uint256 p, ) = oracle.getExpiryPrice(underlying, _expiryTimestamp);
+        oracle.setExpiryPrice(lpToken, _expiryTimestamp, p * 2);
+    }
+}
+contract PythAdapterLike {
+    IPythLike public pyth;
+    function updatePrice(address asset, bytes calldata priceUpdate) external payable {
+        bytes[] memory d = new bytes[](1); d[0] = priceUpdate;
+        pyth.updatePriceFeeds{value: pyth.getUpdateFee(d)}(d);
+    }
+}

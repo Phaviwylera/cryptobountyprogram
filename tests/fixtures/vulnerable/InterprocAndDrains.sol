@@ -66,3 +66,21 @@ contract CallerRescue {
         require(ok);
     }
 }
+
+// PaymentHub-style: recover() moves any token anywhere, for anyone. (real finding from the backfill)
+contract OpenRecover {
+    function recover(address ercAddress, address to, uint256 amount) public {
+        IERC20(ercAddress).transferFrom(address(this), to, amount);
+    }
+}
+
+// An unprotected price setter that ALSO reads a feed is still a theft vector: the caller supplies the price.
+interface IFeedLike { function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80); }
+contract OpenPriceSetter {
+    IFeedLike public feed; mapping(address => uint256) public price;
+    function setPrice(address asset, uint256 newPrice) external {
+        (, int256 ref, , , ) = feed.latestRoundData();
+        require(ref > 0);
+        price[asset] = newPrice;
+    }
+}
