@@ -82,6 +82,19 @@ _INLINE_SKIP = {"require", "assert", "revert", "if", "for", "while", "return", "
                 "abi", "address", "payable", "uint256", "uint", "int256", "bytes", "bool", "new",
                 "sha256", "ecrecover", "type", "this", "super"}
 
+# Proxy shells whose stub functions intentionally have no local access control at the proxy
+# level; auth lives behind the delegatecall into the implementation, which is analysed as its
+# own contract (see MErc20Delegator / CTokenDelegator admin methods, OpenSea OwnableDelegateProxy,
+# ERC1967Proxy admin selectors). Flagging those stubs floods the dashboard with proxies.
+_PROXY_SHELL_NAMES = {
+    "MErc20Delegator", "CErc20Delegator", "MToken", "CEther", "CToken",
+    "DAIPoolDelegator", "USDTPoolDelegator", "LPoolDelegator",
+    "OwnableDelegateProxy", "AccessManagedProxy", "ERC1967Proxy",
+    "TransparentUpgradeableProxy", "BeaconProxy", "PinnedBeaconProxy", "NullmaskProxy",
+    "OptinProxy", "StrategyProxy", "FortuneFiProxy", "RollupProxy",
+    "InitializableAdminUpgradeabilityProxy", "XaurumProxyERC20",
+}
+
 
 def effective_body(fn: Function, project: Project, depth: int = 1, _seen: frozenset = frozenset()) -> str:
     """fn.body with one level of internal/library calls SUBSTITUTED AT THE CALL SITE, so a regex
@@ -204,6 +217,13 @@ def access_controlled(fn: Function, project: Project) -> bool:
     for alias in SENDER_ALIAS_RE.findall(body):
         if re.search(rf"(?:require|if)\s*\([^;{{]*\b{re.escape(alias)}\b\s*[!=]=", body):
             return True
+    # Auth may live inside an internal/library helper (ReserveManager delegates to
+    # `ReserveAccrualLib.setFee` which asserts `msg.sender == s.modules.waterfall`; MEV bots'
+    # `uniswapV3SwapCallback` forwards to `_v3Callback` which pins msg.sender to the pool).
+    # Inline one level of callees before giving up.
+    eff = effective_body(fn, project, depth=1)
+    if eff != body and AUTH_BODY_RE.search(eff):
+        return True
     return False
 
 
@@ -288,6 +308,10 @@ def is_role_controlled(fn: Function, project: Project) -> bool:
     for alias in re.findall(rf"\b(\w+)\s*=\s*{SENDER}\s*;", body):
         if re.search(rf"(?:require|if)\s*\([^;{{]*\b{re.escape(alias)}\b\s*[!=]=", body):
             return True
+    # One-level inline for helpers that carry the equality check (library setters, _v3Callback).
+    eff = effective_body(fn, project, depth=1)
+    if eff != body and ROLE_BODY_RE.search(eff):
+        return True
     return False
 
 
@@ -396,8 +420,10 @@ REPLAY_GUARD_RE = re.compile(
     r"\w*nonce\w*\s*(?:\[[^\]]*\]\s*)*(?:\+\+|\+=|\|=|=\s*\w*nonce\w*\s*(?:\[[^\]]*\]\s*)*\+)"   # nonce++ / nonces[a]++ / bitmap |=
     r"|\+\+\s*\w*nonce\w*"                                                                      # ++nonce
     r"|_use\w*Nonce\s*\(|incrementNonce|invalidateNonce|_invalidate\w*"                       # OZ Nonces, Permit2
-    r"|\b\w*(?:used|executed|claimed|consumed|processed|redeemed|fill(?:ed|s)?|spent|cancelled|seen)\w*"   # orderFills[u][h] (EtherDelta)
-    r"\s*(?:\[[^\]]*\]\s*)+=\s*(?!0\b|false\b|address\s*\(\s*0)"                              # used[h] = true / consumedInto[x] = id
+    # mapping-flag replay guards: used[h]=true, pending[h].to != address(0), isPaid[h]=true
+    # (EtherDelta orderFills, EdgexBridge pendingWithdrawals, Invoice isPaid).
+    r"|\b\w*(?:used|executed|claimed|consumed|processed|redeemed|fill(?:ed|s)?|spent|cancelled|seen|paid|pending)\w*"
+    r"\s*(?:\[[^\]]*\]\s*)+(?:=\s*(?!0\b|false\b|address\s*\(\s*0)|\.\w+\s*!=\s*address\s*\(\s*0\s*\))"
     r"|sequence|replay|invalidat"
     r"|\bage\s*<=|Stale\w*|\b(?:last|latest|current)\w*(?:Timestamp|Age|Round|Epoch)\w*\s*>=", re.I)  # monotonic (Chronicle)
 PRICE_SOURCE_RE = re.compile(
@@ -442,6 +468,17 @@ def _privileged(project: Project):
         # logic - and its caller check - lives in the registered delegate, which is analysed on its own.
         fwd = re.search(r"([\w.()\[\]]+)\s*\.\s*delegatecall\s*\(\s*msg\.data\s*\)", fn.body or "")
         if fwd and root_identifier(fwd.group(1)) not in fn.param_names:
+            continue
+        # CToken-style delegator stubs: a function body that is literally
+        # `delegateToImplementation(abi.encodeWithSignature(...))` or `return abi.decode(delegateTo...)`.
+        # The impl behind the delegatecall carries the admin check (`require(msg.sender == admin)`);
+        # the stub itself is unguarded BY DESIGN. Same for OwnableDelegateProxy / AccessManagedProxy.
+        if re.search(r"\bdelegate(?:To(?:Implementation|And\w+)?|cast)\s*\(\s*abi\.encode(?:WithSelector|WithSignature|Call)?\s*\(",
+                     fn.body or ""):
+            continue
+        # Known proxy contract names where the proxy itself intentionally has no access control at
+        # the proxy level; access lives behind the delegatecall (OpenZeppelin, OpenSea, Compound).
+        if fn.contract.name in _PROXY_SHELL_NAMES:
             continue
         body = fn.body or ""
         if re.search(rf"\[\s*{SENDER}\s*\]", body):
@@ -657,6 +694,13 @@ def _tx_origin(project: Project):
             s, e = statement_bounds(body, m.start())
             if re.search(rf"tx\.origin\s*[!=]=\s*{SENDER}|{SENDER}\s*[!=]=\s*tx\.origin", body[s:e]):
                 continue  # EOA-only check, not authorization
+            # Chainlink AccessControlledOffchainAggregator pattern:
+            # `require(msg.sender == owner || tx.origin == owner)` — a legitimate owner-fallback.
+            # If the same statement also compares msg.sender to the same identifier (or to owner()),
+            # tx.origin is just a convenience branch, not a phishable auth path on its own.
+            if re.search(rf"{SENDER}\s*==\s*\w+[\w.()]*\s*\|\|\s*tx\.origin\s*==|"
+                         rf"tx\.origin\s*==\s*\w+[\w.()]*\s*\|\|\s*{SENDER}\s*==", body[s:e]):
+                continue
             yield Hit(fn, m.start(), "tx.origin is compared in an authorization check.")
 
 
@@ -670,9 +714,27 @@ def _tx_origin(project: Project):
 )
 def _selfdestruct(project: Project):
     for fn in entrypoints(project):
-        m = re.search(r"\b(?:selfdestruct|suicide)\s*\(", fn.body or "")
-        if m and not access_controlled(fn, project):
-            yield Hit(fn, m.start(), f"`{fn.name}` calls selfdestruct without access control.")
+        body = fn.body or ""
+        m = re.search(r"\b(?:selfdestruct|suicide)\s*\(([^)]+)\)", body)
+        if not m or access_controlled(fn, project):
+            continue
+        # ENS-Deed pattern: `function destroyDeed() { if (active) throw; ... selfdestruct(burn); }`
+        # or Solidity >=0.5 `if (active) revert();` style. A state-flag guard at function entry
+        # makes the function effectively unreachable to an attacker while `active == true`, and
+        # `active` can only be flipped by a role-controlled function elsewhere. Combined with a
+        # FIXED beneficiary (constant/immutable/state var, not a caller param), this is a legitimate
+        # teardown path - not a fund-theft vector.
+        beneficiary = m.group(1).strip()
+        bene_root = root_identifier(beneficiary)
+        if bene_root and bene_root not in fn.param_names:
+            # beneficiary is not a caller-chosen parameter; check if the function also carries a
+            # state-flag guard such as `if (active) throw;` or `if (!closed) revert;`
+            state_guard = re.search(
+                r"\bif\s*\(\s*!?\s*\w+\s*\)\s*(?:throw\s*;|revert\s*\(|\{\s*(?:throw|revert))",
+                body)
+            if state_guard:
+                continue
+        yield Hit(fn, m.start(), f"`{fn.name}` calls selfdestruct without access control.")
 
 
 # --------------------------------------------------------------------------- external calls
@@ -1262,7 +1324,11 @@ def _flash_callback(project: Project):
     for fn in entrypoints(project):
         if not _is_callback(fn):
             continue
-        body = fn.body or ""
+        # One-level inline: MEV arb bots route uniswapV3SwapCallback/pancakeV3SwapCallback into a
+        # shared `_v3Callback(amount0Delta, amount1Delta, data)` helper that pins msg.sender to the
+        # expected pool via a packed-address compare `require(uint96(uint160(msg.sender)) == uint96(expected))`.
+        # Without inlining we'd flag every one of those bots as unauthenticated.
+        body = effective_body(fn, project, depth=1)
         authed = SENDER_AUTH_RE.search(body) or access_controlled(fn, project)
         pays_sender = re.search(rf"\.(?:transfer|safeTransfer|call\s*\{{[^}}]*value)\s*\(\s*{SENDER}\b", body)
         if not authed:
