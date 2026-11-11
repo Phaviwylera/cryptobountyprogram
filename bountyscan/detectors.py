@@ -467,6 +467,11 @@ REPLAY_GUARD_RE = re.compile(
     r"|\.\s*(?:executed|used|claimed|processed|redeemed|filled|settled|consumed|cancelled|finalized|completed)\b"
     r"\s*=\s*true\b"
     r"|sequence|replay|invalidat"
+    # monotonic state-channel nonce: `if (nonce <= stored) revert` / `require(newNonce > old)` - a higher
+    # nonce overrides, so an old-nonce signed state cannot be replayed (Lithium, Perun/Raiden channels).
+    # The nonce is a struct field, not a mapping, so the ++/[..] forms above miss it.
+    r"|\w*nonce\w*\s*(?:<=?|>=?)\s*[\w.(]|[\w.)]\s*(?:<=?|>=?)\s*\w*\.?\w*nonce\w*"
+    r"|Invalid\w*Nonce|Nonce\w*(?:TooLow|TooOld|Invalid|Used|Replay|Stale|Mismatch|Reused)|StaleNonce|OldNonce"
     r"|\bage\s*<=|Stale\w*|\b(?:last|latest|current)\w*(?:Timestamp|Age|Round|Epoch)\w*\s*>=", re.I)  # monotonic (Chronicle)
 PRICE_SOURCE_RE = re.compile(
     r"latestRoundData|latestAnswer|getExpiryPrice|getPrice\w*\s*\(|getUnderlyingPrice|updatePriceFeeds|"
@@ -1319,7 +1324,24 @@ def _sig_replay(project: Project):
         off, absolute = (m.start(), False) if in_own else (fn.offset, True)
         # Consuming the signature also counts when the entrypoint (or its helpers) marks it - e.g. a
         # per-trade id `if (bridged[tradeId]) revert; bridged[tradeId] = true` in the caller's own code.
-        guarded = REPLAY_GUARD_RE.search(ctext) or REPLAY_GUARD_RE.search(body)
+        # State-channel / library-delegation designs put the signature check AND the replay guard (a
+        # monotonic struct-field nonce, `if (nonce <= stored) revert InvalidNonce()`) in dedicated
+        # libraries the entrypoint delegates into (Lithium -> LithiumUpdater/Settler/Verification). Those
+        # libraries are not in the family text, so collect the text of every library the call tree
+        # transitively references and fold it into both the replay-guard and chainid-binding scopes.
+        by_name = {c.name: c for f in project.files for c in f.contracts}
+        refd: set[str] = set()
+        frontier = ctext + " " + body
+        for _ in range(3):
+            new = {n for n, c in by_name.items() if c.kind == "library" and n not in refd
+                   and re.search(rf"(?<![.\w]){re.escape(n)}\s*\.", frontier)}
+            if not new:
+                break
+            refd |= new
+            frontier = " ".join(by_name[n].text for n in new)
+        reflib_text = " ".join(by_name[n].text for n in refd)
+        scope = ctext + " " + body + " " + reflib_text
+        guarded = bool(REPLAY_GUARD_RE.search(scope))
         # Self-signed: the recovered signer must BE the caller (2FA / password-style schemes). Nobody else can
         # submit that signature, so "replaying" it only re-does the caller's own action.
         aliases = "|".join([SENDER] + [re.escape(a) for a in SENDER_ALIAS_RE.findall(body)])
@@ -1338,7 +1360,7 @@ def _sig_replay(project: Project):
             yield Hit(fn, off, f"`{fn.name}` acts on a signature but nothing consumes a nonce or marks the digest used"
                                + (" (a nonce is declared but never incremented)." if declared else "."), absolute=absolute)
         elif not re.search(r"block\.chainid|chainid\s*\(|_hashTypedDataV4|DOMAIN_SEPARATOR|_domainSeparator|EIP712"
-                           r"|getNetworkId|networkId|chainId", ctext + body):   # BitGo binds via a per-chain network id
+                           r"|getNetworkId|networkId|chainId", scope):   # BitGo binds via a per-chain network id
             yield Hit(fn, off, f"`{fn.name}` signed digest does not bind chainid (cross-chain replay).", severity="medium",
                       absolute=absolute)
         # Zero-address check: only judged where ecrecover is called directly (a helper returning it defers).
