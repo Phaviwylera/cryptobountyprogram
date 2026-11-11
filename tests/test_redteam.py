@@ -24,6 +24,17 @@ class RedTeamCorpus(unittest.TestCase):
         findings = scan([CORPUS / "safe"], min_severity="medium").findings
         self.assertEqual([(Path(f.file).name, f.detector, f.function) for f in findings], [])
 
+    def test_proxy_initializer_suppressed_when_deployment_is_proxy(self):
+        # The impl's unguarded initialize() is a real finding on a fresh scan...
+        proxy_dir = Path(__file__).parent / "fixtures" / "proxy"
+        fresh = scan([proxy_dir], min_severity="medium").findings
+        self.assertTrue(any(f.detector == "unprotected-initializer" for f in fresh),
+                        "impl initialize() should flag when the deployment is not a proxy")
+        # ...but is suppressed once we know the deployed address is a proxy (already initialized at deploy).
+        as_proxy = scan([proxy_dir], min_severity="medium", meta={"proxy": True}).findings
+        self.assertFalse(any(f.detector == "unprotected-initializer" for f in as_proxy),
+                         "unprotected-initializer must not fire on a proxy deployment")
+
 
 if __name__ == "__main__":
     unittest.main()

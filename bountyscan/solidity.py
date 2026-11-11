@@ -99,6 +99,7 @@ def split_top_level(text: str, sep: str = ",") -> list[str]:
 class Param:
     type: str
     name: str
+    is_storage: bool = False  # declared with the `storage` data location (reference, not ABI-serializable)
 
 
 @dataclass
@@ -186,7 +187,7 @@ def _parse_params(text: str) -> list[Param]:
         if not toks:
             continue
         name = toks[-1] if len(toks) >= 2 and toks[-1] not in PARAM_NOISE else ""
-        params.append(Param(type=toks[0], name=name))
+        params.append(Param(type=toks[0], name=name, is_storage="storage" in toks))
     return params
 
 

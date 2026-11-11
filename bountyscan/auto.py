@@ -137,7 +137,7 @@ def process(store, row, cfg: AutoConfig) -> str:
         return "safe"
 
     _stage(cfg, f"Scanning {name or short} with all fund-theft detectors")
-    result = scan([src], min_severity="high")
+    result = scan([src], min_severity="high", meta=meta)
     # Only the deployed contract (and, for a proxy, its implementation) plus what they inherit count.
     roots = [meta.get("contract_name")]
     impl_meta = read_meta(src / "implementation" / chain / str(meta.get("implementation") or "").lower()) \

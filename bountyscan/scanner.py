@@ -55,6 +55,7 @@ def scan(
     only: set[str] | None = None,
     exclude: set[str] | None = None,
     use_slither: bool = False,
+    meta: dict | None = None,
 ) -> ScanResult:
     errors: list[str] = []
     files: list[SourceFile] = []
@@ -64,7 +65,7 @@ def scan(
         except Exception as exc:  # keep scanning other files
             errors.append(f"{path}: parse error: {exc}")
 
-    findings = run_detectors(files, only=only, exclude=exclude)
+    findings = run_detectors(files, only=only, exclude=exclude, meta=meta)
     if use_slither:
         for p in map(Path, paths):
             extra, err = slither_bridge.run_slither(p)

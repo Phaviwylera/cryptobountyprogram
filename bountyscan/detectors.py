@@ -52,6 +52,7 @@ class Project:
     files: list[SourceFile]
     auth_modifiers: set[str]
     state_vars: set[str]
+    meta: dict = field(default_factory=dict)  # deployed-contract metadata (proxy flag, impl address, ...)
 
     def functions(self) -> Iterator[Function]:
         for f in self.files:
@@ -191,7 +192,9 @@ AUTH_BODY_RE = re.compile(
     r"_check(?:Owner|Role|Auth|Admin|Caller|Sender|Permission|Canonical)\w*\s*\(|hasRole\s*\(|_?only\w*\s*\(|_authorize\w*|_?isAuthorized|requiresAuth"
     r"|_require\w*(?:Owner|Admin|Role|Auth)\w*\s*\("
     rf"|require\s*\([^;]*{SENDER}|if\s*\([^;{{]*{SENDER}[^;{{]*\)\s*(?:revert|throw|\{{\s*(?:revert|throw))"
-    rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
+    # positive inline guard wrapping a privileged write: `if (msg.sender == owner) { ... }`, and the
+    # AND-compound form `if (msg.sender == initializer && state == 0) { ... }` (narrowing conditions only).
+    rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*(?:\)|&&)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*(?:\)|&&)"
     rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w+\s*\(\s*{SENDER}"   # named helper, not bare require(
     , re.M)
 # `address caller = _msgSender(); if (caller != authority()) revert ...;`
@@ -287,8 +290,9 @@ ROLE_BODY_RE = re.compile(
     rf"|require\s*\([^;{{]*{SENDER}\s*==|require\s*\([^;{{]*==\s*{SENDER}\b"
     rf"|if\s*\([^;{{]*{SENDER}\s*[!=]=\s*\w[^;{{]*\)\s*(?:revert|throw|\{{\s*(?:revert|throw))"   # throw: solidity <0.5
     rf"|if\s*\([^;{{]*\b\w[\w.()]*\s*!=\s*{SENDER}[^;{{]*\)\s*(?:revert|throw|\{{\s*(?:revert|throw))"
-    # positive guard wrapping the action: `if (msg.sender == owner) selfdestruct(owner);` (legacy style)
-    rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*\)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*\)"
+    # positive guard wrapping the action: `if (msg.sender == owner) selfdestruct(owner);` (legacy style),
+    # and the AND-compound form `if (msg.sender == initializer && controller == address(0)) { ... }`.
+    rf"|^\s*if\s*\(\s*{SENDER}\s*==\s*[\w.()]+\s*(?:\)|&&)|^\s*if\s*\(\s*[\w.()]+\s*==\s*{SENDER}\s*(?:\)|&&)"
     # a guard helper invoked ON the caller: requireMaster(msg.sender), _checkCaller(msg.sender), onlyX(msg.sender)
     rf"|\b_?(?:require|check|only|ensure|validate|assert|verify|auth)\w+\s*\(\s*{SENDER}"   # named helper, not bare require(
     , re.M)
@@ -335,6 +339,12 @@ def calls_guarded_helper(fn: Function, project: Project) -> bool:
         # a require/if on msg.sender inside a helper whose name says it is a check
         if re.match(r"^_?(?:require|check|only|ensure|validate|assert|verify|auth)\w*$", callee.name, re.I) and \
                 callee.body and re.search(rf"(?:require|if)\s*\([^;]*{SENDER}", callee.body):
+            return True
+        # Boolean auth PREDICATE used in a reverting guard: `if (!_isVaultOwner() && !_isManagerAdmin()) revert`
+        # / `require(isOwner())`. The predicate `return`s a msg.sender comparison (directly, or via
+        # owner()/manager()/hasRole), and the caller reverts unless it holds (Arrakis UniV4StandardModule).
+        if callee.body and re.search(rf"return\b[^;]*(?:{SENDER}|hasRole\s*\(|_checkRole)", callee.body) and \
+                re.search(rf"(?:require|if)\s*\([^;{{]*\b{re.escape(name)}\s*\(", body):
             return True
         # calldata timelocks (Morpho Vault V2 `timelocked()`): only calldata a curator submitted, after
         # the delay, can execute - the gate is keyed on msg.data rather than msg.sender
@@ -405,8 +415,16 @@ def target_whitelisted(fn, target: str) -> bool:
 
 def entrypoints(project: Project, mutating: bool = True) -> Iterator[Function]:
     for fn in project.functions():
-        if fn.is_entrypoint and (fn.is_mutating or not mutating):
-            yield fn
+        if not (fn.is_entrypoint and (fn.is_mutating or not mutating)):
+            continue
+        # A `public`/`external` LIBRARY function that takes a `storage` reference parameter cannot be
+        # called across the ABI boundary (storage pointers do not serialize). It is internal plumbing a
+        # guarded wrapper calls (e.g. `AccessableLib.setExternalSanctionsList(storage $, ...)` behind
+        # `Vault.setExternalSanctionsList() external onlyWhitelistManager`). Flagging it as an unprotected
+        # entrypoint is a false positive — the caller check lives on the wrapper.
+        if fn.contract.kind == "library" and any(p.is_storage for p in fn.params):
+            continue
+        yield fn
 
 
 # --------------------------------------------------------------------------- access control
@@ -424,6 +442,10 @@ REPLAY_GUARD_RE = re.compile(
     # (EtherDelta orderFills, EdgexBridge pendingWithdrawals, Invoice isPaid).
     r"|\b\w*(?:used|executed|claimed|consumed|processed|redeemed|fill(?:ed|s)?|spent|cancelled|seen|paid|pending)\w*"
     r"\s*(?:\[[^\]]*\]\s*)+(?:=\s*(?!0\b|false\b|address\s*\(\s*0)|\.\w+\s*!=\s*address\s*\(\s*0\s*\))"
+    # struct-field one-shot flag CONSUMED: `orders[orderId].executed = true` (BitGo-style MultiSigPool
+    # _recordOrder marks the order id used, so the second submission of the same order reverts).
+    r"|\.\s*(?:executed|used|claimed|processed|redeemed|filled|settled|consumed|cancelled|finalized|completed)\b"
+    r"\s*=\s*true\b"
     r"|sequence|replay|invalidat"
     r"|\bage\s*<=|Stale\w*|\b(?:last|latest|current)\w*(?:Timestamp|Age|Round|Epoch)\w*\s*>=", re.I)  # monotonic (Chronicle)
 PRICE_SOURCE_RE = re.compile(
@@ -552,6 +574,15 @@ def _mint(project: Project):
         m = re.search(r"\b_mint\s*\(|\b(?:_balances|balanceOf|balances)\s*\[[^\]]+\]\s*\+=", body)
         if not m:
             continue
+        # Access control often lives in an OVERRIDDEN internal mint the public wrapper delegates to:
+        # `function mint(a, n) public canMint { _mint(a, n); }` with a derived
+        # `function _mint(a, n) internal override onlyMinter { super._mint(a, n); }`. The modifier is not
+        # in the wrapper's body, so resolve every definition of the internal mint helper this function
+        # calls and treat the path as guarded if any carries a caller check (PowerfulERC20 / erc20-generator).
+        called_mint = set(re.findall(r"\b(_mint\w*)\s*\(", body))
+        if any(access_controlled(d, project)
+               for nm in called_mint for d in project.callables_by_name().get(nm, []) if d is not fn):
+            continue
         eff = effective_body(fn, project, depth=2)
         if re.search(r"msg\.value|transferFrom\s*\(|safeTransferFrom\s*\(|_burn\s*\(|\bburn\w*\s*\(|SIGNATURE|MerkleProof|ecrecover|\.recover\s*\("
                      r"|_deposit\s*\(|_pull\w*\s*\(|claimable|pending\w*\[", eff):
@@ -607,6 +638,17 @@ def _arbitrary_withdraw(project: Project):
             continue
         recipients = fn.params_of_type("address")
         eff = effective_body(fn, project, depth=2)
+        # Custodial multi-sig withdrawal: the recipient is bound into a hash verified against the
+        # contract's OWN registered signer set (`isAllowedSigner` / `allSigners` / `signers[]`), with an
+        # order-id/digest replay guard. Anyone may relay the transaction, but only the custodians'
+        # signatures authorize where the money goes (MultiSigPoolV2). A single external-signer scheme
+        # that lacks a registered signer set (e.g. an operator-signed voucher) is NOT covered here.
+        # Use a SHALLOW inline (depth=1): the verifier helper's body is pasted verbatim, so its
+        # `ECDSA.recover(...)` / `isAllowedSigner(...)` tokens survive (a deeper inline rewrites them away).
+        sig_scope = effective_body(fn, project, depth=1)
+        if SIGNATURE_CHECK_RE.search(sig_scope) and re.search(
+                r"isAllowedSigner|allSigners|\bsigners\s*\[|\bsigners\s*\.\s*length|\bisSigner\b", sig_scope):
+            continue
         for m in pay_re.finditer(body):
             to = next((g for g in m.groups() if g), "")
             if to not in recipients:
@@ -631,6 +673,14 @@ def _arbitrary_withdraw(project: Project):
     ["https://rekt.news/parity-wallet-hack/", "https://docs.openzeppelin.com/upgrades-plugins/writing-upgradeable#initializers"],
 )
 def _initializer(project: Project):
+    # A deployed, fund-holding PROXY has necessarily already been initialized: its implementation's
+    # `initialize()` was consumed at deploy, and the OZ `initializer` modifier / already-set storage
+    # makes any re-call revert (confirmed by mainnet-fork tests on the BeaconProxy/OptinProxy cluster).
+    # The flagged `initialize` always lives in the implementation bundle, not the proxy shell, so there
+    # is no front-runnable window left to flag. The impl's own missing `_disableInitializers()` is the
+    # separate medium `uninitialized-implementation` finding, not a fund-theft one.
+    if project.meta.get("proxy"):
+        return
     for fn in entrypoints(project):
         if not re.match(r"^(initiali[sz]e\w*|init)$", fn.name):
             continue
@@ -1435,7 +1485,7 @@ def _randomness(project: Project):
 
 # --------------------------------------------------------------------------- runner
 
-def build_project(files: list[SourceFile]) -> Project:
+def build_project(files: list[SourceFile], meta: dict | None = None) -> Project:
     auth_mods: set[str] = set()
     state_vars: set[str] = set()
     for f in files:
@@ -1444,11 +1494,12 @@ def build_project(files: list[SourceFile]) -> Project:
             for mod in c.modifiers:
                 if mod.body and (re.search(SENDER, mod.body) or AUTH_BODY_RE.search(mod.body)):
                     auth_mods.add(mod.name)
-    return Project(files, auth_mods, state_vars)
+    return Project(files, auth_mods, state_vars, meta or {})
 
 
-def run_detectors(files: list[SourceFile], only: set[str] | None = None, exclude: set[str] | None = None) -> list[Finding]:
-    project = build_project(files)
+def run_detectors(files: list[SourceFile], only: set[str] | None = None, exclude: set[str] | None = None,
+                  meta: dict | None = None) -> list[Finding]:
+    project = build_project(files, meta)
     findings: list[Finding] = []
     seen: set[tuple] = set()
     for det in DETECTORS:
