@@ -290,7 +290,7 @@ let tags = [], tagsKey = '', tagsT0 = 0, findingsCache = {};
 
 /* ---------------- canvas: galaxy ---------------- */
 const cv = $('#galaxy'), g = cv.getContext('2d');
-let W = 0, H = 0, DPR = 1, bgLayer = null, hudTop = 0;
+let W = 0, H = 0, DPR = 1, bgLayer = null, hudTop = 0, nebR = 0;
 
 function rngFrom(seed){ let a = seed >>> 0; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
   t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
@@ -325,12 +325,19 @@ function resize(){
   const hud = document.querySelector('.hud');
   hudTop = (getComputedStyle(hud).position === 'absolute') ? hud.offsetTop : H;
   // static background: starfield + a few huge faint nebulae
-  bgLayer = document.createElement('canvas'); bgLayer.width = cv.width; bgLayer.height = cv.height;
+  // Large, DENSE nebula texture (bigger than the viewport). render() rotates + "breathes" it, so the
+  // whole universe drifts as one organic cloud (matches the reference), not a sparse starfield.
+  nebR = Math.ceil(Math.max(W, H) * 1.9);
+  bgLayer = document.createElement('canvas'); bgLayer.width = bgLayer.height = Math.ceil(nebR*DPR);
   const b = bgLayer.getContext('2d'); b.scale(DPR,DPR); const r = rngFrom(7);
-  for (let i=0;i<Math.floor(W*H/1800);i++){ b.fillStyle = `rgba(200,210,230,${.05+r()*.22})`; b.fillRect(r()*W, r()*H, .9, .9); }
-  [[.18,.42,170],[.78,.28,150],[.62,.66,190],[.30,.78,140]].forEach(([nx,ny,R],i)=>{
-    const cl = makeCloud(900+i, R*(Math.min(W,1400)/1400+.35), '170,180,200', .45);
-    b.drawImage(cl.img, nx*W - cl.size/2, ny*Math.min(H,hudTop+60) - cl.size/2, cl.size, cl.size); });
+  // baked starfield
+  for (let i=0;i<Math.floor(nebR*nebR/1500);i++){ const big = r()<.07; b.fillStyle = `rgba(205,214,234,${.04+r()*.24})`;
+    b.fillRect(r()*nebR, r()*nebR, big?1.7:.9, big?1.7:.9); }
+  // many overlapping organic clouds -> one connected, colourful nebula field
+  const pal = ['150,162,188','120,150,205','158,120,196','118,188,176','196,150,120'];
+  for (let i=0;i<18;i++){ const R = nebR*(.07+r()*.17), nx = r()*nebR, ny = r()*nebR;
+    const cl = makeCloud(900+i, R, pal[Math.floor(r()*pal.length)], .30+r()*.2);
+    b.drawImage(cl.img, nx - cl.size/2, ny - cl.size/2, cl.size, cl.size); }
   makeStars();
   for (const c of clusters.values()) place(c, true);
 }
@@ -467,10 +474,17 @@ function render(now){
   frame++;
   const col = PH[PHI[phase] ?? 0].c;
   g.clearRect(0,0,W,H);
-  if (bgLayer) g.drawImage(bgLayer, 0, 0, W, H);
-
-  // 3D universe: advance the camera, fly through the starfield, then project the clusters
-  if (W){ updateCamera(now); if (stars3d.length) drawStars(now); project3d(now); }
+  if (W) updateCamera(now);
+  // dense nebula, rotated + slowly zoomed -> flying through a living universe
+  if (bgLayer){ const bx = W/2, by = (118 + (hudTop||H))*0.5;
+    const zoom = 1.08 + Math.sin(now*0.00004)*0.07;
+    g.save(); g.translate(bx, by); g.rotate(camRot*0.5); g.scale(zoom, zoom);
+    g.globalAlpha = .92; g.drawImage(bgLayer, -nebR/2, -nebR/2, nebR, nebR); g.globalAlpha = 1; g.restore();
+    const pw = g.createRadialGradient(bx,by,0,bx,by,Math.max(W,H)*.55);   // phase-coloured wash
+    pw.addColorStop(0, `rgba(${rgb(col)},.07)`); pw.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = pw; g.fillRect(0,0,W,H); }
+  // faint parallax starfield on top, then project the clusters as bright nodes
+  if (W){ if (stars3d.length) drawStars(now); project3d(now); }
   const ordered = [...clusters.values()].sort((a,b) => (b.depth||0) - (a.depth||0));
   // clouds
   for (const c of ordered){
