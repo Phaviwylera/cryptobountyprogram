@@ -31,10 +31,12 @@ ATTACKER_WALLET = os.environ.get("BOUNTYSCAN_ATTACKER_WALLET", "0xE4754d8237C952
 
 
 def _addr_literal(addr: str) -> str:
-    """Embed an address as `address(uint160(0x..))` - a numeric literal, so Solidity's EIP-55 checksum
-    requirement never rejects the (lowercase, from-DB) address and the test always compiles."""
-    h = re.sub(r"[^0-9a-fA-F]", "", addr.lower().replace("0x", ""))
-    return f"address(uint160(0x{h}))"
+    """Embed an address as a NUMBER, not an address literal, so Solidity's EIP-55 checksum rule never
+    rejects the lowercase from-DB address. A bare 40-hex `0x..` is still parsed as an address (checksum
+    enforced even inside uint160(...)); the compiler's own escape is to prepend '00' -> 42 hex digits is
+    a plain number, and uint160() takes the low 160 bits back to the address."""
+    h = re.sub(r"[^0-9a-fA-F]", "", addr.lower().replace("0x", "")).rjust(40, "0")
+    return f"address(uint160(0x00{h}))"
 
 
 def forge_bin() -> str | None:
@@ -259,11 +261,13 @@ def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: 
         reason = "forge not installed" if not forge else "no fork RPC configured"
         return [PayloadVerdict(f, "error", f"payload not run: {reason}") for f in findings]
 
-    root = Path(workdir or (Path.home() / ".bountyscan_forge"))
-    proj = root / target.lower()
+    # One shared project (forge-std installed once) - the target is a constant in each generated test,
+    # so there is no need for a per-target project, and we avoid a slow/flaky install on every contract.
+    proj = Path(workdir or (Path.home() / ".bountyscan_forge" / "shared"))
     (proj / "test").mkdir(parents=True, exist_ok=True)
     (proj / "foundry.toml").write_text('[profile.default]\nsrc="src"\ntest="test"\nlibs=["lib"]\n', encoding="utf-8")
-    _ensure_forge_std(proj, forge)
+    if not _ensure_forge_std(proj, forge):
+        return [PayloadVerdict(f, "error", "payload not run: forge-std unavailable") for f in findings]
 
     for f in findings:
         fn = _function_of(files, f)
@@ -285,11 +289,12 @@ def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: 
     return verdicts
 
 
-def _ensure_forge_std(proj: Path, forge: str) -> None:
-    if (proj / "lib" / "forge-std").exists():
-        return
+def _ensure_forge_std(proj: Path, forge: str) -> bool:
+    if (proj / "lib" / "forge-std" / "src" / "Test.sol").exists():
+        return True
     try:
-        subprocess.run([forge, "install", "foundry-rs/forge-std", "--no-git"],
-                       cwd=proj, capture_output=True, text=True, timeout=120)
+        subprocess.run([forge, "install", "foundry-rs/forge-std", "--no-git", "--root", str(proj)],
+                       capture_output=True, text=True, timeout=180)
     except Exception:
         pass
+    return (proj / "lib" / "forge-std" / "src" / "Test.sol").exists()

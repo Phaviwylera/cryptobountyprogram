@@ -40,10 +40,10 @@ class BuildExploit(unittest.TestCase):
         from bountyscan.forge_verify import ATTACKER_WALLET
         t = build_exploit(_finding("unprotected-privileged-function"),
                           _fn("setController", [("address", "c")]), "0xABc0000000000000000000000000000000000001")
-        # target embedded as a numeric literal so Solidity's EIP-55 checksum never rejects it
-        self.assertIn("address(uint160(0xabc0000000000000000000000000000000000001))", t)
+        # target embedded as a NUMBER (00-prefixed) so Solidity's EIP-55 checksum never rejects it
+        self.assertIn("address(uint160(0x00abc0000000000000000000000000000000000001))", t)
         # loot routed to the configured receiving wallet
-        self.assertIn("address(uint160(0x" + ATTACKER_WALLET.lower().replace("0x", "") + "))", t)
+        self.assertIn("address(uint160(0x00" + ATTACKER_WALLET.lower().replace("0x", "") + "))", t)
         self.assertIn("funds must land here", t)
 
     def test_non_auto_type_returns_none(self):
