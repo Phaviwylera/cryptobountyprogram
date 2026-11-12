@@ -74,6 +74,37 @@ class ServerSmokeTests(unittest.TestCase):
             _, body = self.get("/api/results")
             self.assertIn("results", json.loads(body))
 
+    def test_download_all_reports(self):
+        # Seed one confirmed-vulnerable row with a report on disk, then the one-file download must carry it.
+        store = Handler.worker.store
+        root = Path(self.tmp.name)
+        rep = root / "REPORT.md"
+        rep.write_text("# Threat report\nAnyone can mint tokens for free.\n", encoding="utf-8")
+        (root / "findings.json").write_text(
+            '{"findings":[{"severity":"critical","title":"Anyone can mint tokens/shares without paying"}]}',
+            encoding="utf-8")
+        addr = "0x" + "cd" * 20
+        store.enqueue("ethereum", addr, "test")
+        store.update("ethereum", addr, status="vulnerable", name="MintBug", max_severity="critical",
+                     findings=1, value_usd=1234.0, report=str(rep))
+        status, body = self.get("/api/report/all.txt")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+        self.assertIn("ALL CONFIRMED THREATS", text)
+        self.assertIn("MintBug", text)
+        self.assertIn("Anyone can mint tokens for free", text)
+        self.assertIn("findings.json", text)
+
+    def test_requeue_endpoint_recHecks_judged_rows(self):
+        store = Handler.worker.store
+        addr = "0x" + "ef" * 20
+        store.enqueue("ethereum", addr, "test")
+        store.update("ethereum", addr, status="vulnerable", name="X", max_severity="high", findings=1)
+        status, d = self.post("/api/requeue", {"scope": "vulnerable"})
+        self.assertEqual(status, 200)
+        self.assertTrue(d["ok"])
+        self.assertGreaterEqual(d["requeued"], 1)
+
     def test_live_start_without_rpc_errors_cleanly(self):
         # worker has no rpc; starting live scan should 400, not crash
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/live/start",

@@ -183,11 +183,11 @@ INDEX_HTML = r"""<!doctype html>
       <label>Start from block (blank = chain head)</label><input id="liveFromBlock" placeholder="latest">
     </div>
     <div class="drow">
-      <button class="cmd back" id="btnBack">◷ BACKFILL 6 MONTHS</button>
+      <button class="cmd back" id="btnBack">◷ BACKFILL 2 YEARS</button>
       <button class="cmd gear" id="btnBackGear" title="Backfill settings" style="--c:var(--purple)">⚙</button>
     </div>
     <div class="drawer" id="drBack">
-      <label>History window (days)</label><input id="bfDays" value="180" inputmode="numeric">
+      <label>History window (days · 730 = 2 years)</label><input id="bfDays" value="730" inputmode="numeric">
       <label>Alive = at least N transactions (or any balance / market cap)</label><input id="bfTxs" value="10" inputmode="numeric">
       <div style="color:var(--dim);font-size:10px;margin-top:6px">Lists every contract verified on Blockscout in the window, keeps the alive ones, prices them, and scans the richest first. Resumes after restarts.</div>
     </div>
@@ -217,7 +217,9 @@ INDEX_HTML = r"""<!doctype html>
 <section class="findings" id="findings">
   <div class="fh"><h2>FINDINGS</h2>
     <span class="ftab on" data-t="results">vulnerable</span><span class="ftab" data-t="safe">safe</span><span class="ftab" data-t="errors">errors</span>
-    <span style="margin-left:auto;color:var(--dim)" id="fNote">only findings confirmed by the independent second pass appear here</span></div>
+    <button class="cmd" id="btnDownload" style="margin-left:auto;--c:var(--teal)" title="Download every confirmed threat's full report as one text document">⬇ DOWNLOAD ALL REPORTS</button>
+    <button class="cmd" id="btnRecheck" style="--c:var(--pink)" title="Re-verify every already-judged contract against the current rules">↻ RE-CHECK ALL</button>
+    <span style="margin-left:14px;color:var(--dim)" id="fNote">only findings confirmed by the independent second pass appear here</span></div>
   <div id="fTable"><div class="empty">loading…</div></div>
 </section>
 
@@ -606,7 +608,7 @@ function updateChrome(s){
   const bf = s.backfill || {};
   const bb = $('#btnBack');
   if (bf.active && bf.running){ bb.classList.add('running'); bb.textContent = `◷ BACKFILL · ${bf.percent}%`; }
-  else { bb.classList.remove('running'); bb.textContent = bf.active && !bf.done ? `◷ RESUME BACKFILL · ${bf.percent}%` : '◷ BACKFILL 6 MONTHS'; }
+  else { bb.classList.remove('running'); bb.textContent = bf.active && !bf.done ? `◷ RESUME BACKFILL · ${bf.percent}%` : '◷ BACKFILL 2 YEARS'; }
   $('#tBack').textContent = bf.active ? (bf.done ? 'done' : bf.percent + '%') : '-';
   let bfCard = '';
   if (bf.active){
@@ -734,13 +736,22 @@ $('#btnBack').onclick = async () => {
   const running = S && S.backfill && S.backfill.running;
   const b = $('#btnBack'); b.disabled = true;
   const r = running ? await api('/api/backfill/stop','POST',{})
-    : await api('/api/backfill/start','POST',{chain:$('#liveChain').value, days:parseInt($('#bfDays').value||'180'), min_txs:parseInt($('#bfTxs').value||'10')});
+    : await api('/api/backfill/start','POST',{chain:$('#liveChain').value, days:parseInt($('#bfDays').value||'730'), min_txs:parseInt($('#bfTxs').value||'10')});
   b.disabled = false;
   if (r.error) toast('backfill · ' + r.error, true);
   else toast(running ? 'backfill paused · progress saved' : `backfill running · last ${$('#bfDays').value} days of verified contracts, richest first`);
   poll();
 };
 $('#btnStop').onclick = async () => { await api('/api/live/stop','POST',{}); toast('stopping · current contract finishes first'); poll(); };
+$('#btnDownload').onclick = () => { toast('building full threat report…'); window.location = '/api/report/all.txt'; };
+$('#btnRecheck').onclick = async () => {
+  const b = $('#btnRecheck'); b.disabled = true;
+  const r = await api('/api/requeue','POST',{scope:'vulnerable'});
+  b.disabled = false;
+  if (r.error) toast('re-check · ' + r.error, true);
+  else toast(`re-checking ${r.requeued} already-flagged contract(s) against current rules`);
+  poll();
+};
 $('#btnImmGo').onclick = async () => {
   const scope = $('#immScope').value.trim();
   const assets = $('#immAddrs').value.split('\n').map(x=>x.trim()).filter(Boolean).map(l => { const m = l.match(/^(?:([\w-]+)[:,\s]+)?(0x[0-9a-fA-F]{40})$/);

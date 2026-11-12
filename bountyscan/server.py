@@ -264,15 +264,49 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet; the worker prints its own progress
         pass
 
-    def _send(self, code, payload, ctype="application/json"):
+    def _send(self, code, payload, ctype="application/json", filename=None):
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def _all_reports_text(self) -> str:
+        """Every confirmed threat's full report + findings.json, concatenated into one text document."""
+        import time as _t
+        rows = self.worker.store.by_status("vulnerable")
+        out = ["=" * 100,
+               f"BOUNTYSCAN - ALL CONFIRMED THREATS  (rules v{__version__})",
+               f"{len(rows)} contract(s)  -  generated {_t.strftime('%Y-%m-%d %H:%M:%S UTC', _t.gmtime())}",
+               "Each entry carries its full report (what is wrong / how it is exploited / how to fix) and findings.json.",
+               "These are the contracts confirmed by the independent second verification pass.",
+               "=" * 100]
+        total = 0.0
+        for i, r in enumerate(rows, 1):
+            keys = r.keys()
+            v = (r["value_usd"] if "value_usd" in keys and r["value_usd"] else 0) or 0
+            total += v
+            out += ["\n" + "#" * 100,
+                    f"# #{i}  {r['address']}  chain={r['chain']}  severity={r['max_severity']}  "
+                    f"findings={r['findings']}  value_usd={v:.2f}  name={r['name'] or ''}",
+                    "#" * 100 + "\n"]
+            rep = r["report"]
+            if rep and Path(rep).exists():
+                out.append(Path(rep).read_text(encoding="utf-8"))
+                fj = Path(rep).parent / "findings.json"
+                if fj.exists():
+                    out += ["\n--- findings.json ---", fj.read_text(encoding="utf-8")]
+            else:
+                out.append("[report file not on disk]")
+        out += ["\n" + "=" * 100,
+                f"TOTAL value_usd across all threats: ${total:,.2f}",
+                "NOTE: value_usd is the contract's holdings heuristic, NOT the directly stealable amount."]
+        return "\n".join(out)
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
@@ -298,6 +332,11 @@ class Handler(BaseHTTPRequestHandler):
                                     "detectors": [{"id": d.id, "severity": d.severity, "title": d.title} for d in DETECTORS]})
         if u.path == "/api/results":
             return self._send(200, {"results": [self._row(r) for r in w.store.by_status("vulnerable")]})
+        if u.path in ("/api/report/all.txt", "/download/reports.txt"):
+            import time as _t
+            fn = f"bountyscan_threats_{_t.strftime('%Y%m%d')}.txt"
+            return self._send(200, self._all_reports_text().encode("utf-8"),
+                              "text/plain; charset=utf-8", filename=fn)
         if u.path == "/api/safe":
             return self._send(200, {"safe": [self._row(r) for r in w.store.by_status("safe")[:200]]})
         if u.path == "/api/errors":
@@ -335,11 +374,21 @@ class Handler(BaseHTTPRequestHandler):
                 w.stop()
                 return self._send(200, {"ok": True, "mode": w.mode})
             if u.path == "/api/backfill/start":
-                days = max(1, min(3650, int(b.get("days", 180) or 180)))
+                days = max(1, min(3650, int(b.get("days", 730) or 730)))   # default 2 years
                 min_txs = max(0, int(b.get("min_txs", 10) or 0))
                 w.backfill.start(b.get("chain", cfg_default_chain()), days, min_txs)
                 w.start_drain()
                 return self._send(200, {"ok": True, "backfill": w.backfill.snapshot()})
+            if u.path == "/api/requeue":
+                # Re-verify already-judged contracts, so nothing stays flagged on stale rules - even a
+                # contract manually marked vulnerable before gets re-scanned by the current pipeline.
+                scope = (b.get("scope") or "vulnerable").lower()
+                n = w.store.requeue_status("vulnerable", 2e9)
+                if scope == "all":
+                    n += w.store.requeue_status("safe", 1.5e9)
+                w.start_drain()
+                w.add_event("info", f"Re-checking {n} already-judged contract(s) ({scope}) against the current rules.")
+                return self._send(200, {"ok": True, "requeued": n, "scope": scope})
             if u.path == "/api/backfill/stop":
                 w.backfill.stop()
                 return self._send(200, {"ok": True, "backfill": w.backfill.snapshot()})
