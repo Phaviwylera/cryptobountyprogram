@@ -530,10 +530,35 @@ def _eth_get_tx_input(rpc_url: str, tx_hash: str) -> str | None:
         return None
 
 
+def cast_bin() -> str | None:
+    f = forge_bin()
+    if f:
+        c = Path(f).with_name("cast")
+        if c.exists():
+            return str(c)
+    return shutil.which("cast")
+
+
+def selector_of(sig: str) -> str | None:
+    """4-byte function selector (0x……) for a canonical signature, via `cast sig`. None if unavailable."""
+    cast = cast_bin()
+    if not cast or not sig:
+        return None
+    try:
+        r = subprocess.run([cast, "sig", sig], capture_output=True, text=True, timeout=20)
+        s = r.stdout.strip().lower()
+        return s if re.fullmatch(r"0x[0-9a-f]{8}", s) else None
+    except Exception:
+        return None
+
+
 def fetch_historical_calldata(target: str, rpc_url: str | None = None, key: str | None = None,
-                              chain_id: int = 1, explicit_hash: str | None = None, limit: int = 80):
-    """Find a historical tx to `target` whose calldata carries a 65-byte signature (a replayable signed
-    payload). Returns (tx_hash, calldata_hex) or (None, None). Real past calldata - nothing is fabricated."""
+                              chain_id: int = 1, explicit_hash: str | None = None, limit: int = 1000,
+                              selectors=None):
+    """Find a historical tx to `target` carrying a replayable signed payload: one whose calldata starts
+    with the vulnerable function's selector (preferred), or else carries a 65-byte (r,s,v) blob. Returns
+    (tx_hash, calldata_hex) or (None, None). Real past calldata - nothing is fabricated."""
+    sels = tuple(s.lower() for s in (selectors or []) if s)
     key = key or os.environ.get("ETHERSCAN_API_KEY")
     if explicit_hash and rpc_url:
         cd = _eth_get_tx_input(rpc_url, explicit_hash)
@@ -559,7 +584,12 @@ def fetch_historical_calldata(target: str, rpc_url: str | None = None, key: str 
             inp = (tx.get("input") or "").lower()
             if str(tx.get("isError", "0")) not in ("0", "", "None") or str(tx.get("txreceipt_status", "1")) == "0":
                 continue
-            if len(inp) >= 10 and _SIG65_MARKER in inp:      # a signed, replayable call
+            if len(inp) < 10:
+                continue
+            if sels:                                         # selector match (robust for multi-sig relays)
+                if inp[2:10] in sels:
+                    return tx.get("hash"), inp
+            elif _SIG65_MARKER in inp:                        # fallback: a lone 65-byte signature blob
                 return tx.get("hash"), inp
     return None, None
 
@@ -679,7 +709,8 @@ def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: 
             # Tier 3: fetch a real historical signed call to the target and replay it. Revert -> FP.
             static = PayloadVerdict(f, "manual", "signature-replay: needs a historical signed tx to replay; verify by hand")
             try:
-                txh, cd = fetch_historical_calldata(target, rpc_url)
+                sel = selector_of(canonical_sig(fn)) if (fn is not None and _encodable(fn)) else None
+                txh, cd = fetch_historical_calldata(target, rpc_url, selectors=[sel] if sel else None)
                 poc = build_replay_exploit(target, cd, wallet) if cd else None
                 if poc is None:
                     verdicts.append(static)
