@@ -27,7 +27,10 @@ CONTRACT_RE = re.compile(
     r"\b(?:(abstract)\s+)?(contract|library|interface)\s+([A-Za-z_]\w*)\s*([^{;]*?)\{"
 )
 MEMBER_RE = re.compile(
-    r"(?<![.\w])(?:function\s+([A-Za-z_]\w*)|(constructor)|(receive)|(fallback)|modifier\s+([A-Za-z_]\w*))\s*\("
+    # The trailing "(" is optional (group 6) so a parenthesis-less modifier definition is parsed too:
+    # `modifier byDFO virtual { ... }`, `modifier isSigner { ... }`. Without it the modifier - and the
+    # msg.sender auth check in its body - was invisible, so every function it guards read as unprotected.
+    r"(?<![.\w])(?:function\s+([A-Za-z_]\w*)|(constructor)|(receive)|(fallback)|modifier\s+([A-Za-z_]\w*))\s*(\()?"
 )
 PRAGMA_RE = re.compile(r"pragma\s+solidity\s+([^;]+);")
 
@@ -291,9 +294,18 @@ def parse_source(path: Path, display: str | None = None, raw: str | None = None)
             else:
                 kind, name = "modifier", mm.group(5)
 
-            paren_open = mm.end() - 1
-            paren_close = match_close(clean, paren_open, "(", ")")
-            j, depth = paren_close + 1, 0
+            if mm.group(6):                              # has a parameter list "("
+                paren_open = mm.end() - 1
+                paren_close = match_close(clean, paren_open, "(", ")")
+                params_src = clean[paren_open + 1: paren_close]
+                after = paren_close + 1
+            elif kind == "modifier":                     # parenthesis-less modifier: `modifier byDFO { ... }`
+                paren_close = after = mm.end()
+                params_src = ""
+            else:                                        # a function-like member must have "(" - skip a stray match
+                p = mm.end()
+                continue
+            j, depth = after, 0
             while j < close_i:
                 c = clean[j]
                 if c == "(":
@@ -303,9 +315,9 @@ def parse_source(path: Path, display: str | None = None, raw: str | None = None)
                 elif c in "{;" and depth == 0:
                     break
                 j += 1
-            tail = clean[paren_close + 1: j]
+            tail = clean[after: j]
             visibility, mutability, mods = _parse_header_tail(tail)
-            if clean[j] == "{":
+            if j < close_i and clean[j] == "{":
                 body_close = match_close(clean, j)
                 body, body_offset, end = clean[j + 1: body_close], j + 1, body_close + 1
             else:
@@ -313,7 +325,7 @@ def parse_source(path: Path, display: str | None = None, raw: str | None = None)
 
             fn = Function(
                 kind=kind, name=name, contract=contract,
-                params=_parse_params(clean[paren_open + 1: paren_close]),
+                params=_parse_params(params_src),
                 visibility=visibility, mutability=mutability, modifiers=mods,
                 body=body, body_offset=body_offset, offset=mm.start(),
             )
