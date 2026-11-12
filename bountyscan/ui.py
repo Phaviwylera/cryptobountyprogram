@@ -800,7 +800,7 @@ function drawCode(s){
 /* ---------------- findings table ---------------- */
 async function loadTable(){
   const ep = ftab === 'results' ? '/api/results' : ftab === 'safe' ? '/api/safe' : '/api/errors';
-  const d = await api(ep).catch(()=>({})); const rows = d[ftab] || [];
+  const d = await api(ep).catch(()=>({})); let rows = d[ftab] || [];
   if (ftab === 'safe') safeHeld = rows.filter(r => (r.error||'').includes('not confirmed')).length;
   const w = $('#fTable');
   if (!rows.length){ w.innerHTML = `<div class="empty">${ftab==='results' ? 'no confirmed vulnerabilities yet · the crawler keeps going' : 'nothing here yet'}</div>`; return; }

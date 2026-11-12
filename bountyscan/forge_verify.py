@@ -491,7 +491,7 @@ def parse_overflow_outcome(finding, stdout: str, fallback: "PayloadVerdict") -> 
                 "mint/inflation bug -> THEORETICAL unless chained" if gt_supply else
                 "the required token balance is within total supply, so it is CRITICAL if those tokens are "
                 "buyable for less than the drained ETH")
-        detail = (f"unchecked `amount*{price}` overflow drains {-tgt_delta} wei from the target to the "
+        detail = (f"unchecked multiplication overflow drains {-tgt_delta} wei from the target to the "
                   f"attacker. Economic precondition: holding {amount} tokens (supply {supply}) - {econ}")
         return PayloadVerdict(finding, "conditional", detail, profit_wei=-tgt_delta,
                               metrics=metrics, injected=injected)
