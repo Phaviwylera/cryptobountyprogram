@@ -124,11 +124,20 @@ INDEX_HTML = r"""<!doctype html>
   .mh{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line)}
   .mh b{color:var(--pink)} .mh button{background:0;border:0;color:var(--dim);font-size:20px;cursor:pointer}
   dialog pre{margin:0;padding:16px;max-height:76vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px/1.55 var(--mono);color:#c9d2dd}
-  .toasts{position:fixed;right:16px;top:70px;z-index:40;display:flex;flex-direction:column;gap:6px;pointer-events:none}
-  .toast{background:rgba(8,10,14,.97);border:1px solid var(--line2);border-left:3px solid var(--teal);padding:9px 12px;max-width:340px;
+  .toasts{position:fixed;left:16px;bottom:16px;z-index:40;display:flex;flex-direction:column-reverse;gap:6px;pointer-events:none;max-height:40vh;overflow:hidden}
+  .toast{background:rgba(8,10,14,.97);border:1px solid var(--line2);border-left:3px solid var(--teal);padding:8px 11px;max-width:320px;font-size:11px;
     animation:tin .25s ease}
   .toast.err{border-left-color:var(--pink)}
-  @keyframes tin{from{opacity:0;transform:translateX(8px)}}
+  @keyframes tin{from{opacity:0;transform:translateX(-8px)}}
+  /* top alert ticker - vulnerable/funded hits scroll across the top instead of blocking the panels */
+  .ticker{position:fixed;left:0;right:0;top:34px;height:24px;z-index:36;overflow:hidden;background:linear-gradient(90deg,rgba(6,8,12,.0),rgba(6,8,12,.92) 6%,rgba(6,8,12,.92) 94%,rgba(6,8,12,0));
+    border-top:1px solid rgba(255,92,138,.18);border-bottom:1px solid rgba(255,92,138,.18);display:flex;align-items:center;pointer-events:none}
+  .ticker .lbl{flex:0 0 auto;padding:0 10px;font:600 10px var(--mono);letter-spacing:.8px;color:var(--pink);background:rgba(255,92,138,.12);align-self:stretch;display:flex;align-items:center;z-index:2}
+  .tk-win{flex:1 1 auto;overflow:hidden;position:relative;height:100%}
+  .tk-track{position:absolute;left:0;top:0;height:100%;display:flex;align-items:center;white-space:nowrap;will-change:transform;animation:tk 1s linear infinite}
+  .tk-item{padding:0 26px;font:500 11px var(--mono);color:#cdd6e2}
+  .tk-item b{color:var(--pink)} .tk-item em{color:var(--yellow);font-style:normal}
+  @keyframes tk{from{transform:translateX(0)}to{transform:translateX(-50%)}}
 
   /* ---------- responsive ---------- */
   @media (max-width:1100px){
@@ -232,6 +241,7 @@ INDEX_HTML = r"""<!doctype html>
 </section>
 
 <dialog id="modal"><div class="mh"><b id="mTitle">report</b><button onclick="document.getElementById('modal').close()">×</button></div><pre id="mBody"></pre></dialog>
+<div class="ticker" id="ticker"><div class="lbl">⚑ LIVE HITS</div><div class="tk-win"><div class="tk-track" id="tkTrack"></div></div></div>
 <div class="toasts" id="toasts"></div>
 
 <script>
@@ -326,18 +336,37 @@ function resize(){
 
 /* cluster placement inside the free area (between title and HUD) */
 function place(c, keep){
-  const top = 120, bottom = Math.max(top+120, hudTop - 30), left = 30, right = W - (W > 1100 ? 330 : 30);
-  if (!keep || c.nx === undefined){
-    const r = rngFrom(hash(c.addr)); let best = null, bestD = -1;
-    for (let k=0;k<40;k++){
-      const nx = r(), ny = r(); const x = left + nx*(right-left), y = top + ny*(bottom-top);
-      let d = 1e9; for (const o of clusters.values()) if (o!==c && o.x!==undefined) d = Math.min(d, Math.hypot(o.x-x, o.y-y));
-      if (d > bestD){ bestD = d; best = [nx,ny]; } if (d > 230) break; }
-    c.nx = best[0]; c.ny = best[1];
+  // 3D placement: each cluster sits on a shell in a rotating universe (project3d maps it to screen).
+  if (!keep || c.wx === undefined){
+    const r = rngFrom(hash(c.addr));
+    const u = r()*2-1, th = r()*Math.PI*2, rr = Math.sqrt(Math.max(0,1-u*u));
+    c.wx = rr*Math.cos(th); c.wy = u*0.78; c.wz = rr*Math.sin(th);
+    c.wr = 0.5 + r()*0.55;
   }
-  c.x = left + c.nx*(right-left); c.y = top + c.ny*(bottom-top);
-  c.R = Math.max(46, Math.min(92, (bottom-top)/5.2));
+  c.R = Math.max(40, Math.min(84, ((hudTop||H)-150)/5.4));
+  c.x = W/2; c.y = (118 + (hudTop||H))*0.5;   // provisional until first projection
+  c.scale = 1; c.depth = 0;
   c.grey = null; c.tint = {};
+}
+
+/* project every cluster from its 3D world position to the screen, through a slowly rotating camera
+   with a gentle pitch bob - the clusters orbit and parallax, so it reads as a 3D universe. */
+let camRot = 0, _projT = 0;
+function project3d(now){
+  const dt = Math.min(0.05, (now - _projT)/1000) || 0.016; _projT = now;
+  camRot += dt*0.14;
+  const pitch = Math.sin(now*0.00006)*0.20;
+  const cx = W/2, cyc = (118 + (hudTop||H))*0.5;
+  const spread = Math.min(W, 1040)*0.42, focal = 560, back = spread*1.55;
+  const cY = Math.cos(camRot), sY = Math.sin(camRot), cX = Math.cos(pitch), sX = Math.sin(pitch);
+  for (const c of clusters.values()){
+    if (c.wx === undefined) place(c, false);
+    const x = c.wx*c.wr*spread, y = c.wy*c.wr*spread, z = c.wz*c.wr*spread;
+    const x1 = x*cY - z*sY, z1 = x*sY + z*cY;         // yaw (around Y)
+    const y1 = y*cX - z1*sX, z2 = y*sX + z1*cX;        // pitch (around X)
+    const dist = z2 + back, sc = focal / Math.max(80, focal + dist);
+    c.x = cx + x1*sc; c.y = cyc + y1*sc; c.scale = sc; c.depth = dist;
+  }
 }
 
 function cloudFor(c, color){
@@ -416,28 +445,34 @@ function render(now){
   g.clearRect(0,0,W,H);
   if (bgLayer) g.drawImage(bgLayer, 0, 0, W, H);
 
+  // 3D universe: project every cluster, then draw far-to-near so depth reads correctly
+  if (W) project3d(now);
+  const ordered = [...clusters.values()].sort((a,b) => (b.depth||0) - (a.depth||0));
   // clouds
-  for (const c of clusters.values()){
+  for (const c of ordered){
     const isA = c.addr === active, age = (now - c.born)/900, fade = Math.min(1, age);
-    const status = c.status;
+    const status = c.status, sc = c.scale || 1, dim = Math.max(.28, Math.min(1, sc*1.15));
     let tint = null;
     if (isA) tint = col; else if (status === 'vulnerable') tint = '#ff5c8a';
-    const cl = cloudFor(c, tint);
-    g.globalAlpha = fade * (isA ? 1 : (status === 'vulnerable' ? .85 : .55));
-    if (isA){ const hg = g.createRadialGradient(c.x,c.y,0,c.x,c.y,c.R*1.5);
+    const cl = cloudFor(c, tint), sz = cl.size*sc;
+    g.globalAlpha = fade * dim * (isA ? 1 : (status === 'vulnerable' ? .9 : .55));
+    if (isA){ const hg = g.createRadialGradient(c.x,c.y,0,c.x,c.y,c.R*1.5*sc);
       hg.addColorStop(0, `rgba(${rgb(col)},.20)`); hg.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = hg;
-      g.fillRect(c.x-c.R*1.6, c.y-c.R*1.6, c.R*3.2, c.R*3.2); g.globalCompositeOperation = 'lighter'; }
-    g.drawImage(cl.img, c.x - cl.size/2, c.y - cl.size/2, cl.size, cl.size);
-    g.globalCompositeOperation = 'source-over'; g.globalAlpha = fade;
-    // label
-    g.font = `${isA?'700':'500'} ${isA?14:12.5}px JetBrains Mono, monospace`;
+      g.fillRect(c.x-c.R*1.6*sc, c.y-c.R*1.6*sc, c.R*3.2*sc, c.R*3.2*sc); g.globalCompositeOperation = 'lighter'; }
+    g.drawImage(cl.img, c.x - sz/2, c.y - sz/2, sz, sz);
+    g.globalCompositeOperation = 'source-over'; g.globalAlpha = fade * dim;
+    // label (scaled with depth, hidden when very far/small)
+    const fs = Math.max(8.5, (isA?14:12.5)*sc);
+    g.font = `${isA?'700':'500'} ${fs}px JetBrains Mono, monospace`;
     g.fillStyle = isA ? col : (status==='vulnerable' ? '#ff5c8a' : '#aab3c0');
-    const lx = c.x + c.R*.15, ly = c.y - c.R*.9;
-    g.fillText(c.name || short(c.addr), lx, ly);
-    g.font = '400 10px JetBrains Mono, monospace'; g.fillStyle = '#5d6878';
-    const VERB = {discover:'discovered', fetch:'fetching source', scan:'scanning · detectors', verify:'verifying · 2nd pass', next:'queued'};
-    const worth = c.usd != null ? ' · ' + usd(c.usd) : '';
-    g.fillText((isA && phase !== 'report' ? VERB[phase] : (STATUS_TXT[status] || status)) + worth, lx, ly+13);
+    const lx = c.x + c.R*.15*sc, ly = c.y - c.R*.9*sc;
+    if (sc > 0.45){
+      g.fillText(c.name || short(c.addr), lx, ly);
+      g.font = `400 ${Math.max(7.5, 10*sc)}px JetBrains Mono, monospace`; g.fillStyle = '#5d6878';
+      const VERB = {discover:'discovered', fetch:'fetching source', scan:'scanning · detectors', verify:'verifying · 2nd pass', next:'queued'};
+      const worth = c.usd != null ? ' · ' + usd(c.usd) : '';
+      g.fillText((isA && phase !== 'report' ? VERB[phase] : (STATUS_TXT[status] || status)) + worth, lx, ly+13*sc);
+    }
     g.globalAlpha = 1;
   }
 
@@ -450,10 +485,13 @@ function render(now){
     const [px,py] = bez(tr.a, c, tr.b, (now/1600 + i*.3)%1); g.fillStyle = `rgba(255,255,255,${(1-life)*.9})`; g.fillRect(px-1.2,py-1.2,2.4,2.4);
   }
 
-  // spider movement
+  // spider movement - the active cluster orbits in 3D, so keep re-targeting its LIVE position
   if (active){
+    const ac = clusters.get(active);
+    if (ac){ spider.tx = ac.x; spider.ty = ac.y; }
     spider.t = Math.min(1, spider.t + 1/70); const e = ease(spider.t);
-    [spider.x, spider.y] = bez({x:spider.fx,y:spider.fy}, {x:spider.cx,y:spider.cy}, {x:spider.tx,y:spider.ty}, e);
+    if (spider.t >= 1 && ac){ spider.x = ac.x; spider.y = ac.y; }
+    else [spider.x, spider.y] = bez({x:spider.fx,y:spider.fy}, {x:spider.cx,y:spider.cy}, {x:spider.tx,y:spider.ty}, e);
     const sx = spider.x, sy = spider.y;
 
     // tentacles + tags
@@ -568,9 +606,10 @@ async function poll(){
     const held = e.msg.match(/(?:Holds|holds) \$([\d,]+(?:\.\d+)?)/);
     const patch = {status}; if (nm) patch.name = nm; if (held) patch.usd = parseFloat(held[1].replace(/,/g,''));
     if (KIND[e.kind] && e.kind !== 'info') upsert(m[0], patch);
-    if (isNew && !firstPoll && e.kind === 'funded') toast('$ ' + e.msg, true);
+    const tkName = esc(nm || short(m[0])), tkWorth = held ? ` · <em>$${esc(held[1])}</em>` : '';
+    if (isNew && !firstPoll && e.kind === 'funded') ticker(`💰 <b>${tkName}</b> funded${tkWorth}`);
     if (isNew && !firstPoll && e.kind !== 'found' && e.kind !== 'info'){ newResults++; lastResult = performance.now(); }
-    if (isNew && !firstPoll && e.kind === 'vulnerable'){ toast('⚑ ' + e.msg, true);
+    if (isNew && !firstPoll && e.kind === 'vulnerable'){ ticker(`⚑ <b>${tkName}</b> ${esc(short(m[0]))}${tkWorth}`);
       api(`/api/result?chain=${s.chain}&addr=${m[0].toLowerCase()}`).then(r => { if (r.findings) findingsCache[m[0].toLowerCase()] = r.findings.findings || []; }); }
   }
   activity = Math.min(1, activity*.7 + newResults*.35 + (s.mode !== 'idle' ? .1 : 0));
@@ -749,6 +788,15 @@ document.querySelectorAll('.ftab').forEach(t => t.onclick = () => { document.que
   t.classList.add('on'); ftab = t.dataset.t; loadTable(); });
 
 /* ---------------- controls ---------------- */
+let tkMsgs = [];
+function ticker(msg){
+  tkMsgs.push(msg); if (tkMsgs.length > 28) tkMsgs.shift();
+  const tr = $('#tkTrack'); if (!tr) return;
+  const html = tkMsgs.map(m => `<span class="tk-item">${m}</span>`).join('');
+  tr.innerHTML = html + html;   // duplicate so the loop is seamless
+  const chars = tkMsgs.reduce((a,m) => a + m.replace(/<[^>]+>/g,'').length + 8, 0);
+  tr.style.animationDuration = Math.max(16, chars*0.2) + 's';
+}
 function toast(msg, err){ const el = document.createElement('div'); el.className = 'toast' + (err ? ' err' : ''); el.textContent = msg;
   $('#toasts').appendChild(el); setTimeout(() => el.remove(), 4500); }
 $('#btnGear').onclick = () => $('#drGear').classList.toggle('open');
