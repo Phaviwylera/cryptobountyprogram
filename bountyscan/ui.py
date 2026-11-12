@@ -79,6 +79,7 @@ INDEX_HTML = r"""<!doctype html>
   .hud{position:absolute;left:16px;right:16px;bottom:16px;z-index:6;display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
   .p{background:var(--panel);border:1px solid var(--line);padding:9px 10px 8px;height:258px;overflow:hidden;position:relative;
     backdrop-filter:blur(2px)}
+  .p.firing{animation:glow 1.1s ease-in-out infinite;border-color:var(--teal)}
   .p .hd{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
   .p .hd b{font-size:11px;letter-spacing:.7px;color:var(--white)}
   .p .hd span{color:var(--teal);font-size:11px}
@@ -210,6 +211,12 @@ INDEX_HTML = r"""<!doctype html>
       <div style="color:var(--dim);margin-top:6px;font-size:10.5px">contracts per minute</div><div class="big" id="hCpm">0.0/m</div><div class="kv" id="hKv"></div></div>
     <div class="p"><div class="hd"><b>CLEAR RATE</b><span>live</span></div><canvas id="hGauge" style="width:100%;height:178px"></canvas>
       <div style="color:var(--pink);font-size:11px" id="hFlags">flags to verify · 0</div><div style="color:var(--dim);font-size:10.5px">verify, don't guess</div></div>
+    <div class="p" id="pPayload"><div class="hd"><b>⚔ PAYLOAD ATTACK</b><span id="hPayState">forge ·</span></div>
+      <div id="hPayRun" style="font-size:11px;color:var(--teal);min-height:15px;margin-bottom:4px"></div>
+      <div class="bars" id="hPayBars"></div>
+      <div class="big" id="hPayTotal" style="margin-top:4px">0</div>
+      <div style="color:var(--dim);font-size:10.5px">fork exploits fired this session · funds→wallet or it's not a finding</div>
+      <div class="kv" id="hPayKv"></div></div>
     <div class="p"><div class="hd"><b>BOUNTYSCAN.PY</b><span id="hLps" style="color:var(--pink)">0 l/s</span></div><div class="code" id="hCode"></div></div>
   </div>
 </section>
@@ -639,7 +646,8 @@ function updateHud(s){
     const d = new Date(e.t*1000); const tt = String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
     return `<div class="${(Date.now()/1000 - e.t) < 2.5 ? 'new' : ''}"><span class="t">${tt}</span><span class="vb" style="color:${col}">${vb}</span><span class="o">${esc(obj)}</span></div>`; }).join('');
   const recent = evs.filter(e => Date.now()/1000 - e.t < 600 && e.kind !== 'info' && e.kind !== 'found').length;
-  $('#hRate').textContent = (recent/10).toFixed(1) + ' c/m';
+  const act = (s.active_scans||[]).length, wk = s.scan_workers||1;
+  $('#hRate').textContent = (recent/10).toFixed(1) + ' c/m' + (wk>1 ? ` · ⚡${act}/${wk}` : '');
   // PIPELINE
   const total = Object.values(c).reduce((a,b)=>a+b,0) || 0;
   $('#hTotal').textContent = total;
@@ -665,6 +673,18 @@ function updateHud(s){
   // GAUGE
   const sc = (c.safe||0) + (c.vulnerable||0); gaugeVal = sc ? 100*(c.safe||0)/sc : 0;
   $('#hFlags').textContent = `flags to verify · ${c.vulnerable||0}`;
+  // PAYLOAD ATTACK
+  const pay = s.payload || {counts:{}, running:0, forge:false};
+  const pc = pay.counts || {};
+  $('#hPayState').textContent = pay.forge ? (pay.running>0 ? '⚔ '+pay.running+' firing' : 'forge ready') : 'forge off';
+  $('#hPayState').style.color = pay.forge ? (pay.running>0 ? 'var(--teal)' : 'var(--dim)') : 'var(--pink)';
+  const pr = $('#pPayload'); if (pay.running>0) pr.classList.add('firing'); else pr.classList.remove('firing');
+  $('#hPayRun').textContent = pay.running>0 ? `forking mainnet · routing loot to the wallet · ${pay.running} exploit(s) live` : (pay.forge ? '' : 'install forge to run payload attacks');
+  $('#hPayTotal').textContent = pc.total||0;
+  const pbars = [['confirmed',pc.confirmed||0,'var(--teal)'],['reverted',pc.reverted||0,'#3fb8e6'],['no-move',pc.no_change||0,'#5a6b7a'],['manual',pc.manual||0,'#f2c14e'],['not run',pc.error||0,'var(--pink)']];
+  const pmax = Math.max(1, ...pbars.map(x=>x[1]));
+  $('#hPayBars').innerHTML = pbars.map(([n,v,col])=>`<div><span>${n}</span><i style="width:${Math.min(100, 8+70*v/pmax)}px;background:${col};transition:width .8s"></i><b>${v}</b></div>`).join('');
+  $('#hPayKv').innerHTML = [['dropped FP',(pc.reverted||0)+(pc.no_change||0),'#3fb8e6'],['real theft',pc.confirmed||0,'var(--teal)'],['manual',pc.manual||0,'#f2c14e']].map(([k,v,col])=>`<div><span>${k}</span><b style="color:${col}">${v}</b></div>`).join('');
   // CODE
   drawCode(s);
 }

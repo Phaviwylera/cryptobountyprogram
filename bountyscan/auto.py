@@ -43,6 +43,7 @@ class AutoConfig:
     quiet: bool = False
     on_stage: object = None        # optional callback(stage_text) - the dashboard's live step display
     on_event: object = None        # optional callback(kind, message) - the dashboard's activity feed
+    on_payload: object = None      # optional callback(event) - payload-attack metrics (start/end/outcome)
 
 
 def _stage(cfg: AutoConfig, text: str) -> None:
@@ -164,11 +165,17 @@ def process(store, row, cfg: AutoConfig) -> str:
     if theft and cfg.forge_verify and cfg.rpc is not None:
         from .forge_verify import forge_available, run_payloads
         if forge_available():
-            _stage(cfg, f"Launching payload attack on {len(theft)} finding(s) on a {chain} fork")
+            n_started = len(theft)
+            _stage(cfg, f"Launching payload attack on {n_started} finding(s) on a {chain} fork")
+            if cfg.on_payload:
+                cfg.on_payload("start", n_started)
             try:
                 payloads = run_payloads(theft, result.files, address, cfg.rpc.url)
+                if cfg.on_payload:
+                    for pv in payloads:
+                        cfg.on_payload(pv.outcome)
                 kept = [pv.finding for pv in payloads if pv.is_finding]
-                dropped = len(theft) - len(kept)
+                dropped = n_started - len(kept)
                 conf = sum(pv.outcome == "confirmed" for pv in payloads)
                 if dropped:
                     _log(cfg, f"    payload attack disproved {dropped} finding(s) (reverted / no funds moved)")
@@ -178,6 +185,9 @@ def process(store, row, cfg: AutoConfig) -> str:
                     _log(cfg, f"    payload attack CONFIRMED {conf} finding(s)")
             except Exception as exc:
                 _log(cfg, f"    payload attack warning ({exc}); keeping static verdicts")
+            finally:
+                if cfg.on_payload:
+                    cfg.on_payload("end", n_started)
 
     if not theft:
         extra = ""

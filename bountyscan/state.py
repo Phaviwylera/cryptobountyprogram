@@ -117,6 +117,21 @@ class Store:
         with self._lock:
             return self.db.execute(q + (f" LIMIT {int(limit)}" if limit else ""), (time.time(),)).fetchall()
 
+    def claim_one(self, lease: float = 1800.0) -> sqlite3.Row | None:
+        """Atomically take the highest-priority due row and LEASE it (push next_try out) so no other
+        scan thread grabs it. If the scan finishes, it overwrites the row's status; if it crashes, the
+        lease expires and the row becomes due again. Enables safe parallel scanning."""
+        with self._lock:
+            row = self.db.execute(
+                "SELECT * FROM contracts WHERE status IN ('queued','unverified') AND next_try <= ? "
+                "ORDER BY priority DESC, next_try, rowid LIMIT 1", (time.time(),)).fetchone()
+            if not row:
+                return None
+            self.db.execute("UPDATE contracts SET next_try = ? WHERE chain = ? AND address = ?",
+                            (time.time() + lease, row["chain"], row["address"]))
+            self.db.commit()
+            return row
+
     def pending_count(self) -> int:
         with self._lock:
             return self.db.execute("SELECT COUNT(*) FROM contracts WHERE status IN ('queued','unverified')").fetchone()[0]

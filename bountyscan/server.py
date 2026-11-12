@@ -32,6 +32,20 @@ from .rpc import RPC, RPCError
 from .state import Store
 from .ui import INDEX_HTML
 
+_FORGE_OK = None
+
+
+def _forge_ok() -> bool:
+    """Cached check of whether the forge binary is available (snapshot is polled often)."""
+    global _FORGE_OK
+    if _FORGE_OK is None:
+        try:
+            from .forge_verify import forge_available
+            _FORGE_OK = forge_available()
+        except Exception:
+            _FORGE_OK = False
+    return _FORGE_OK
+
 
 class Worker:
     """Owns the scan loop in a background thread. Thread-safe via a lock around the store."""
@@ -53,14 +67,23 @@ class Worker:
         self.last_error = None
         self.started_at = None
         self.scanned = 0
+        # Parallel scanning: N worker threads each claim + scan a contract. Source fetches are network-
+        # bound, so a small pool multiplies backfill throughput. Set BOUNTYSCAN_SCAN_WORKERS=1 for serial.
+        self.scan_workers = max(1, min(16, int(os.environ.get("BOUNTYSCAN_SCAN_WORKERS", "4"))))
+        self.currents: dict = {}           # active scans: thread name -> {chain, address}
+        self._count_lock = threading.Lock()
+        self._pool: list = []
         # live progress for the dashboard
         self.stage = "Idle"
         self.stage_at = time.time()
         self._seq = 0
         self.events: collections.deque = collections.deque(maxlen=200)
         self.batches: list[dict] = []     # Immunefi/program scans: {program, items, started}
+        self.payload = collections.Counter()   # dynamic payload-attack outcomes this session
+        self.payload_running = 0               # findings currently under a forge payload test
         cfg.on_stage = self.set_stage
         cfg.on_event = self.add_event
+        cfg.on_payload = self._record_payload
         from .backfill import Backfill
         self.backfill = Backfill(store, rpc, on_event=self.add_event, on_queue=self._backfill_has_work)
 
@@ -77,35 +100,67 @@ class Worker:
         self._seq += 1
         self.events.append({"id": self._seq, "t": time.time(), "kind": kind, "msg": msg})
 
+    def _record_payload(self, event: str, n: int = 1) -> None:
+        # event: "start"/"end" bracket a contract's payload attack; otherwise an outcome name.
+        if event == "start":
+            self.payload_running += n
+        elif event == "end":
+            self.payload_running = max(0, self.payload_running - n)
+        else:
+            self.payload[event] += n
+            self.payload["total"] += n
+
     def add_batch(self, program: str, items: list[tuple[str, str]]) -> None:
         self.batches.append({"program": program, "items": [(c.lower(), a.lower()) for c, a in items], "started": time.time()})
         self.batches = self.batches[-10:]
 
     def _run(self):
+        """Coordinator thread: block discovery (live), periodic value re-check, and idle detection.
+        The actual contract scanning runs in the parallel _scan_loop pool."""
         while not self._stop.is_set():
             try:
                 if self.mode == "live" and self.rpc is not None:
                     self._discover_step()
                 if self.rpc is not None and time.time() - self._last_recheck > 600:
                     self._recheck_vulnerable_value()
-                did = self._scan_step()
-                if not did:
-                    if self.mode == "draining" and not self.store.pending_count() and not self.backfill.running:
-                        self.mode = "idle"
-                        self.set_stage("Idle - queue finished")
-                        self.add_event("info", "All queued contracts processed.")
-                        break
-                    self.set_stage(f"Waiting for new blocks on {self.chain}…" if self.mode == "live"
-                                   else "Waiting for contracts that are not verified yet (retrying on schedule)…")
-                    time.sleep(3.0)
+                idle_now = (self.mode == "draining" and not self.store.pending_count()
+                            and not self.backfill.running and not self.currents and self.payload_running == 0)
+                if idle_now:
+                    self.mode = "idle"
+                    self.set_stage("Idle - queue finished")
+                    self.add_event("info", "All queued contracts processed.")
+                    break
+                if self.mode == "live" and not self.currents:
+                    self.set_stage(f"Waiting for new blocks on {self.chain}…")
+                time.sleep(2.0)
             except ExplorerFatalGuard as exc:
                 self.last_error = str(exc)
                 self.mode = "idle"
                 break
-            except Exception as exc:  # never let the worker die
+            except Exception as exc:  # never let the coordinator die
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 time.sleep(5.0)
-        self.current = None
+
+    def _scan_loop(self):
+        """One parallel scan worker: claim the next due contract and scan it, until stopped."""
+        while not self._stop.is_set():
+            if self.mode not in ("live", "draining"):
+                time.sleep(1.0)
+                continue
+            try:
+                row = self.store.claim_one()
+            except Exception as exc:
+                self.last_error = f"claim: {type(exc).__name__}: {exc}"
+                time.sleep(3.0)
+                continue
+            if not row:
+                time.sleep(2.0)
+                continue
+            try:
+                self._scan_once(row)
+            except Exception as exc:  # never let a scan thread die
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                time.sleep(2.0)
 
     def _discover_step(self):
         try:
@@ -140,24 +195,24 @@ class Worker:
                 self.add_event("funded", f"FUNDED - vulnerable {row['address']}"
                                + (f" ({row['name']})" if row["name"] else "") + f" now holds ${new:,.0f}. Prioritise this one.")
 
-    def _scan_step(self) -> bool:
-        with self.lock:
-            rows = self.store.due(1)
-            if not rows:
-                return False
-            row = rows[0]
-            self.current = {"chain": row["chain"], "address": row["address"]}
-            from .auto import process
-            self.cfg.min_balance_wei = self.min_balance_wei
-            self.cfg.min_value_usd = self.min_value_usd
-            try:
-                status = process(self.store, row, self.cfg)
-            except Exception as exc:
-                self.store.update(row["chain"], row["address"], status="error", error=str(exc)[:300])
-                status = "error"
+    def _scan_once(self, row) -> None:
+        tn = threading.current_thread().name
+        self.currents[tn] = {"chain": row["chain"], "address": row["address"]}
+        self.current = self.currents[tn]
+        from .auto import process
+        self.cfg.min_balance_wei = self.min_balance_wei
+        self.cfg.min_value_usd = self.min_value_usd
+        try:
+            status = process(self.store, row, self.cfg)
+        except Exception as exc:
+            self.store.update(row["chain"], row["address"], status="error", error=str(exc)[:300])
+            status = "error"
+        with self._count_lock:
             self.scanned += 1
+        with self.lock:   # serialize the shared summary-file write across scan threads
             from .contract_report import write_summary
             write_summary(self.store, self.cfg.out_dir)
+        self.currents.pop(tn, None)
         self.current = {"chain": row["chain"], "address": row["address"], "status": status}
         done = self.store.fetch_one(row["chain"], row["address"])
         name = (done["name"] if done and done["name"] else "")
@@ -175,13 +230,18 @@ class Worker:
             "error": f"Error - {label}: {done['error'] if done else ''}",
         }.get(status, f"{status} - {label}")
         self.add_event(status, text)
-        return True
 
     def ensure_thread(self):
         self._stop.clear()   # a Start right after Stop must cancel the pending stop
         if self._thread is None or not self._thread.is_alive():
             self._thread = threading.Thread(target=self._run, daemon=True, name="bountyscan-worker")
             self._thread.start()
+        # (re)start the parallel scan pool
+        self._pool = [t for t in self._pool if t.is_alive()]
+        while len(self._pool) < self.scan_workers:
+            t = threading.Thread(target=self._scan_loop, daemon=True, name=f"bscan-{len(self._pool)+1}")
+            t.start()
+            self._pool.append(t)
 
     def start_live(self, chain, from_block, min_balance_wei, min_value_usd: float = 0.0):
         if self.rpc is None:
@@ -246,6 +306,10 @@ class Worker:
             "value": self.store.value_stats(),
             "backfill": self.backfill.snapshot(),
             "min_value_usd": self.min_value_usd,
+            "payload": {"counts": dict(self.payload), "running": self.payload_running,
+                        "forge": bool(_forge_ok())},
+            "scan_workers": self.scan_workers,
+            "active_scans": list(self.currents.values()),
         }
 
 
