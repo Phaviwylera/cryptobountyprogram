@@ -286,6 +286,20 @@ class Tier3Replay(unittest.TestCase):
         self.assertEqual(txh, "0xyes")
         self.assertIn(marker, cd)
 
+    def test_fetch_matches_by_selector(self):
+        from bountyscan import forge_verify as fv
+        canned = {"status": "1", "result": [
+            {"hash": "0xa", "input": "0xdeadbeef" + "00" * 40, "isError": "0"},
+            {"hash": "0xb", "input": "0x10bfce71" + "ab" * 200, "isError": "0"},   # executeTransactions
+        ]}
+        orig = fv._http_json; fv._http_json = lambda *a, **k: canned
+        try:
+            txh, cd = fv.fetch_historical_calldata("0x" + "ab" * 20, key="k", selectors=["0x10bfce71"])
+        finally:
+            fv._http_json = orig
+        self.assertEqual(txh, "0xb")                          # matched the selector, not the prefix-off bug
+        self.assertTrue(cd.startswith("0x10bfce71"))
+
 
 if __name__ == "__main__":
     unittest.main()

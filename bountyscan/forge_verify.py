@@ -587,7 +587,7 @@ def fetch_historical_calldata(target: str, rpc_url: str | None = None, key: str 
             if len(inp) < 10:
                 continue
             if sels:                                         # selector match (robust for multi-sig relays)
-                if inp[2:10] in sels:
+                if inp[:10] in sels:                          # inp[:10] == "0x" + 4-byte selector
                     return tx.get("hash"), inp
             elif _SIG65_MARKER in inp:                        # fallback: a lone 65-byte signature blob
                 return tx.get("hash"), inp
