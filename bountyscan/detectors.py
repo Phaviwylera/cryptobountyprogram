@@ -765,10 +765,20 @@ def _tx_origin(project: Project):
         # by tx.origin - that is the standard pattern, not phishable owner auth.
         if re.search(r"UserOperation|[Pp]aymaster|[Bb]undler|handleOps", fn.contract.text):
             continue
+        # A view/pure function moves no funds and changes no state, so a tx.origin comparison in it is a
+        # read-access predicate or EOA helper (Chainlink SimpleReadAccessController.hasAccess returning
+        # `_user == tx.origin`, anti-bot `_isOrigin`), never a phishable fund-moving authorization. Any
+        # real risk lives in the state-changing CONSUMER, which is analysed on its own.
+        if not fn.is_mutating:
+            continue
         for m in re.finditer(r"tx\.origin\s*[!=]=|[!=]=\s*tx\.origin", body):
             s, e = statement_bounds(body, m.start())
             if re.search(rf"tx\.origin\s*[!=]=\s*{SENDER}|{SENDER}\s*[!=]=\s*tx\.origin", body[s:e]):
                 continue  # EOA-only check, not authorization
+            # `tx.origin == Constants.ESTIMATION_ADDRESS` (Optimism gas-estimation sentinel) / comparison
+            # to a SCREAMING_CASE constant is a special-mode branch, not owner authorization.
+            if re.search(r"tx\.origin\s*==\s*[\w.]*(?:ESTIMATION|SENTINEL|Constants\.\w+|[A-Z]{2,}_[A-Z]{2,})", body[s:e]):
+                continue
             # Chainlink AccessControlledOffchainAggregator pattern:
             # `require(msg.sender == owner || tx.origin == owner)` — a legitimate owner-fallback.
             # If the same statement also compares msg.sender to the same identifier (or to owner()),

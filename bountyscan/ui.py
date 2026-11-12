@@ -217,7 +217,8 @@ INDEX_HTML = r"""<!doctype html>
 <section class="findings" id="findings">
   <div class="fh"><h2>FINDINGS</h2>
     <span class="ftab on" data-t="results">vulnerable</span><span class="ftab" data-t="safe">safe</span><span class="ftab" data-t="errors">errors</span>
-    <button class="cmd" id="btnDownload" style="margin-left:auto;--c:var(--teal)" title="Download every confirmed threat's full report as one text document">⬇ DOWNLOAD ALL REPORTS</button>
+    <label id="hideEmptyWrap" style="margin-left:auto;color:var(--dim);font-size:11px;display:flex;align-items:center;gap:5px;cursor:pointer" title="Hide contracts that currently hold no priced value (nothing to steal right now)"><input type="checkbox" id="hideEmpty" checked style="accent-color:var(--teal)">hide holds-nothing</label>
+    <button class="cmd" id="btnDownload" style="--c:var(--teal)" title="Download every confirmed threat's full report as one text document">⬇ DOWNLOAD ALL REPORTS</button>
     <button class="cmd" id="btnRecheck" style="--c:var(--pink)" title="Re-verify every already-judged contract against the current rules">↻ RE-CHECK ALL</button>
     <span style="margin-left:14px;color:var(--dim)" id="fNote">only findings confirmed by the independent second pass appear here</span></div>
   <div id="fTable"><div class="empty">loading…</div></div>
@@ -698,7 +699,16 @@ async function loadTable(){
   if (!rows.length){ w.innerHTML = `<div class="empty">${ftab==='results' ? 'no confirmed vulnerabilities yet · the crawler keeps going' : 'nothing here yet'}</div>`; return; }
   rows.sort((a,b) => (b.value_usd||0) - (a.value_usd||0));
   const valCell = r => `<td style="color:${(r.value_usd||0) >= 1000 ? 'var(--yellow)' : 'var(--dim)'}">${usd(r.value_usd)}</td><td style="color:var(--dim)">${esc(holdTxt(r.holdings)) || (r.value_usd === 0 ? 'holds nothing' : '-')}</td>`;
+  // On the vulnerable tab, hide contracts that currently hold no priced value (nothing to steal right
+  // now) unless the viewer unticks the toggle. Non-destructive - the rows stay in the DB and the download.
+  let hiddenEmpty = 0;
+  if (ftab === 'results' && $('#hideEmpty') && $('#hideEmpty').checked){
+    hiddenEmpty = rows.filter(r => (r.value_usd||0) <= 0).length;
+    rows = rows.filter(r => (r.value_usd||0) > 0);
+  }
   if (ftab === 'results'){
+    if (!rows.length){ w.innerHTML = `<div class="empty">${hiddenEmpty ? hiddenEmpty+' flagged contract(s) hidden · they hold no priced value · untick “hide holds-nothing” to see them' : 'no confirmed vulnerabilities with value yet · the crawler keeps going'}</div>`;
+      $('#fNote').textContent = hiddenEmpty ? hiddenEmpty+' empty hidden' : ''; return; }
     w.innerHTML = `<table><thead><tr><th>severity</th><th>findings</th><th>value held</th><th>holdings</th><th>chain</th><th>address</th><th>contract</th></tr></thead><tbody>` +
       rows.map(r => `<tr class="click" data-c="${esc(r.chain)}" data-a="${esc(r.address)}"><td><span class="sev ${esc(r.max_severity)}">${esc(r.max_severity)}</span></td>
         <td>${r.findings||0}</td>${valCell(r)}<td>${esc(r.chain)}</td><td>${esc(r.address)}</td><td>${esc(r.name||'')}</td></tr>`).join('') + '</tbody></table>';
@@ -708,7 +718,7 @@ async function loadTable(){
       rows.map(r => `<tr>${valCell(r)}<td>${esc(r.chain)}</td><td>${esc(r.address)}</td><td>${esc(r.name||'')}</td><td style="color:var(--dim)">${esc(r.error||'clear')}</td></tr>`).join('') + '</tbody></table>';
   }
   $('#fNote').textContent = ftab === 'results'
-    ? 'confirmed by the independent second pass · sorted by value held · re-checked every 10 min'
+    ? 'confirmed · sorted by value held · re-checked every 10 min' + (hiddenEmpty ? ` · ${hiddenEmpty} empty hidden` : '')
     : 'value = native coin + major tokens, priced by Chainlink';
 }
 async function openReport(chain, addr){
@@ -743,6 +753,7 @@ $('#btnBack').onclick = async () => {
   poll();
 };
 $('#btnStop').onclick = async () => { await api('/api/live/stop','POST',{}); toast('stopping · current contract finishes first'); poll(); };
+$('#hideEmpty').onchange = () => { loadTable(); };
 $('#btnDownload').onclick = () => { toast('building full threat report…'); window.location = '/api/report/all.txt'; };
 $('#btnRecheck').onclick = async () => {
   const b = $('#btnRecheck'); b.disabled = true;
