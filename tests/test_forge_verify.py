@@ -175,11 +175,14 @@ class OverflowPoC(unittest.TestCase):
         self.assertIn("TARGET.balance", reader)
 
     def test_literal_injects_exact_amount_soundly(self):
+        from bountyscan.forge_verify import ATTACKER_WALLET
         fn = _fn("sell", [("uint256", "amount")], body="msg.sender.transfer(amount * sellPrice);")
         lit = build_overflow_literal(fn, "0x" + "ab" * 20, (1 << 240) + 192, 1000)
         self.assertIn("uint256 amount = 1766847064778384329583297500742918515827483896875618958121606201292619968;", lit)
         self.assertIn("checked_write", lit)                 # stdstore-verified slot, not a hardcoded 0
         self.assertNotIn("maxUint", lit)                    # not the broken k*(maxUint+1)==0 loop
+        self.assertNotIn('makeAddr("attacker")', lit)       # canonical wallet, not a synthesized EOA
+        self.assertIn("address(uint160(0x00" + ATTACKER_WALLET.lower().replace("0x", "") + "))", lit)
         self.assertIn('"sell(uint256)"', lit)
 
     def test_parse_reader(self):
