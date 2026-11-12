@@ -51,7 +51,9 @@ def _payload_exec_lines(pv, f) -> list[str]:
     if pv is None:
         return ["_No generic payload for this detector class — confirm with a hand-written fork PoC._", ""]
     moved = "funds moved to the attacker wallet" if pv.outcome == "confirmed" else \
-            ("call reverted — the guard held" if pv.outcome == "reverted" else
+            ("logic flaw proven on fork — the drain is real; reachability is economically conditional (see caveat)"
+             if pv.outcome == "conditional" else
+             "call reverted — the guard held" if pv.outcome == "reverted" else
              "call succeeded but moved nothing (fallback / no drain)" if pv.outcome == "no_change" else
              "left for manual verification")
     return [
@@ -102,6 +104,7 @@ def write_contract_report(chain: str, address: str, meta: dict, findings: list[F
     # forensic overall status from the dynamic payload attack
     outs = {pv.outcome for pv in (payloads or [])}
     fstatus = ("CONFIRMED EXPLOIT" if "confirmed" in outs else
+               "LOGIC-CONFIRMED (ECONOMICALLY CONDITIONAL)" if "conditional" in outs else
                "LATENT / MANUAL REVIEW" if ("manual" in outs or not payloads) else
                "STATIC CANDIDATE")
 

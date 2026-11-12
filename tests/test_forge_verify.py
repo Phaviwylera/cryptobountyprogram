@@ -1,15 +1,17 @@
 import types
 import unittest
 
-from bountyscan.forge_verify import (AUTO_VERIFIABLE, M256, build_exploit, canonical_sig,
-                                     classify_overflow, overflow_amount, overflow_verdict, parse_outcome)
+from bountyscan.forge_verify import (AUTO_VERIFIABLE, M256, PayloadVerdict, build_exploit,
+                                     build_overflow_exploit, canonical_sig, classify_overflow,
+                                     overflow_amount, overflow_verdict, parse_outcome,
+                                     parse_overflow_outcome)
 from bountyscan.solidity import Function, Param
 
 
-def _fn(name, params):
+def _fn(name, params, body="{}"):
     return Function(kind="function", name=name, contract=None,
                     params=[Param(type=t, name=n) for t, n in params],
-                    visibility="external", mutability=None, modifiers=[], body="{}", body_offset=0, offset=0)
+                    visibility="external", mutability=None, modifiers=[], body=body, body_offset=0, offset=0)
 
 
 def _finding(detector, function="f", contract="C"):
@@ -161,6 +163,57 @@ class OverflowTiering(unittest.TestCase):
         self.assertEqual(v.outcome, "manual")
         self.assertIn("Tier 4", v.injected)
         self.assertIn("REFUSED", v.injected)
+
+
+class OverflowPoC(unittest.TestCase):
+    def test_generated_poc_is_sound(self):
+        fn = _fn("sell", [("uint256", "amount")], body="balances[msg.sender] -= amount; msg.sender.transfer(amount * sellPrice);")
+        poc = build_overflow_exploit(_finding("pre-0.8-overflow", function="sell"), fn, "0x" + "ab" * 20)
+        self.assertIsNotNone(poc)
+        # the exact-wrap calc via modular inverse - NOT the broken `contractEth + k*(maxUint+1)` (==0) loop
+        self.assertIn("contractEth * _inv(price)", poc)
+        self.assertNotIn("maxUint", poc)
+        # stdstore-VERIFIED injection (reverts on a wrong slot) instead of a hardcoded slot 0
+        self.assertIn("checked_write", poc)
+        self.assertNotIn("uint256(0))", poc.split("checked_write")[0][-200:])  # no slot-0 guess
+        # reads the live multiplier + totalSupply for the economic check
+        self.assertIn('abi.encodeWithSignature("sellPrice()")', poc)
+        self.assertIn("totalSupply()", poc)
+        self.assertIn('"sell(uint256)"', poc)
+
+    def test_tier4_overflow_has_no_auto_poc(self):
+        # balance-gated amount -> needs tokens the attacker can't hold -> no fabricated auto-run
+        fn = _fn("sell", [("uint256", "amount")], body="require(balanceOf[msg.sender] >= amount); msg.sender.transfer(amount * sellPrice);")
+        self.assertIsNone(build_overflow_exploit(_finding("pre-0.8-overflow"), fn, "0x0"))
+
+    def test_parse_conditional_when_drained(self):
+        f = _finding("pre-0.8-overflow")
+        fb = PayloadVerdict(f, "manual", "fallback")
+        out = ("OVF_PRICE 777\nOVF_SUPPLY 1000\nOVF_AMOUNT 99999999999999999999999\n"
+               "OVF_AMOUNT_GT_SUPPLY true\nOVF_CALL_OK true\nOVF_ATT_ETH_GAIN 5000\nOVF_TGT_ETH_DELTA -5000")
+        v = parse_overflow_outcome(f, out, fb)
+        self.assertEqual(v.outcome, "conditional")
+        self.assertIn("THEORETICAL", v.detail)          # amount > supply -> not freely acquirable
+        self.assertIn("ECONOMICALLY CONDITIONAL", v.status_word)
+
+    def test_parse_conditional_critical_when_within_supply(self):
+        f = _finding("pre-0.8-overflow")
+        out = ("OVF_SUPPLY 10**30\nOVF_AMOUNT 5\nOVF_AMOUNT_GT_SUPPLY false\n"
+               "OVF_CALL_OK true\nOVF_ATT_ETH_GAIN 5000\nOVF_TGT_ETH_DELTA -5000\nOVF_PRICE 3")
+        v = parse_overflow_outcome(f, out, PayloadVerdict(f, "manual", "fb"))
+        self.assertEqual(v.outcome, "conditional")
+        self.assertIn("CRITICAL", v.detail)
+
+    def test_parse_reverted_is_dropped(self):
+        f = _finding("pre-0.8-overflow")
+        v = parse_overflow_outcome(f, "OVF_CALL_OK false\nOVF_AMOUNT 1", PayloadVerdict(f, "manual", "fb"))
+        self.assertEqual(v.outcome, "reverted")
+        self.assertFalse(v.is_finding)
+
+    def test_parse_no_logs_uses_fallback(self):
+        f = _finding("pre-0.8-overflow")
+        fb = PayloadVerdict(f, "manual", "static classification")
+        self.assertIs(parse_overflow_outcome(f, "Compiler run failed", fb), fb)
 
 
 if __name__ == "__main__":
