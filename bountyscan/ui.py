@@ -331,6 +331,7 @@ function resize(){
   [[.18,.42,170],[.78,.28,150],[.62,.66,190],[.30,.78,140]].forEach(([nx,ny,R],i)=>{
     const cl = makeCloud(900+i, R*(Math.min(W,1400)/1400+.35), '170,180,200', .45);
     b.drawImage(cl.img, nx*W - cl.size/2, ny*Math.min(H,hudTop+60) - cl.size/2, cl.size, cl.size); });
+  makeStars();
   for (const c of clusters.values()) place(c, true);
 }
 
@@ -351,14 +352,37 @@ function place(c, keep){
 
 /* project every cluster from its 3D world position to the screen, through a slowly rotating camera
    with a gentle pitch bob - the clusters orbit and parallax, so it reads as a 3D universe. */
-let camRot = 0, _projT = 0;
-function project3d(now){
+let camRot = 0, camPitch = 0, _projT = 0, stars3d = [];
+function updateCamera(now){
   const dt = Math.min(0.05, (now - _projT)/1000) || 0.016; _projT = now;
-  camRot += dt*0.14;
-  const pitch = Math.sin(now*0.00006)*0.20;
+  camRot += dt*0.22;                         // continuous rotation of the whole universe
+  camPitch = Math.sin(now*0.00006)*0.22;
+}
+/* a dense 3D starfield the camera flies through - rotates + crawls so the universe reads as 3D */
+function makeStars(){
+  const r = rngFrom(42), N = Math.max(260, Math.min(820, Math.floor(W*H/1500)));
+  stars3d = Array.from({length:N}, () => ({x:r()*2-1, y:r()*2-1, z:r()*2-1, b:.25+r()*.75}));
+}
+function drawStars(now){
+  const cx = W/2, cyc = (118 + (hudTop||H))*0.5, spread = Math.max(W,H)*0.95, focal = 500;
+  const cY = Math.cos(camRot), sY = Math.sin(camRot), cX = Math.cos(camPitch), sX = Math.sin(camPitch);
+  const crawl = (now*0.00005) % 1;           // forward crawl, wraps -> endless flight
+  for (const st of stars3d){
+    const x = st.x*spread, y = st.y*spread*0.8;
+    let z = (((st.z + crawl*2 + 1) % 2) - 1) * spread;
+    const x1 = x*cY - z*sY, z1 = x*sY + z*cY;
+    const y1 = y*cX - z1*sX, z2 = y*sX + z1*cX;
+    const dist = z2 + spread*1.1; if (dist <= 30) continue;
+    const sc = focal / dist, sx = cx + x1*sc, sy = cyc + y1*sc;
+    if (sx < -4 || sx > W+4 || sy < -4 || sy > H+4) continue;
+    const a = Math.min(1, st.b*sc*2.2), sz = Math.max(.7, sc*2.2);
+    g.fillStyle = `rgba(206,218,240,${a})`; g.fillRect(sx-sz/2, sy-sz/2, sz, sz);
+  }
+}
+function project3d(now){
   const cx = W/2, cyc = (118 + (hudTop||H))*0.5;
   const spread = Math.min(W, 1040)*0.42, focal = 560, back = spread*1.55;
-  const cY = Math.cos(camRot), sY = Math.sin(camRot), cX = Math.cos(pitch), sX = Math.sin(pitch);
+  const cY = Math.cos(camRot), sY = Math.sin(camRot), cX = Math.cos(camPitch), sX = Math.sin(camPitch);
   for (const c of clusters.values()){
     if (c.wx === undefined) place(c, false);
     const x = c.wx*c.wr*spread, y = c.wy*c.wr*spread, z = c.wz*c.wr*spread;
@@ -384,7 +408,7 @@ function upsert(addr, patch){
   if (!c){ c = {addr, name:'', status:'queued', born:performance.now(), seen:Date.now()}; clusters.set(addr, c); place(c);
     sparks.push({x:c.x, y:c.y, t:performance.now(), n:6});
     // keep the galaxy readable: at most 11 clouds, drop the oldest that isn't active
-    if (clusters.size > 11){ const old = [...clusters.values()].filter(x=>x.addr!==active).sort((a,b)=>a.seen-b.seen)[0];
+    if (clusters.size > 26){ const old = [...clusters.values()].filter(x=>x.addr!==active).sort((a,b)=>a.seen-b.seen)[0];
       if (old) clusters.delete(old.addr); } }
   Object.assign(c, patch, {seen:Date.now()});
   return c;
@@ -445,8 +469,8 @@ function render(now){
   g.clearRect(0,0,W,H);
   if (bgLayer) g.drawImage(bgLayer, 0, 0, W, H);
 
-  // 3D universe: project every cluster, then draw far-to-near so depth reads correctly
-  if (W) project3d(now);
+  // 3D universe: advance the camera, fly through the starfield, then project the clusters
+  if (W){ updateCamera(now); if (stars3d.length) drawStars(now); project3d(now); }
   const ordered = [...clusters.values()].sort((a,b) => (b.depth||0) - (a.depth||0));
   // clouds
   for (const c of ordered){
