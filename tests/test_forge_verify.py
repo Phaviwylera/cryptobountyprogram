@@ -2,9 +2,9 @@ import types
 import unittest
 
 from bountyscan.forge_verify import (AUTO_VERIFIABLE, M256, PayloadVerdict, build_exploit,
-                                     build_overflow_exploit, canonical_sig, classify_overflow,
-                                     overflow_amount, overflow_verdict, parse_outcome,
-                                     parse_overflow_outcome)
+                                     build_overflow_literal, build_overflow_reader, canonical_sig,
+                                     classify_overflow, overflow_amount, overflow_verdict, parse_outcome,
+                                     parse_overflow_outcome, parse_overflow_reader)
 from bountyscan.solidity import Function, Param
 
 
@@ -166,25 +166,41 @@ class OverflowTiering(unittest.TestCase):
 
 
 class OverflowPoC(unittest.TestCase):
-    def test_generated_poc_is_sound(self):
+    def test_reader_reads_live_multiplier(self):
         fn = _fn("sell", [("uint256", "amount")], body="balances[msg.sender] -= amount; msg.sender.transfer(amount * sellPrice);")
-        poc = build_overflow_exploit(_finding("pre-0.8-overflow", function="sell"), fn, "0x" + "ab" * 20)
-        self.assertIsNotNone(poc)
-        # the exact-wrap calc via modular inverse - NOT the broken `contractEth + k*(maxUint+1)` (==0) loop
-        self.assertIn("contractEth * _inv(price)", poc)
-        self.assertNotIn("maxUint", poc)
-        # stdstore-VERIFIED injection (reverts on a wrong slot) instead of a hardcoded slot 0
-        self.assertIn("checked_write", poc)
-        self.assertNotIn("uint256(0))", poc.split("checked_write")[0][-200:])  # no slot-0 guess
-        # reads the live multiplier + totalSupply for the economic check
-        self.assertIn('abi.encodeWithSignature("sellPrice()")', poc)
-        self.assertIn("totalSupply()", poc)
-        self.assertIn('"sell(uint256)"', poc)
+        reader = build_overflow_reader(fn, "0x" + "ab" * 20)
+        self.assertIsNotNone(reader)
+        self.assertIn('abi.encodeWithSignature("sellPrice()")', reader)
+        self.assertIn("totalSupply()", reader)
+        self.assertIn("TARGET.balance", reader)
+
+    def test_literal_injects_exact_amount_soundly(self):
+        fn = _fn("sell", [("uint256", "amount")], body="msg.sender.transfer(amount * sellPrice);")
+        lit = build_overflow_literal(fn, "0x" + "ab" * 20, (1 << 240) + 192, 1000)
+        self.assertIn("uint256 amount = 1766847064778384329583297500742918515827483896875618958121606201292619968;", lit)
+        self.assertIn("checked_write", lit)                 # stdstore-verified slot, not a hardcoded 0
+        self.assertNotIn("maxUint", lit)                    # not the broken k*(maxUint+1)==0 loop
+        self.assertIn('"sell(uint256)"', lit)
+
+    def test_parse_reader(self):
+        out = "OVF_PRICE 10000000000000000\nOVF_SUPPLY 1000\nOVF_TGT_ETH 1920000000000000000"
+        self.assertEqual(parse_overflow_reader(out), (10000000000000000, 1000, 1920000000000000000))
+        self.assertIsNone(parse_overflow_reader("nothing here"))
 
     def test_tier4_overflow_has_no_auto_poc(self):
         # balance-gated amount -> needs tokens the attacker can't hold -> no fabricated auto-run
         fn = _fn("sell", [("uint256", "amount")], body="require(balanceOf[msg.sender] >= amount); msg.sender.transfer(amount * sellPrice);")
-        self.assertIsNone(build_overflow_exploit(_finding("pre-0.8-overflow"), fn, "0x0"))
+        self.assertIsNone(build_overflow_reader(fn, "0x0"))
+
+    def test_akivacoin_live_values_give_conditional_theoretical(self):
+        # the exact values the live fork returned for 0xcffa...E91
+        amt = overflow_amount(1920000000000000000, 10000000000000000)
+        self.assertEqual(amt, (1 << 240) + 192)             # the OVERFLOWING solution, not the trivial 192
+        out = (f"OVF_AMOUNT {amt}\nOVF_SUPPLY 1000\nOVF_CALL_OK true\n"
+               "OVF_ATT_ETH_GAIN 1920000000000000000\nOVF_TGT_ETH_DELTA -1920000000000000000")
+        v = parse_overflow_outcome(_finding("pre-0.8-overflow"), out, PayloadVerdict(_finding("pre-0.8-overflow"), "manual", "fb"))
+        self.assertEqual(v.outcome, "conditional")
+        self.assertIn("THEORETICAL", v.detail)              # 2^240 tokens >> 1000 supply
 
     def test_parse_conditional_when_drained(self):
         f = _finding("pre-0.8-overflow")
