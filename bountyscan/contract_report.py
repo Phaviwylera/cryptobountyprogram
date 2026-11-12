@@ -70,8 +70,10 @@ def _differential_lines(pv) -> list[str]:
         return ["_Not measured (no dynamic run)._", ""]
     m = pv.metrics
     ok = pv.outcome == "confirmed"
+    call = m.get("call_ok")
+    call_word = "not run (static / latent)" if call is None else ("success" if call else "revert")
     return [
-        f"- **Call returned:** {'success' if m.get('call_ok') else 'revert'}",
+        f"- **Call returned:** {call_word}",
         f"- **Attacker delta:** wei `{_fmt_amt(m.get('att_wei', 0))}` · token `{_fmt_amt(m.get('att_tok', 0))}`",
         f"- **Target delta:** wei `{_fmt_amt(m.get('tgt_wei', 0))}` · token `{_fmt_amt(m.get('tgt_tok', 0))}`",
         f"- **Code length delta:** `{m.get('code', 0)}` (selfdestruct check)",

@@ -1,7 +1,8 @@
 import types
 import unittest
 
-from bountyscan.forge_verify import (AUTO_VERIFIABLE, build_exploit, canonical_sig, parse_outcome)
+from bountyscan.forge_verify import (AUTO_VERIFIABLE, M256, build_exploit, canonical_sig,
+                                     classify_overflow, overflow_amount, overflow_verdict, parse_outcome)
 from bountyscan.solidity import Function, Param
 
 
@@ -101,6 +102,65 @@ class ParseOutcome(unittest.TestCase):
     def test_report_line_present(self):
         v = parse_outcome(_finding("unrestricted-mint"), "CALL_OK true\nTOKEN_DELTA 5\nATTACKER_WEI_DELTA 0")
         self.assertIn("Payload attack: CONFIRMED", v.report_line())
+
+
+class OverflowMath(unittest.TestCase):
+    """Phase 3 Tier-1: the exact EVM wrap-around input, computed - never fabricated state."""
+
+    def test_wraps_to_target(self):
+        # odd multiplier -> unique solution; the product genuinely wraps 2**256.
+        sell_price = 1_000_000_000_000_001           # odd
+        contract_wei = 42 * 10**18                    # drain the whole balance
+        amt = overflow_amount(contract_wei, sell_price)
+        self.assertIsNotNone(amt)
+        self.assertEqual((amt * sell_price) % M256, contract_wei)   # lands EXACTLY on the balance
+        self.assertGreater(amt, 1 << 200)                            # a huge input -> it really overflows
+
+    def test_akivacoin_regression(self):
+        # AkivaCoin 0xcffaFCED915D6cC3e9b05ef38B52f0bCcd897E91 - sell(amount) unchecked `amount*sellPrice`.
+        # For any odd sellPrice and any balance, the calculator yields the input that wraps to the balance.
+        for sell_price in (3, 777, 10**18 + 1):
+            for bal in (1, 5 * 10**18, (1 << 255) + 123):
+                amt = overflow_amount(bal, sell_price)
+                self.assertEqual((amt * sell_price) % M256, bal)
+
+    def test_batch_overflow_to_zero(self):
+        # classic batchOverflow: len(2) * value wraps to 0, so require(balance >= 0) passes with no funds.
+        amt = overflow_amount(0, 2)
+        self.assertEqual((2 * amt) % M256, 0)
+        self.assertGreater(amt, 0)
+
+    def test_unsatisfiable_returns_none(self):
+        # even multiplier can't hit an odd target (gcd doesn't divide) -> we refuse to invent a solution.
+        self.assertIsNone(overflow_amount(3, 2))
+
+
+class OverflowTiering(unittest.TestCase):
+    def test_tier1_batch_overflow_guard_has_product(self):
+        fn = types.SimpleNamespace(body="uint t = cnt * value; require(balances[msg.sender] >= cnt * value); balances[to] += value;")
+        tier, _ = classify_overflow(fn, set())
+        self.assertEqual(tier, 1)
+
+    def test_tier4_balance_gated_amount_is_forbidden(self):
+        fn = types.SimpleNamespace(body="require(balanceOf[msg.sender] >= amount); uint pay = amount * sellPrice; msg.sender.transfer(pay);")
+        tier, _ = classify_overflow(fn, set())
+        self.assertEqual(tier, 4)
+
+    def test_overflow_verdict_tier1_is_latent_not_fabricated(self):
+        f = _finding("pre-0.8-overflow", function="batchTransfer")
+        fn = types.SimpleNamespace(body="require(balances[msg.sender] >= cnt * value); balances[to] += value;")
+        v = overflow_verdict(f, fn, None)
+        self.assertEqual(v.outcome, "manual")          # LATENT - never auto-confirmed by injection
+        self.assertIn("Tier 1", v.injected)
+        self.assertNotIn("CONFIRMED EXPLOIT", v.status_word)
+
+    def test_overflow_verdict_tier4_refused(self):
+        f = _finding("pre-0.8-overflow", function="sell")
+        fn = types.SimpleNamespace(body="require(balanceOf[msg.sender] >= amount); msg.sender.transfer(amount * sellPrice);")
+        v = overflow_verdict(f, fn, None)
+        self.assertEqual(v.outcome, "manual")
+        self.assertIn("Tier 4", v.injected)
+        self.assertIn("REFUSED", v.injected)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ actually die / pay the attacker?), free mint, caller-chosen withdrawal, burn-fro
 """
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import os
@@ -62,6 +63,75 @@ AUTO_VERIFIABLE = {
     "arbitrary-recipient-withdrawal",
     "unrestricted-burn-from",
 }
+
+# ---------------------------------------------------------------------------------------------
+# Phase 3 - sound state injection, classified into tiers.
+#
+# Blind `vm.store` injection re-introduces false positives: a synthetic balance/role does not mean
+# the attacker can acquire it on mainnet, so draining with it "confirms" an exploit no one can run.
+# The ONLY injections that stay sound are those using state an attacker could really produce. Every
+# injection is classified; Tier 4 (fabricated balance/role) is REFUSED, never auto-confirmed.
+INJECTION_TIERS = {
+    1: "realistic-input",     # attacker-crafted calldata (overflow / precision loss) - NOTHING injected
+    2: "flash-loan",          # vm.deal ETH to borrow -> attack -> repay; profit measured AFTER repay
+    3: "historical-replay",   # a real (v,r,s) / calldata pulled from the chain, replayed
+    4: "fabricated-state",    # FORBIDDEN: a balance or role the attacker cannot acquire on mainnet
+}
+TIER4_CAVEAT = ("exploitable only if combined with an external token-acquisition / role-grant vector; "
+                "held LATENT-MANUAL to avoid fabricating the prerequisite state")
+
+M256 = 1 << 256
+
+
+def overflow_amount(target_product: int, multiplier: int, bits: int = 256) -> int | None:
+    """Smallest positive `amount` with (amount * multiplier) mod 2**bits == target_product - i.e. the
+    caller-chosen input that makes an unchecked multiplication WRAP around to exactly `target_product`.
+
+    This is Tier-1: a real transaction argument, not fabricated state. The EVM would genuinely compute
+    this product; nothing is injected. Returns None when no such amount exists (gcd(multiplier, 2**bits)
+    does not divide target_product).
+
+    AkivaCoin regression (`sell(amount)`, odd sellPrice): the product wraps to the contract's wei
+    balance, so one call drains it. Pure modular arithmetic - the exact exploit the EVM runs.
+    """
+    M = 1 << bits
+    s = multiplier % M
+    t = target_product % M
+    if s == 0:
+        return None
+    g = math.gcd(s, M)
+    if t % g != 0:
+        return None                      # linear congruence unsatisfiable -> overflow can't hit the target
+    s2, m2, t2 = s // g, M // g, (t // g) % (M // g)
+    amount = (pow(s2, -1, m2) * t2) % m2
+    return amount or m2                   # want a NONZERO, actually-overflowing input
+
+
+def classify_overflow(fn, state_vars) -> tuple[int, str]:
+    """Classify a pre-0.8 overflow finding into an injection tier WITHOUT fabricating state.
+
+    Tier 1 (sound, no injection): the overflow happens INSIDE a balance guard - e.g. batchOverflow,
+    `require(balances[msg.sender] >= cnt * value)` where `cnt * value` wraps to ~0, so the check passes
+    with ZERO attacker balance and credits other accounts. The attacker needs nothing they can't get.
+
+    Tier 4 (forbidden): the guard checks a raw caller amount (`require(balanceOf[msg.sender] >= amount)`)
+    that only overflows later in a payout - exploiting it needs `amount` tokens the attacker cannot hold,
+    so it is held LATENT-MANUAL instead of confirmed with a fabricated balance.
+    """
+    body = getattr(fn, "body", "") or ""
+    # A guard whose compared expression is itself a product of caller-chosen values -> the overflow
+    # defeats the guard, no pre-existing balance required.
+    guard_has_product = re.search(
+        r"(?:require|assert|if)\s*\([^;{]*\b\w+\s*\[[^\]]*\][^;{]*(?:>=|<=|>|<)[^;{]*\w+\s*\*\s*\w+", body)
+    if guard_has_product:
+        return 1, INJECTION_TIERS[1]
+    # A guard that bounds a single caller amount against the caller's own balance -> Tier 4 prerequisite.
+    guard_on_amount = re.search(
+        r"(?:require|assert)\s*\([^;{]*balance[^;{]*\[\s*msg\.sender\s*\][^;{]*(?:>=|>)\s*\w+", body, re.I)
+    if guard_on_amount:
+        return 4, INJECTION_TIERS[4]
+    # No balance guard in the way (pure credit/payout by a caller-chosen amount) -> Tier 1 as well.
+    return 1, INJECTION_TIERS[1]
 
 
 @dataclass
@@ -266,6 +336,26 @@ def parse_outcome(finding, stdout: str) -> PayloadVerdict:
     return mk("manual", "unauthorized call does NOT revert - no funds moved to the wallet generically; confirm the impact by hand")
 
 
+def overflow_verdict(finding, fn, state_vars) -> PayloadVerdict:
+    """Classify a pre-0.8 overflow finding into a sound injection tier and describe the Tier-1 crafted
+    input - WITHOUT fabricating attacker state. Tier-1 overflows are real inputs the EVM would run;
+    Tier-4 ones need balances/roles the attacker can't acquire and are held LATENT-MANUAL, never
+    confirmed with injected state. The exact wrap-around amount is computed from live values at fork
+    time via `overflow_amount()`; here we record the attack shape and tier for the forensic report."""
+    tier, label = classify_overflow(fn, state_vars or set())
+    metrics = {"call_ok": None, "att_wei": 0, "att_tok": 0, "tgt_wei": 0, "tgt_tok": 0, "code": 0}
+    if tier == 4:
+        inj = f"Tier 4 ({label}) - REFUSED: {TIER4_CAVEAT}"
+        detail = ("unchecked arithmetic, but the exploit needs tokens/role the attacker cannot acquire; "
+                  "not confirmed with a fabricated balance (would be a false positive)")
+    else:
+        inj = (f"Tier 1 ({label}) - a crafted caller input whose product wraps 2**256; nothing injected. "
+               "Exact amount = overflow_amount(live target, live multiplier) at fork time.")
+        detail = ("caller-chosen input overflows the unchecked multiplication, bypassing the balance "
+                  "guard with no pre-existing balance - run the computed wrap input on a fork to confirm")
+    return PayloadVerdict(finding, "manual", detail, metrics=metrics, injected=inj)
+
+
 def _function_of(files: list[SourceFile], finding) -> Function | None:
     for f in files:
         for c in f.contracts:
@@ -296,6 +386,10 @@ def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: 
 
     for f in findings:
         fn = _function_of(files, f)
+        if f.detector == "pre-0.8-overflow" and fn is not None:
+            # Phase 3: classify the overflow into a sound tier; never fabricate attacker state.
+            verdicts.append(overflow_verdict(f, fn, None))
+            continue
         test = build_exploit(f, fn, target, wallet) if fn is not None else None
         if test is None:
             verdicts.append(PayloadVerdict(f, "manual", f"{f.detector}: no generic payload - verify by hand"))
