@@ -40,12 +40,16 @@ def _rel(path: str, src_dir: Path) -> str:
 
 
 def write_contract_report(chain: str, address: str, meta: dict, findings: list[Finding], balance_wei: int | None,
-                          src_dir: Path, out_dir: Path, verdicts=None, holdings=None) -> Path:
+                          src_dir: Path, out_dir: Path, verdicts=None, holdings=None, payloads=None) -> Path:
     from .value import describe as describe_value
     vmap = {}
     if verdicts:
         for v in verdicts:
             vmap[(v.finding.detector, v.finding.contract, v.finding.function, v.finding.line)] = v
+    pmap = {}
+    if payloads:
+        for pv in payloads:
+            pmap[(pv.finding.detector, pv.finding.contract, pv.finding.function)] = pv
     target = out_dir / "vulnerable" / chain / address.lower()
     target.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -78,6 +82,8 @@ def write_contract_report(chain: str, address: str, meta: dict, findings: list[F
             "",
             f"**Where:** `{loc}:{f.line}` in `{f.contract}.{f.function}()`",
             "",
+            *([f"**{pmap[(f.detector, f.contract, f.function)].report_line()}**", ""]
+              if (f.detector, f.contract, f.function) in pmap else []),
             "### What's wrong",
             "",
             f.description,

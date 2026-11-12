@@ -39,6 +39,7 @@ class AutoConfig:
     max_attempts: int = 6         # unverified retries before giving up
     retry_base: float = 600.0      # seconds; doubles each attempt (10m, 20m, 40m, ...)
     verify: bool = True            # independent second pass must confirm each finding
+    forge_verify: bool = True      # dynamic third pass: run the exploit payload on a fork (needs forge + rpc)
     quiet: bool = False
     on_stage: object = None        # optional callback(stage_text) - the dashboard's live step display
     on_event: object = None        # optional callback(kind, message) - the dashboard's activity feed
@@ -156,10 +157,32 @@ def process(store, row, cfg: AutoConfig) -> str:
         except Exception as exc:
             _log(cfg, f"    verification warning ({exc}); holding findings for manual review")
             theft = []  # unconfirmed -> do not claim vulnerable
+    # Dynamic third pass: actually run each surviving finding's exploit PAYLOAD on a mainnet fork.
+    # A payload that reverts or moves no funds/state is NOT a finding and is dropped here.
+    payloads = None
+    payload_note = ""
+    if theft and cfg.forge_verify and cfg.rpc is not None:
+        from .forge_verify import forge_available, run_payloads
+        if forge_available():
+            _stage(cfg, f"Launching payload attack on {len(theft)} finding(s) on a {chain} fork")
+            try:
+                payloads = run_payloads(theft, result.files, address, cfg.rpc.url)
+                kept = [pv.finding for pv in payloads if pv.is_finding]
+                dropped = len(theft) - len(kept)
+                conf = sum(pv.outcome == "confirmed" for pv in payloads)
+                if dropped:
+                    _log(cfg, f"    payload attack disproved {dropped} finding(s) (reverted / no funds moved)")
+                payload_note = f" ({dropped} disproved by payload attack)" if dropped else ""
+                theft = kept
+                if conf:
+                    _log(cfg, f"    payload attack CONFIRMED {conf} finding(s)")
+            except Exception as exc:
+                _log(cfg, f"    payload attack warning ({exc}); keeping static verdicts")
+
     if not theft:
         extra = ""
         if candidates and (verdicts is not None):
-            extra = f" ({len(candidates)} candidate(s) not confirmed by second pass)"
+            extra = f" ({len(candidates)} candidate(s) not confirmed by second pass{payload_note})"
         store.update(chain, address, status="safe", name=name, findings=0, max_severity=None,
                      balance_wei=None if balance is None else str(balance), error=extra or None, **value_fields)
         if hasattr(store, "cache_verdict"):
@@ -167,7 +190,8 @@ def process(store, row, cfg: AutoConfig) -> str:
         _discard_source(src, cfg)
         return "safe"
 
-    report = write_contract_report(chain, address, meta, theft, balance, src, cfg.out_dir, verdicts=verdicts, holdings=held)
+    report = write_contract_report(chain, address, meta, theft, balance, src, cfg.out_dir,
+                                   verdicts=verdicts, holdings=held, payloads=payloads)
     worst = min(theft, key=lambda f: SEVERITY_RANK[f.severity]).severity
     store.update(chain, address, status="vulnerable", name=name, findings=len(theft), max_severity=worst,
                  balance_wei=None if balance is None else str(balance), report=str(report), error=None, **value_fields)
