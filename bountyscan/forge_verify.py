@@ -22,8 +22,6 @@ from pathlib import Path
 
 from .solidity import Function, SourceFile
 
-_FORGE_CANDIDATES = [shutil.which("forge"), str(Path.home() / ".foundry" / "bin" / "forge")]
-
 # The attacker / receiving wallet: the exploit routes stolen funds HERE and confirms they land.
 # "Funds moved to a wallet" is the theory of impact, so we check THIS wallet's balance delta.
 # Override per deployment with BOUNTYSCAN_ATTACKER_WALLET.
@@ -40,7 +38,13 @@ def _addr_literal(addr: str) -> str:
 
 
 def forge_bin() -> str | None:
-    for c in _FORGE_CANDIDATES:
+    """Locate the forge binary, robust to which user runs the service (the server runs as root but forge
+    may live in another user's ~/.foundry). Order: BOUNTYSCAN_FORGE, PATH, common install dirs."""
+    import glob
+    candidates = [os.environ.get("BOUNTYSCAN_FORGE"), shutil.which("forge"),
+                  "/usr/local/bin/forge", str(Path.home() / ".foundry" / "bin" / "forge")]
+    candidates += sorted(glob.glob("/home/*/.foundry/bin/forge")) + sorted(glob.glob("/root/.foundry/bin/forge"))
+    for c in candidates:
         if c and Path(c).exists():
             return c
     return None
