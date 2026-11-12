@@ -543,21 +543,24 @@ def fetch_historical_calldata(target: str, rpc_url: str | None = None, key: str 
             return explicit_hash, cd      # caller named it explicitly; trust them
     if not key:
         return None, None
-    try:
-        res = _http_json(ETHERSCAN_V2 + "?" + urllib.parse.urlencode({
-            "chainid": chain_id, "module": "account", "action": "txlist", "address": target,
-            "startblock": 0, "endblock": 99999999, "page": 1, "offset": limit, "sort": "desc",
-            "apikey": key}))
-    except Exception:
-        return None, None
-    if str(res.get("status")) != "1" or not isinstance(res.get("result"), list):
-        return None, None
-    for tx in res["result"]:
-        inp = (tx.get("input") or "").lower()
-        if str(tx.get("isError", "0")) not in ("0", "", "None") or str(tx.get("txreceipt_status", "1")) == "0":
+    # Scan both the most-recent and the earliest txs: replayable signed calls can be old (inactive
+    # contracts) or new, and a successful original tx is what we want to re-fire.
+    for order in ("desc", "asc"):
+        try:
+            res = _http_json(ETHERSCAN_V2 + "?" + urllib.parse.urlencode({
+                "chainid": chain_id, "module": "account", "action": "txlist", "address": target,
+                "startblock": 0, "endblock": 99999999, "page": 1, "offset": limit, "sort": order,
+                "apikey": key}))
+        except Exception:
             continue
-        if len(inp) >= 10 and _SIG65_MARKER in inp:      # a signed, replayable call
-            return tx.get("hash"), inp
+        if str(res.get("status")) != "1" or not isinstance(res.get("result"), list):
+            continue
+        for tx in res["result"]:
+            inp = (tx.get("input") or "").lower()
+            if str(tx.get("isError", "0")) not in ("0", "", "None") or str(tx.get("txreceipt_status", "1")) == "0":
+                continue
+            if len(inp) >= 10 and _SIG65_MARKER in inp:      # a signed, replayable call
+                return tx.get("hash"), inp
     return None, None
 
 
