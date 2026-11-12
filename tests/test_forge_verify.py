@@ -81,6 +81,23 @@ class ParseOutcome(unittest.TestCase):
         self.assertEqual(v.outcome, "manual")
         self.assertTrue(v.is_finding)   # kept - we could not prove the negative
 
+    def test_withdrawal_requires_target_loss_differential(self):
+        # attacker gained but the TARGET did not lose -> fallback/mint-like -> dropped
+        v = parse_outcome(_finding("arbitrary-recipient-withdrawal"),
+                          "CALL_OK true\nATTACKER_WEI_DELTA 5\nTOKEN_DELTA 0\nTARGET_WEI_DELTA 0\nTARGET_TOK_DELTA 0")
+        self.assertEqual(v.outcome, "no_change")
+        self.assertFalse(v.is_finding)
+        # attacker gained AND target lost the same funds -> confirmed drain
+        v2 = parse_outcome(_finding("arbitrary-recipient-withdrawal"),
+                           "CALL_OK true\nATTACKER_WEI_DELTA 5\nTOKEN_DELTA 0\nTARGET_WEI_DELTA -5\nTARGET_TOK_DELTA 0")
+        self.assertEqual(v2.outcome, "confirmed")
+
+    def test_privileged_payload_measures_target_deltas(self):
+        t = build_exploit(_finding("unprotected-privileged-function"),
+                          _fn("sweep", [("address", "to")]), "0x" + "ab" * 20)
+        self.assertIn("TARGET_WEI_DELTA", t)
+        self.assertIn("TARGET_TOK_DELTA", t)
+
     def test_report_line_present(self):
         v = parse_outcome(_finding("unrestricted-mint"), "CALL_OK true\nTOKEN_DELTA 5\nATTACKER_WEI_DELTA 0")
         self.assertIn("Payload attack: CONFIRMED", v.report_line())

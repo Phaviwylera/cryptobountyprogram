@@ -42,15 +42,19 @@ INDEX_HTML = r"""<!doctype html>
   .tab.on{color:#05070a;font-weight:700}
 
   /* ---------- stage (galaxy canvas) ---------- */
-  .stage{position:relative;height:100vh;min-height:760px;overflow:hidden}
-  canvas#galaxy{position:absolute;inset:0;width:100%;height:100%;display:block}
+  /* galaxy is a STANDALONE full-width band; controls + HUD flow BELOW it (no overlap) */
+  .stage{position:relative;height:auto;min-height:0;overflow:visible}
+  canvas#galaxy{position:relative;display:block;width:100%;height:58vh;min-height:440px}
   .title{position:absolute;top:66px;left:16px;z-index:5;pointer-events:none}
   .title .h{display:flex;align-items:center;gap:12px;font-size:30px;font-weight:800;letter-spacing:.5px;color:var(--white)}
   .title .h::before{content:"";width:5px;height:34px;background:var(--phase);box-shadow:0 0 18px var(--phase)}
   .title .s{margin:2px 0 0 17px;color:var(--phase);font-size:12px;max-width:62vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
   /* ---------- command dock ---------- */
-  .dock{position:absolute;top:66px;right:16px;z-index:8;width:300px;display:flex;flex-direction:column;gap:6px}
+  .dock{position:relative;z-index:2;width:auto;margin:12px 16px 0;display:flex;flex-direction:row;flex-wrap:wrap;align-items:flex-start;gap:10px}
+  .dgroup{flex:1 1 250px;min-width:230px;max-width:380px;display:flex;flex-direction:column;gap:6px}
+  #batches{flex:1 1 100%;display:flex;flex-wrap:wrap;gap:8px}
+  #batches>*{flex:1 1 300px}
   .drow{display:flex;gap:6px}
   .cmd{flex:1;appearance:none;cursor:pointer;font:700 11.5px var(--mono);letter-spacing:.8px;padding:10px 12px;
     border:1px solid var(--line2);background:rgba(10,13,18,.92);color:var(--ink);transition:all .2s}
@@ -76,7 +80,7 @@ INDEX_HTML = r"""<!doctype html>
   .bar i{display:block;height:100%;background:var(--cyan);transition:width .6s}
 
   /* ---------- HUD panels ---------- */
-  .hud{position:absolute;left:16px;right:16px;bottom:16px;z-index:6;display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+  .hud{position:relative;z-index:2;margin:12px 16px 16px;display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
   .p{background:var(--panel);border:1px solid var(--line);padding:9px 10px 8px;height:258px;overflow:hidden;position:relative;
     backdrop-filter:blur(2px)}
   .p.firing{animation:glow 1.1s ease-in-out infinite;border-color:var(--teal)}
@@ -180,6 +184,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="title"><div class="h" id="phTitle">00 IDLE</div><div class="s" id="phSub">press LIVE SCAN to start crawling the chain</div></div>
 
   <div class="dock">
+    <div class="dgroup">
     <div class="drow">
       <button class="cmd live" id="btnLive">▶ LIVE SCAN</button>
       <button class="cmd stop" id="btnStop" title="Stop">■</button>
@@ -192,6 +197,8 @@ INDEX_HTML = r"""<!doctype html>
       <div style="color:var(--dim);font-size:10px;margin-top:4px">native coin + USDC, USDT, DAI, USDS, USDe, WETH, stETH, wstETH, WBTC · priced by Chainlink</div>
       <label>Start from block (blank = chain head)</label><input id="liveFromBlock" placeholder="latest">
     </div>
+    </div>
+    <div class="dgroup">
     <div class="drow">
       <button class="cmd back" id="btnBack">◷ BACKFILL 2 YEARS</button>
       <button class="cmd gear" id="btnBackGear" title="Backfill settings" style="--c:var(--purple)">⚙</button>
@@ -201,6 +208,8 @@ INDEX_HTML = r"""<!doctype html>
       <label>Alive = at least N transactions (or any balance / market cap)</label><input id="bfTxs" value="10" inputmode="numeric">
       <div style="color:var(--dim);font-size:10px;margin-top:6px">Lists every contract verified on Blockscout in the window, keeps the alive ones, prices them, and scans the richest first. Resumes after restarts.</div>
     </div>
+    </div>
+    <div class="dgroup">
     <button class="cmd imm" id="btnImm">◆ IMMUNEFI SCAN</button>
     <div class="drawer" id="drImm">
       <label>Program</label><input id="immName" placeholder="acme-protocol">
@@ -208,6 +217,7 @@ INDEX_HTML = r"""<!doctype html>
       <textarea id="immAddrs" placeholder="ethereum:0x…&#10;0x…"></textarea>
       <label>…or scope file on server (optional)</label><input id="immScope" placeholder="programs/acme.json">
       <button class="cmd imm" id="btnImmGo" style="width:100%;margin-top:9px">SCAN PROGRAM</button>
+    </div>
     </div>
     <div id="batches"></div>
   </div>
@@ -367,8 +377,8 @@ function updateCamera(now){
 }
 /* a dense 3D starfield the camera flies through - rotates + crawls so the universe reads as 3D */
 function makeStars(){
-  const r = rngFrom(42), N = Math.max(260, Math.min(820, Math.floor(W*H/1500)));
-  stars3d = Array.from({length:N}, () => ({x:r()*2-1, y:r()*2-1, z:r()*2-1, b:.25+r()*.75}));
+  const r = rngFrom(42), N = Math.max(900, Math.min(2600, Math.floor(W*H/520)));   // dense, deep field
+  stars3d = Array.from({length:N}, () => ({x:r()*2-1, y:r()*2-1, z:r()*2-1, b:.22+r()*.78}));
 }
 function drawStars(now){
   const cx = W/2, cyc = (118 + (hudTop||H))*0.5, spread = Math.max(W,H)*0.95, focal = 500;
