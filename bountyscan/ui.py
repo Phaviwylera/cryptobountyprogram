@@ -223,6 +223,9 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <div class="hud">
+    <div class="p" id="pJourney" style="grid-column:1/-1;height:188px">
+      <div class="hd"><b>CONTRACT JOURNEY</b><span id="jLive" style="color:var(--teal)">how every contract is judged · live</span></div>
+      <canvas id="journey" style="width:100%;height:150px;display:block"></canvas></div>
     <div class="p"><div class="hd"><b>SCAN LOG</b><span id="hRate">0 c/m</span></div><div class="log" id="hLog"></div><div class="ft">block → source → detectors → verdict</div></div>
     <div class="p"><div class="hd"><b>PIPELINE</b><span id="hTotal">0</span></div><div id="hPipe"></div></div>
     <div class="p"><div class="hd"><b>DETECTOR RADAR</b><span>live</span></div><svg id="hRadar" viewBox="0 0 200 128" style="width:100%;height:132px"></svg><div class="bars" id="hRadarBars"></div></div>
@@ -898,6 +901,80 @@ drawRadar(); resize();
 (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(() => resize());
 poll(); setInterval(poll, 1500);
 requestAnimationFrame(render);
+
+/* ---------------- CONTRACT JOURNEY: live animated pipeline (ingest -> verdict) ---------------- */
+(function(){
+  const cv = document.getElementById('journey'); if(!cv) return;
+  const ctx = cv.getContext('2d');
+  const STAGES = [
+    {k:'INGEST',  c:'#9aa7b5', d:'new verified contracts enter the queue'},
+    {k:'SOURCE',  c:'#3fb8e6', d:'pull the verified source from the explorer'},
+    {k:'STATIC',  c:'#ff5c8a', d:'fund-theft detectors scan the code'},
+    {k:'VERIFY',  c:'#f2c14e', d:'independent second pass re-checks every hit'},
+    {k:'PAYLOAD', c:'#9a7cff', d:'live fork exploit — funds must actually move'},
+    {k:'VERDICT', c:'#4fd1b5', d:'tagged SAFE or AT-RISK on the evidence'},
+  ];
+  let W=0,H=0,dpr=1, xs=[], yMid=0, vx=0, packets=[], last=performance.now(), spawnAcc=0, hover=-1, flash=0;
+  function size(){
+    dpr = Math.min(2, window.devicePixelRatio||1);
+    W = cv.clientWidth||600; H = cv.clientHeight||150;
+    cv.width = W*dpr; cv.height = H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+    const padL=52, padR=86; yMid = H*0.44;
+    xs = STAGES.map((_,i)=> padL + (W-padL-padR) * i/(STAGES.length-1)); vx = xs[5];
+  }
+  function counts(){
+    const s = (typeof S!=='undefined' && S) || {}; const c = s.counts||{}, p=s.payload||{}, pc=p.counts||{};
+    const scanned=(c.safe||0)+(c.vulnerable||0);
+    return {INGEST:(c.queued||0), SOURCE:scanned+(c.unverified||0), STATIC:(pc.total||0),
+            VERIFY:scanned, PAYLOAD:(pc.total||0), VERDICT:(c.vulnerable||0),
+            safe:(c.safe||0), vuln:(c.vulnerable||0), running:(p.running||0)};
+  }
+  const fmt = n => n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n|0);
+  function spawn(){
+    const ct=counts(); const ratio = (ct.safe+ct.vuln)>0 ? ct.vuln/(ct.safe+ct.vuln) : 0.02;
+    packets.push({p:0, v:0.00020+Math.random()*0.00012, risk:Math.random()<Math.max(0.03,Math.min(0.2,ratio*6)),
+                  seed:Math.random()*6.28, off:(Math.random()*2-1)});
+  }
+  function draw(now){
+    const dt = Math.min(60, now-last); last=now; if(!W) size();
+    const ct = counts();
+    spawnAcc += dt; if(spawnAcc > Math.max(240, 600 - ct.running*40)){ spawnAcc=0; spawn(); }
+    ctx.clearRect(0,0,W,H);
+    const x0=xs[0], x1=xs[5];
+    ctx.lineWidth=2; ctx.strokeStyle='rgba(120,140,165,.16)'; ctx.beginPath(); ctx.moveTo(x0,yMid); ctx.lineTo(x1,yMid); ctx.stroke();
+    for(let i=0;i<STAGES.length-1;i++){ const a=xs[i],b=xs[i+1];
+      const g=ctx.createLinearGradient(a,0,b,0); g.addColorStop(0,STAGES[i].c+'00'); g.addColorStop(.5,STAGES[i].c+'4d'); g.addColorStop(1,STAGES[i+1].c+'00');
+      ctx.strokeStyle=g; ctx.lineWidth=2.2; ctx.beginPath(); ctx.moveTo(a,yMid); ctx.lineTo(b,yMid); ctx.stroke(); }
+    ctx.strokeStyle='rgba(79,209,181,.22)'; ctx.beginPath(); ctx.moveTo(xs[4],yMid); ctx.lineTo(vx, yMid-H*0.26); ctx.stroke();
+    ctx.strokeStyle='rgba(255,92,138,.22)'; ctx.beginPath(); ctx.moveTo(xs[4],yMid); ctx.lineTo(vx, yMid+H*0.26); ctx.stroke();
+    for(const pk of packets){ pk.p += pk.v*dt;
+      if(pk.p>=1){ pk._done=true; if(pk.risk) flash=1; continue; }
+      let x = x0 + (x1-x0)*pk.p, y = yMid + Math.sin(now/600 + pk.seed + pk.p*6)*4*pk.off, col;
+      if(pk.p>0.8){ const t=(pk.p-0.8)/0.2; y = yMid + (pk.risk?1:-1)*H*0.26*t; x = xs[4] + (vx-xs[4])*t; col = pk.risk?'#ff5c8a':'#4fd1b5'; }
+      else col = STAGES[Math.min(5,Math.floor(pk.p*(STAGES.length-1)))].c;
+      const r = 2.4 + Math.sin(now/300+pk.seed)*0.6;
+      ctx.shadowColor=col; ctx.shadowBlur=10; ctx.fillStyle=col; ctx.beginPath(); ctx.arc(x,y,r,0,6.2832); ctx.fill(); ctx.shadowBlur=0; }
+    packets = packets.filter(pk=>!pk._done); if(flash>0) flash -= dt/600;
+    STAGES.forEach((st,i)=>{ const x=xs[i], y=yMid, pulse=1+Math.sin(now/700+i)*0.08, R=(i===5?15:12)*pulse*(hover===i?1.22:1);
+      const gr=ctx.createRadialGradient(x,y,1,x,y,R*1.8); gr.addColorStop(0,st.c); gr.addColorStop(.5,st.c+'88'); gr.addColorStop(1,st.c+'00');
+      ctx.fillStyle=gr; ctx.beginPath(); ctx.arc(x,y,R*1.8,0,6.2832); ctx.fill();
+      ctx.fillStyle='#0a0e13'; ctx.beginPath(); ctx.arc(x,y,R*0.55,0,6.2832); ctx.fill();
+      ctx.strokeStyle=st.c; ctx.lineWidth=1.6; ctx.beginPath(); ctx.arc(x,y,R*0.55,0,6.2832); ctx.stroke();
+      ctx.textAlign='center'; ctx.font='700 10px ui-monospace,monospace'; ctx.fillStyle=st.c; ctx.fillText(st.k, x, y-R*1.8-6);
+      ctx.font='600 11px ui-monospace,monospace'; ctx.fillStyle='#c7d2de'; ctx.fillText(fmt(ct[st.k]||0), x, y+R*1.8+13); });
+    ctx.textAlign='left'; ctx.font='700 10px ui-monospace,monospace';
+    ctx.fillStyle='#4fd1b5'; ctx.fillText('✓ SAFE '+fmt(ct.safe), vx+12, yMid-H*0.26+3);
+    ctx.fillStyle='#ff5c8a'; ctx.fillText('⚑ RISK '+fmt(ct.vuln), vx+12, yMid+H*0.26+3);
+    if(ct.running>0){ ctx.textAlign='center'; ctx.fillStyle='#9a7cff'; ctx.font='700 9px ui-monospace,monospace'; ctx.fillText('⚔ '+ct.running+' firing', xs[4], yMid+H*0.34); }
+    requestAnimationFrame(draw);
+  }
+  cv.addEventListener('mousemove', e=>{ const r=cv.getBoundingClientRect(), mx=e.clientX-r.left, my=e.clientY-r.top; hover=-1;
+    for(let i=0;i<xs.length;i++){ if(Math.hypot(mx-xs[i],my-yMid)<22){ hover=i; break; } }
+    const hd=$('#jLive'); if(hd) hd.textContent = hover>=0 ? STAGES[hover].d : 'how every contract is judged · live'; });
+  cv.addEventListener('mouseleave', ()=>{ hover=-1; const hd=$('#jLive'); if(hd) hd.textContent='how every contract is judged · live'; });
+  window.addEventListener('resize', ()=>{ clearTimeout(window._jrz); window._jrz=setTimeout(size,160); });
+  size(); requestAnimationFrame(draw);
+})();
 </script>
 </body>
 </html>"""
