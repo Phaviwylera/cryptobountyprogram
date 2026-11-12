@@ -39,6 +39,47 @@ def _rel(path: str, src_dir: Path) -> str:
         return p.as_posix()
 
 
+def _fmt_amt(n) -> str:
+    if n is None:
+        return "n/a"
+    sign = "-" if n < 0 else ""
+    a = abs(int(n))
+    return sign + (f"{a/1e18:.6f} e18" if a >= 10**12 else str(a))
+
+
+def _payload_exec_lines(pv, f) -> list[str]:
+    if pv is None:
+        return ["_No generic payload for this detector class — confirm with a hand-written fork PoC._", ""]
+    moved = "funds moved to the attacker wallet" if pv.outcome == "confirmed" else \
+            ("call reverted — the guard held" if pv.outcome == "reverted" else
+             "call succeeded but moved nothing (fallback / no drain)" if pv.outcome == "no_change" else
+             "left for manual verification")
+    return [
+        f"- **Outcome:** {pv.status_word} — {pv.detail}",
+        f"- **State injection:** {pv.injected or 'vm.deal: gas only'}",
+        "- **Attack path:**",
+        "  1. Fork mainnet at the latest block; prank the attacker (msg.sender AND tx.origin = the receiving wallet).",
+        f"  2. Fire `{f.function}(...)` with an attacker-favourable payload routed to the wallet.",
+        f"  3. {moved}.",
+        "",
+    ]
+
+
+def _differential_lines(pv) -> list[str]:
+    if not pv or not pv.metrics:
+        return ["_Not measured (no dynamic run)._", ""]
+    m = pv.metrics
+    ok = pv.outcome == "confirmed"
+    return [
+        f"- **Call returned:** {'success' if m.get('call_ok') else 'revert'}",
+        f"- **Attacker delta:** wei `{_fmt_amt(m.get('att_wei', 0))}` · token `{_fmt_amt(m.get('att_tok', 0))}`",
+        f"- **Target delta:** wei `{_fmt_amt(m.get('tgt_wei', 0))}` · token `{_fmt_amt(m.get('tgt_tok', 0))}`",
+        f"- **Code length delta:** `{m.get('code', 0)}` (selfdestruct check)",
+        f"- **Assertion — attacker GAINS and target LOSES:** {'✅ PASS' if ok else '❌ FAIL — not a confirmed exploit'}",
+        "",
+    ]
+
+
 def write_contract_report(chain: str, address: str, meta: dict, findings: list[Finding], balance_wei: int | None,
                           src_dir: Path, out_dir: Path, verdicts=None, holdings=None, payloads=None) -> Path:
     from .value import describe as describe_value
@@ -56,12 +97,18 @@ def write_contract_report(chain: str, address: str, meta: dict, findings: list[F
     name = meta.get("contract_name") or "unknown"
     crit = sum(f.severity == "critical" for f in findings)
     high = len(findings) - crit
+    # forensic overall status from the dynamic payload attack
+    outs = {pv.outcome for pv in (payloads or [])}
+    fstatus = ("CONFIRMED EXPLOIT" if "confirmed" in outs else
+               "LATENT / MANUAL REVIEW" if ("manual" in outs or not payloads) else
+               "STATIC CANDIDATE")
 
     lines = [
-        f"# VULNERABLE: {name} ({chain} {address})",
+        f"# 🛡️ BountyScan Forensic Report: {name} ({chain} {address})",
         "",
         "| | |",
         "|---|---|",
+        f"| Status | **{fstatus}** |",
         f"| Verdict | **VULNERABLE**: {crit} critical, {high} high fund-theft candidate(s) |",
         f"| Chain / address | {chain} / [`{address}`]({explorer_url(chain, address)}) |",
         f"| Contract | {name} (compiler {meta.get('compiler') or '?'}) |",
@@ -77,31 +124,41 @@ def write_contract_report(chain: str, address: str, meta: dict, findings: list[F
     for i, f in enumerate(findings, 1):
         rem = REMEDIATION.get(f.detector, {})
         loc = _rel(f.file, src_dir)
+        pv = pmap.get((f.detector, f.contract, f.function))
+        status = pv.status_word if pv else "STATIC CANDIDATE (no dynamic run)"
         lines += [
             f"## {i}. [{SEV_LABEL.get(f.severity, f.severity.upper())}] {f.title}",
             "",
+            f"**Status:** {status}" + (f" — {pv.detail}" if pv else ""),
+            "",
             f"**Where:** `{loc}:{f.line}` in `{f.contract}.{f.function}()`",
             "",
-            *([f"**{pmap[(f.detector, f.contract, f.function)].report_line()}**", ""]
-              if (f.detector, f.contract, f.function) in pmap else []),
-            "### What's wrong",
+            "### 1. Executive summary",
             "",
             f.description,
             "",
+            "### 2. Static analysis & code trace",
+            "",
+            f"- **Vulnerable function:** `{f.contract}.{f.function}()`",
+            f"- **Flaw:** {f.title}",
             *_verdict_lines(vmap.get((f.detector, f.contract, f.function, f.line))),
             "```solidity",
             _context(f.file, f.line) or f.snippet,
             "```",
             "",
-            "### How it can be exploited",
+            "### 3. Dynamic payload execution (Foundry fork)",
+            "",
+            *_payload_exec_lines(pv, f),
+            "### 4. 200% differential verification",
+            "",
+            *_differential_lines(pv),
+            "### 5. How it can be exploited & how to fix",
             "",
             *[f"{n}. {step}" for n, step in enumerate(rem.get("attack", []), 1)],
             "",
             f"**Impact:** {f.impact}",
             "",
-            "### How to fix it",
-            "",
-            f.recommendation,
+            f"**Fix:** {f.recommendation}",
             "",
             "```solidity",
             rem.get("fix", "// see recommendation"),

@@ -70,6 +70,14 @@ class PayloadVerdict:
     outcome: str                     # confirmed | reverted | no_change | manual | error
     detail: str                      # human-readable one-liner for the report
     profit_wei: int | None = None
+    metrics: dict | None = None      # measured deltas: att_wei/att_tok/tgt_wei/tgt_tok/code/call_ok
+    injected: str = ""               # Phase-3 state injection applied (vm.deal / stdstore), if any
+
+    @property
+    def status_word(self) -> str:
+        return {"confirmed": "CONFIRMED EXPLOIT", "manual": "LATENT / MANUAL REVIEW",
+                "reverted": "FALSE POSITIVE", "no_change": "FALSE POSITIVE",
+                "error": "NOT RUN"}.get(self.outcome, self.outcome.upper())
 
     @property
     def is_finding(self) -> bool:
@@ -224,37 +232,38 @@ def parse_outcome(finding, stdout: str) -> PayloadVerdict:
     tgt_tok = int(vals.get("TARGET_TOK_DELTA", "0"))
     target_lost = tgt_wei < 0 or tgt_tok < 0     # 200% differential: the TARGET must actually lose funds
     det = finding.detector
+    metrics = {"call_ok": call_ok, "att_wei": wei, "att_tok": tok, "tgt_wei": tgt_wei,
+               "tgt_tok": tgt_tok, "code": code}
+    injected = "vm.deal: 10 ETH to the attacker (gas / flash-loan stake)"
+
+    def mk(outcome, detail, profit=None):
+        return PayloadVerdict(finding, outcome, detail, profit, metrics=metrics, injected=injected)
 
     if not call_ok:
-        return PayloadVerdict(finding, "reverted",
-                              "an unprivileged attacker's call reverts - the access guard holds")
+        return mk("reverted", "an unprivileged attacker's call reverts - the access guard holds")
     w = ATTACKER_WALLET
     if det == "unprotected-selfdestruct":
         if code < 0:
-            return PayloadVerdict(finding, "confirmed", "selfdestruct destroyed the contract code", wei)
+            return mk("confirmed", "selfdestruct destroyed the contract code", wei)
         if wei > 0:
-            return PayloadVerdict(finding, "confirmed", f"selfdestruct moved {wei} wei to the wallet {w}", wei)
-        return PayloadVerdict(finding, "no_change", "call succeeds but code intact and no funds moved (post-Cancun / fallback)")
+            return mk("confirmed", f"selfdestruct moved {wei} wei to the wallet {w}", wei)
+        return mk("no_change", "call succeeds but code intact and no funds moved (post-Cancun / fallback)")
     if det in ("unrestricted-mint",):
-        return (PayloadVerdict(finding, "confirmed", f"{tok} tokens freshly minted to the wallet {w}", tok) if tok > 0
-                else PayloadVerdict(finding, "no_change", "call succeeds but the wallet's balance is unchanged"))
+        return (mk("confirmed", f"{tok} tokens freshly minted to the wallet {w}", tok) if tok > 0
+                else mk("no_change", "call succeeds but the wallet's balance is unchanged"))
     if det in ("arbitrary-recipient-withdrawal",):
         gain = max(wei, tok)
         # 200% differential: the wallet must GAIN and the target must LOSE the same funds. A gain with no
         # target loss (minted/rebased/returned) or a success with no movement is a fallback trap -> drop.
         if gain > 0 and target_lost:
-            return PayloadVerdict(finding, "confirmed", f"{gain} (wei/token) drained from the target to the wallet {w}", gain)
-        return PayloadVerdict(finding, "no_change",
-                              "withdrawal call succeeds but the target did not lose funds to the wallet (fallback / no drain)")
+            return mk("confirmed", f"{gain} (wei/token) drained from the target to the wallet {w}", gain)
+        return mk("no_change", "withdrawal call succeeds but the target did not lose funds to the wallet (fallback / no drain)")
     if det == "unrestricted-burn-from":
-        # burning a third party's balance needs a funded victim -> can't prove with a generic payload
-        return PayloadVerdict(finding, "manual", "burn-from needs a funded victim; verify by hand")
-    # privileged-function: confirmed only if the wallet gained AND the target lost the same funds
-    # (the 200% differential). A non-reverting call that moves nothing is left for manual review.
+        return mk("manual", "burn-from needs a funded victim; verify by hand")
+    # privileged-function: confirmed only if the wallet gained AND the target lost the same funds.
     if (wei > 0 or tok > 0) and target_lost:
-        return PayloadVerdict(finding, "confirmed", f"unauthorized call drained {max(wei, tok)} from the target to the wallet {w}", max(wei, tok))
-    return PayloadVerdict(finding, "manual",
-                          "unauthorized call does NOT revert - no funds moved to the wallet generically; confirm the impact by hand")
+        return mk("confirmed", f"unauthorized call drained {max(wei, tok)} from the target to the wallet {w}", max(wei, tok))
+    return mk("manual", "unauthorized call does NOT revert - no funds moved to the wallet generically; confirm the impact by hand")
 
 
 def _function_of(files: list[SourceFile], finding) -> Function | None:

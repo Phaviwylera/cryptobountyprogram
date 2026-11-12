@@ -60,7 +60,9 @@ class AutoModeTests(unittest.TestCase):
         self.assertEqual(vuln["max_severity"], "critical")
 
         report = Path(vuln["report"]).read_text(encoding="utf-8")
-        for section in ("### What's wrong", "### How it can be exploited", "### How to fix it", "VULNERABLE"):
+        for section in ("### 1. Executive summary", "### 2. Static analysis & code trace",
+                        "### 3. Dynamic payload execution", "### 4. 200% differential verification",
+                        "### 5. How it can be exploited", "VULNERABLE"):
             self.assertIn(section, report)
         data = json.loads((Path(vuln["report"]).parent / "findings.json").read_text(encoding="utf-8"))
         self.assertTrue(all(f["severity"] in ("critical", "high") for f in data["findings"]))
