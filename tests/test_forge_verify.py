@@ -235,5 +235,57 @@ class OverflowPoC(unittest.TestCase):
         self.assertIs(parse_overflow_outcome(f, "Compiler run failed", fb), fb)
 
 
+class Tier3Replay(unittest.TestCase):
+    def test_build_replay_embeds_calldata_and_wallet(self):
+        from bountyscan.forge_verify import build_replay_exploit, ATTACKER_WALLET
+        poc = build_replay_exploit("0x" + "ab" * 20, "0xdeadbeef" + "00" * 100)
+        self.assertIn('hex"deadbeef', poc)
+        self.assertNotIn("0x", poc.split('hex"')[1][:20])     # calldata is bare hex, no 0x
+        self.assertIn("address(uint160(0x00" + ATTACKER_WALLET.lower().replace("0x", "") + "))", poc)
+        self.assertIn("vm.prank(attacker, attacker)", poc)
+        self.assertIsNone(build_replay_exploit("0x0", "0x"))  # no calldata -> no PoC
+
+    def test_parse_replay_blocked_is_false_positive(self):
+        from bountyscan.forge_verify import parse_replay_outcome, PayloadVerdict
+        f = _finding("signature-replay")
+        v = parse_replay_outcome(f, "RP_CALL_OK false\nRP_ATT_DELTA 0\nRP_TGT_DELTA 0",
+                                 PayloadVerdict(f, "manual", "fb"))
+        self.assertEqual(v.outcome, "reverted")
+        self.assertFalse(v.is_finding)                        # dropped - usedDigests held
+        self.assertIn("BLOCKED", v.detail)
+
+    def test_parse_replay_success_with_drain_is_confirmed(self):
+        from bountyscan.forge_verify import parse_replay_outcome, PayloadVerdict
+        f = _finding("signature-replay")
+        v = parse_replay_outcome(f, "RP_CALL_OK true\nRP_ATT_DELTA 0\nRP_TGT_DELTA -500",
+                                 PayloadVerdict(f, "manual", "fb"))
+        self.assertEqual(v.outcome, "confirmed")
+        self.assertEqual(v.profit_wei, 500)
+
+    def test_parse_replay_success_no_loss_is_dropped(self):
+        from bountyscan.forge_verify import parse_replay_outcome, PayloadVerdict
+        f = _finding("signature-replay")
+        v = parse_replay_outcome(f, "RP_CALL_OK true\nRP_ATT_DELTA 0\nRP_TGT_DELTA 0",
+                                 PayloadVerdict(f, "manual", "fb"))
+        self.assertEqual(v.outcome, "no_change")
+        self.assertFalse(v.is_finding)
+
+    def test_fetch_picks_tx_with_65byte_signature(self):
+        from bountyscan import forge_verify as fv
+        marker = fv._SIG65_MARKER
+        canned = {"status": "1", "result": [
+            {"hash": "0xno", "input": "0xabcd1234", "isError": "0"},                 # no signature blob
+            {"hash": "0xyes", "input": "0xdeadbeef" + marker + "ff" * 65, "isError": "0"},  # signed call
+        ]}
+        orig = fv._http_json
+        fv._http_json = lambda *a, **k: canned
+        try:
+            txh, cd = fv.fetch_historical_calldata("0x" + "ab" * 20, key="k")
+        finally:
+            fv._http_json = orig
+        self.assertEqual(txh, "0xyes")
+        self.assertIn(marker, cd)
+
+
 if __name__ == "__main__":
     unittest.main()

