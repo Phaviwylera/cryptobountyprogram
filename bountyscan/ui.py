@@ -247,6 +247,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="fh"><h2>FINDINGS</h2>
     <span class="ftab on" data-t="results">vulnerable</span><span class="ftab" data-t="safe">safe</span><span class="ftab" data-t="errors">errors</span>
     <label id="hideEmptyWrap" style="margin-left:auto;color:var(--dim);font-size:11px;display:flex;align-items:center;gap:5px;cursor:pointer" title="Hide contracts that currently hold no priced value (nothing to steal right now)"><input type="checkbox" id="hideEmpty" checked style="accent-color:var(--teal)">hide holds-nothing</label>
+    <a class="cmd" href="/live" target="_blank" style="--c:var(--violet);text-decoration:none" title="Open the live threat-watch page: fresh deployments, scanned in their first hours, watched for incoming funds">⚡ LIVE THREAT WATCH</a>
     <button class="cmd" id="btnDownload" style="--c:var(--teal)" title="Download every confirmed threat's full report as one text document">⬇ DOWNLOAD ALL REPORTS</button>
     <button class="cmd" id="btnRecheck" style="--c:var(--pink)" title="Re-verify every already-judged contract against the current rules">↻ RE-CHECK ALL</button>
     <span style="margin-left:14px;color:var(--dim)" id="fNote">only findings confirmed by the independent second pass appear here</span></div>

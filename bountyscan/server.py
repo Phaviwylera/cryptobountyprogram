@@ -388,6 +388,27 @@ class Handler(BaseHTTPRequestHandler):
         w = self.worker
         if u.path in ("/", "/index.html"):
             return self._send(200, INDEX_HTML.encode(), "text/html; charset=utf-8")
+        if u.path in ("/live", "/live/"):
+            from .live_page import LIVE_HTML
+            return self._send(200, LIVE_HTML.encode(), "text/html; charset=utf-8")
+        if u.path == "/api/live/feed":
+            import time as _t
+            fw = w.store.fund_watch_map()
+            now = _t.time()
+            out = []
+            for r in w.store.recent_vulnerable(60):
+                f = fw.get((r["chain"], r["address"]))
+                last_wei = (f["last_wei"] if f else None) or (str(r["balance_wei"]) if r["balance_wei"] else "0")
+                first_wei = int(f["first_wei"] or 0) if f else None
+                receiving = bool(f and int(f["last_wei"] or 0) > (first_wei or 0))
+                out.append({
+                    "chain": r["chain"], "address": r["address"], "name": r["name"],
+                    "severity": r["max_severity"], "findings": r["findings"],
+                    "value_usd": r["value_usd"] if "value_usd" in r.keys() else None,
+                    "age_sec": now - (r["updated"] or now),
+                    "wei": str(last_wei), "inflows": (f["inflows"] if f else 0), "receiving": receiving,
+                })
+            return self._send(200, {"contracts": out, "mode": w.mode, "ts": now})
         if u.path == "/api/status":
             return self._send(200, w.snapshot())
         if u.path == "/api/meta":
@@ -521,6 +542,12 @@ def serve(host: str, port: int, out_dir: Path, cache_dir: Path, state: Path,
     rpc = RPC(rpc_url) if rpc_url else None
     cfg = AutoConfig(out_dir=out_dir, cache_dir=cache_dir, api_key=api_key, rpc=rpc, verify=verify, quiet=True)
     Handler.worker = Worker(store, cfg, rpc)
+    # Isolated live fund-watch: polls native balances of freshly-flagged contracts for inflow (Live Scan page).
+    try:
+        from .fundwatch import FundWatcher
+        FundWatcher(store, rpc_url, chain=cfg_default_chain()).start()
+    except Exception:
+        pass
     if rejudge:
         Handler.worker.add_event("info", f"Rules updated to v{__version__}: re-checking {rejudge} VULNERABLE contract(s) first.")
     # BOUNTYSCAN_AUTOSTART=live resumes the 24/7 live scan after any restart or reboot;

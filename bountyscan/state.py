@@ -171,6 +171,45 @@ class Store:
         with self._lock:
             return self.db.execute("SELECT * FROM contracts WHERE chain=? AND address=?", (chain, address)).fetchone()
 
+    # --- Live fund-watch (isolated: its own table, never touches the scan pipeline) -----------------
+    def ensure_fund_watch(self) -> None:
+        with self._lock:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS fund_watch (chain TEXT, address TEXT, first_seen REAL, "
+                "first_wei TEXT, last_wei TEXT, last_ts REAL, peak_wei TEXT, checks INTEGER, inflows INTEGER, "
+                "PRIMARY KEY(chain, address))")
+            self.db.commit()
+
+    def recent_vulnerable(self, limit: int = 60) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.db.execute("SELECT * FROM contracts WHERE status='vulnerable' ORDER BY updated DESC "
+                                   "LIMIT ?", (int(limit),)).fetchall()
+
+    def fund_watch_update(self, chain: str, address: str, wei: int) -> None:
+        import time as _t
+        now = _t.time()
+        with self._lock:
+            row = self.db.execute("SELECT last_wei, peak_wei, inflows FROM fund_watch WHERE chain=? AND address=?",
+                                  (chain, address)).fetchone()
+            if row is None:
+                self.db.execute("INSERT INTO fund_watch VALUES (?,?,?,?,?,?,?,?,?)",
+                                (chain, address, now, str(wei), str(wei), now, str(wei), 1, 0))
+            else:
+                last = int(row["last_wei"] or 0)
+                inflows = (row["inflows"] or 0) + (1 if wei > last else 0)
+                peak = max(int(row["peak_wei"] or 0), wei)
+                self.db.execute("UPDATE fund_watch SET last_wei=?, last_ts=?, peak_wei=?, checks=checks+1, "
+                                "inflows=? WHERE chain=? AND address=?",
+                                (str(wei), now, str(peak), inflows, chain, address))
+            self.db.commit()
+
+    def fund_watch_map(self) -> dict:
+        with self._lock:
+            try:
+                return {(r["chain"], r["address"]): r for r in self.db.execute("SELECT * FROM fund_watch").fetchall()}
+            except sqlite3.OperationalError:
+                return {}
+
     def cursor(self, chain: str) -> int | None:
         with self._lock:
             row = self.db.execute("SELECT block FROM cursors WHERE chain = ?", (chain,)).fetchone()
