@@ -212,6 +212,54 @@ ONE_TIME_GUARD_RE = re.compile(
 SIGNATURE_CHECK_RE =re.compile(r"MerkleProof|\.verify\s*\(|ecrecover\s*\(|\.recover\s*\(|SignatureChecker|isValidSignature")
 
 
+def _split_top(s: str, sep: str) -> list[str]:
+    """Split on top-level occurrences of `sep` (|| or &&), respecting parentheses."""
+    out, depth, last, i, L = [], 0, 0, 0, len(sep)
+    while i < len(s):
+        c = s[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif depth == 0 and s[i:i + L] == sep:
+            out.append(s[last:i]); i += L; last = i; continue
+        i += 1
+    out.append(s[last:])
+    return out
+
+
+def _if_condition(body: str, lparen: int) -> str | None:
+    """The balanced condition of an `if (...)` starting at the '(' index `lparen`."""
+    depth, i = 0, lparen
+    while i < len(body):
+        if body[i] == "(":
+            depth += 1
+        elif body[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return body[lparen + 1:i]
+        i += 1
+    return None
+
+
+_EQ_SENDER = re.compile(rf"(?:{SENDER}\s*==|==\s*{SENDER})")
+
+
+def sender_admission_guard(body: str) -> bool:
+    """A leading positive caller check whose admission requires msg.sender to equal a principal -
+    INCLUDING the multi-principal OR form `if (msg.sender == owner || msg.sender == dev) { ... }`
+    (Xaurum). Sound because EVERY top-level `||` disjunct must carry a `msg.sender ==` comparison, so a
+    disjunct that would admit a non-sender path (a timestamp, a public bool) is never mistaken for a guard."""
+    head = "\n".join((body or "").split("\n")[:12])      # a leading guard (spec: within the first ~10 lines)
+    for m in re.finditer(r"\bif\s*\(", head):
+        cond = _if_condition(head, m.end() - 1)
+        if cond is None or not _EQ_SENDER.search(cond):
+            continue
+        if all(_EQ_SENDER.search(d) for d in _split_top(cond, "||")):
+            return True
+    return False
+
+
 def access_controlled(fn: Function, project: Project) -> bool:
     """Does the function restrict *who* may call it?"""
     for m in fn.modifiers:
@@ -219,6 +267,8 @@ def access_controlled(fn: Function, project: Project) -> bool:
             return True
     body = fn.body or ""
     if AUTH_BODY_RE.search(body):
+        return True
+    if sender_admission_guard(body):          # inline `if (msg.sender == owner || msg.sender == dev)`
         return True
     if re.search(rf"\bsuper\.{re.escape(fn.name)}\s*\(", body):
         return True  # override delegating to the (checked) parent implementation

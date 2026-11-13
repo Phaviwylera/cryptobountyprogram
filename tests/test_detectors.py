@@ -16,6 +16,23 @@ def hits(findings, detector):
     return [f for f in findings if f.detector == detector]
 
 
+class SenderAdmissionGuard(unittest.TestCase):
+    """Phase-2 CFG: the multi-principal inline guard `if (msg.sender == owner || msg.sender == dev)`."""
+
+    def test_or_of_senders_is_a_guard(self):
+        from bountyscan.detectors import sender_admission_guard
+        self.assertTrue(sender_admission_guard("if (msg.sender == owner || msg.sender == dev) { x = _c; }"))
+        self.assertTrue(sender_admission_guard("if (msg.sender == owner) { x = _c; }"))
+        self.assertTrue(sender_admission_guard("if (paused == false && msg.sender == owner) { x = _c; }"))
+
+    def test_mixed_or_admitting_nonsender_is_not_a_guard(self):
+        from bountyscan.detectors import sender_admission_guard
+        # a disjunct that admits a public path (timestamp / bool) must NOT be mistaken for access control
+        self.assertFalse(sender_admission_guard("if (block.timestamp > start || msg.sender == owner) { x = _c; }"))
+        self.assertFalse(sender_admission_guard("if (isPublic || msg.sender == owner) { x = _c; }"))
+        self.assertFalse(sender_admission_guard("x = _c;"))
+
+
 class ParserTests(unittest.TestCase):
     def test_parses_contracts_functions_and_state(self):
         sf = parse_source(FIXTURES / "vulnerable" / "VulnerableVault.sol")
