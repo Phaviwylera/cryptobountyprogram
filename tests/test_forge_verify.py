@@ -235,6 +235,49 @@ class OverflowPoC(unittest.TestCase):
         self.assertIs(parse_overflow_outcome(f, "Compiler run failed", fb), fb)
 
 
+class MultiStepChain(unittest.TestCase):
+    def _contract(self, fns):
+        return types.SimpleNamespace(name="C", functions=fns)
+
+    def _mfn(self, name, params):
+        return _fn(name, params)   # _fn: visibility external, mutability None -> is_mutating True
+
+    def test_chain_seizes_then_drains(self):
+        from bountyscan.forge_verify import build_privilege_chain
+        takeover = self._mfn("setOwner", [("address", "o")])
+        drain1 = self._mfn("withdraw", [])
+        drain2 = self._mfn("sweep", [("address", "to")])
+        noise = self._mfn("setConfig", [("uint256", "x")])
+        c = self._contract([takeover, drain1, drain2, noise])
+        chain, tried = build_privilege_chain(_finding("unprotected-privileged-function", function="setOwner"),
+                                             takeover, c, "0x" + "ab" * 20)
+        self.assertIsNotNone(chain)
+        self.assertIn('abi.encodeWithSignature("setOwner(address)", attacker)', chain)   # step 1: seize
+        self.assertIn('abi.encodeWithSignature("withdraw()")', chain)                    # step 2: drain
+        self.assertIn('abi.encodeWithSignature("sweep(address)", attacker)', chain)
+        self.assertIn("vm.startPrank(attacker, attacker)", chain)
+        self.assertEqual(set(tried), {"withdraw", "sweep"})
+        self.assertNotIn("setConfig", tried)                                             # non-drain excluded
+
+    def test_no_drain_means_no_chain(self):
+        from bountyscan.forge_verify import build_privilege_chain
+        takeover = self._mfn("setOwner", [("address", "o")])
+        c = self._contract([takeover, self._mfn("setConfig", [("uint256", "x")])])
+        chain, tried = build_privilege_chain(_finding("unprotected-privileged-function"), takeover, c, "0x0")
+        self.assertIsNone(chain)
+        self.assertEqual(tried, [])
+
+    def test_chain_confirms_only_on_real_drain(self):
+        from bountyscan.forge_verify import parse_chain_outcome
+        f = _finding("unprotected-privileged-function", function="setOwner")
+        drained = parse_chain_outcome(f, "CALL_OK true\nATTACKER_WEI_DELTA 5\nTOKEN_DELTA 0\nTARGET_WEI_DELTA -5\nTARGET_TOK_DELTA 0", ["withdraw"])
+        self.assertEqual(drained.outcome, "confirmed")
+        self.assertIn("takeover→drain chain CONFIRMED", drained.detail)
+        # takeover works but nothing drains -> stays manual (not a confirmed theft)
+        nope = parse_chain_outcome(f, "CALL_OK true\nATTACKER_WEI_DELTA 0\nTOKEN_DELTA 0\nTARGET_WEI_DELTA 0\nTARGET_TOK_DELTA 0", ["withdraw"])
+        self.assertEqual(nope.outcome, "manual")
+
+
 class Tier3Replay(unittest.TestCase):
     def test_build_replay_embeds_calldata_and_wallet(self):
         from bountyscan.forge_verify import build_replay_exploit, ATTACKER_WALLET
