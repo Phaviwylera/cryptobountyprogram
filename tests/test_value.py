@@ -122,6 +122,26 @@ class ValueTests(unittest.TestCase):
             self.assertNotIn(idle, got)                       # the year-old backfill flood stays hidden
             s.db.close()
 
+    def test_live_feed_shows_fresh_and_receiving_not_idle_valueholders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Store(Path(tmp) / "lf.db")
+            live = "0x" + "a1" * 20     # fresh live launch
+            recv = "0x" + "e5" * 20     # value-holder that has started receiving
+            idle = "0x" + "d4" * 20     # idle value-holder -> must NOT appear on the fresh page
+            s.enqueue_with("ethereum", live, "block:2002")
+            s.enqueue_with("ethereum", recv, "backfill:x")
+            s.enqueue_with("ethereum", idle, "backfill:x")
+            s.update("ethereum", live, status="vulnerable")
+            s.update("ethereum", recv, status="vulnerable", value_usd=1000.0)
+            s.update("ethereum", idle, status="vulnerable", value_usd=1000.0)
+            s.fund_watch_update("ethereum", recv, 100)
+            s.fund_watch_update("ethereum", recv, 500)      # balance grew -> inflow recorded
+            got = {r["address"] for r in s.live_feed(50)}
+            self.assertIn(live, got)                         # fresh launch shows
+            self.assertIn(recv, got)                         # receiving contract surfaces
+            self.assertNotIn(idle, got)                      # idle value-holder stays off the fresh page
+            s.db.close()
+
     def test_store_migrates_old_database(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as tmp:

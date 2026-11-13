@@ -396,16 +396,17 @@ class Handler(BaseHTTPRequestHandler):
             fw = w.store.fund_watch_map()
             now = _t.time()
             out = []
-            for r in w.store.watch_targets(60):     # live launches + confirmed exploits + value-holders + receiving
+            for r in w.store.live_feed(60):     # fresh live launches + anything now receiving funds
                 f = fw.get((r["chain"], r["address"]))
                 last_wei = (f["last_wei"] if f else None) or (str(r["balance_wei"]) if r["balance_wei"] else "0")
                 first_wei = int(f["first_wei"] or 0) if f else None
                 receiving = bool(f and int(f["last_wei"] or 0) > (first_wei or 0))
+                created = r["discovered"] if ("discovered" in r.keys() and r["discovered"]) else (r["updated"] or now)
                 out.append({
                     "chain": r["chain"], "address": r["address"], "name": r["name"],
                     "severity": r["max_severity"], "findings": r["findings"],
                     "value_usd": r["value_usd"] if "value_usd" in r.keys() else None,
-                    "age_sec": now - (r["updated"] or now),
+                    "age_sec": now - created,
                     "wei": str(last_wei), "inflows": (f["inflows"] if f else 0), "receiving": receiving,
                 })
             return self._send(200, {"contracts": out, "mode": w.mode, "ts": now})

@@ -48,7 +48,7 @@ class Store:
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(contracts)")}
             for name, decl in (("value_usd", "REAL"), ("holdings", "TEXT"), ("value_checked", "REAL"),
                                ("priority", f"REAL NOT NULL DEFAULT {LIVE_PRIORITY}"), ("txs", "INTEGER"),
-                               ("payload_confirmed", "INTEGER")):
+                               ("payload_confirmed", "INTEGER"), ("discovered", "REAL")):
                 if name not in cols:
                     self.db.execute(f"ALTER TABLE contracts ADD COLUMN {name} {decl}")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_due ON contracts(status, priority DESC, next_try)")
@@ -59,9 +59,10 @@ class Store:
     def enqueue_with(self, chain: str, address: str, origin: str, **fields) -> bool:
         """Insert if new and set extra columns (priority, value_usd, name, txs ...). Existing rows untouched."""
         with self._lock:
+            now = time.time()
             cur = self.db.execute(
-                "INSERT OR IGNORE INTO contracts (chain, address, origin, updated) VALUES (?, ?, ?, ?)",
-                (chain.lower(), address.lower(), origin, time.time()))
+                "INSERT OR IGNORE INTO contracts (chain, address, origin, updated, discovered) VALUES (?, ?, ?, ?, ?)",
+                (chain.lower(), address.lower(), origin, now, now))
             if cur.rowcount == 1 and fields:
                 cols = ", ".join(f"{k} = ?" for k in fields)
                 self.db.execute(f"UPDATE contracts SET {cols} WHERE chain = ? AND address = ?",
@@ -106,9 +107,10 @@ class Store:
 
     def enqueue(self, chain: str, address: str, origin: str) -> bool:
         with self._lock:
+            now = time.time()
             cur = self.db.execute(
-                "INSERT OR IGNORE INTO contracts (chain, address, origin, updated) VALUES (?, ?, ?, ?)",
-                (chain.lower(), address.lower(), origin, time.time()),
+                "INSERT OR IGNORE INTO contracts (chain, address, origin, updated, discovered) VALUES (?, ?, ?, ?, ?)",
+                (chain.lower(), address.lower(), origin, now, now),
             )
             self.db.commit()
             return cur.rowcount == 1
@@ -211,6 +213,18 @@ class Store:
                 "    OR (value_usd IS NOT NULL AND value_usd > 0) "
                 "    OR address IN (SELECT address FROM fund_watch WHERE inflows > 0)"
                 ") ORDER BY (value_usd IS NULL), value_usd DESC, updated DESC LIMIT ?", (int(limit),)).fetchall()
+
+    def live_feed(self, limit: int = 60) -> list[sqlite3.Row]:
+        """What the Live page shows: genuinely FRESH live-discovered launches (origin 'block:*'), PLUS
+        any watched contract that has actually started RECEIVING funds (fund_watch inflows>0) - the
+        winnable moment. Idle established value-holders are still watched server-side (watch_targets)
+        but do NOT clutter this fresh-launches view. Newest first by discovery time."""
+        with self._lock:
+            return self.db.execute(
+                "SELECT * FROM contracts WHERE status='vulnerable' AND ("
+                "    origin LIKE 'block:%' "
+                "    OR address IN (SELECT address FROM fund_watch WHERE inflows > 0)"
+                ") ORDER BY COALESCE(discovered, updated) DESC LIMIT ?", (int(limit),)).fetchall()
 
     def fund_watch_update(self, chain: str, address: str, wei: int) -> None:
         import time as _t
