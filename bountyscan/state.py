@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS scan_cache (source_hash TEXT PRIMARY KEY, status TEXT
 LIVE_PRIORITY = 1e9   # live/Immunefi items jump the queue; backfill items are ordered by value
 
 # queued -> safe | vulnerable | unverified (retried) | low_value | no_code | error
-TERMINAL = {"safe", "vulnerable", "low_value", "no_code", "unverified_final", "error"}
+TERMINAL = {"safe", "vulnerable", "low_value", "no_code", "junk", "unverified_final", "error"}
 
 
 class Store:

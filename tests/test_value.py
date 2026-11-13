@@ -51,6 +51,53 @@ class ValueTests(unittest.TestCase):
         self.assertEqual(h["usd"], 0)
         self.assertEqual(h["items"], [])
 
+    def test_spoof_token_fake_supply_is_dropped(self):
+        # The real reported contract: ~1.4e58 whole tokens (18 decimals), zero value held.
+        spoof_raw = 14474011154664524427946373126085988481658748083205070504932198000989141204991
+        class Spoof:
+            def call(self, method, params):
+                data = params[0]["data"]; word = lambda n: "%064x" % n
+                if data == value.TOTAL_SUPPLY:
+                    return "0x" + "%064x" % spoof_raw
+                if data == value.DECIMALS:
+                    return "0x" + word(18)
+                return "0x" + word(0)
+        reason = value.spoof_reason(Spoof(), "0x" + "55" * 20, 0, {"usd": 0})
+        self.assertIsNotNone(reason)
+        self.assertIn("spoof", reason)
+
+    def test_real_token_with_sane_supply_is_kept(self):
+        class Real:
+            def call(self, method, params):
+                data = params[0]["data"]; word = lambda n: "%064x" % n
+                if data == value.TOTAL_SUPPLY:
+                    return "0x" + "%064x" % (1_000_000_000 * 10**18)   # 1e9 tokens: normal
+                if data == value.DECIMALS:
+                    return "0x" + word(18)
+                return "0x" + word(0)
+        self.assertIsNone(value.spoof_reason(Real(), "0x" + "66" * 20, 0, {"usd": 0}))
+
+    def test_contract_holding_value_is_never_dropped_as_spoof(self):
+        # Even with an absurd supply, a contract that holds value must reach the scanner.
+        spoof_raw = 10**60
+        class Spoof:
+            def call(self, method, params):
+                data = params[0]["data"]; word = lambda n: "%064x" % n
+                if data == value.TOTAL_SUPPLY:
+                    return "0x" + "%064x" % spoof_raw
+                if data == value.DECIMALS:
+                    return "0x" + word(18)
+                return "0x" + word(0)
+        self.assertIsNone(value.spoof_reason(Spoof(), "0x" + "77" * 20, 5 * 10**17, {"usd": 1000}))
+        self.assertIsNone(value.spoof_reason(Spoof(), "0x" + "77" * 20, 0, {"usd": 1000}))
+
+    def test_non_erc20_zero_supply_is_kept(self):
+        # A fresh contract that is not a token (totalSupply reverts / 0) must survive for live-watch.
+        class NoToken:
+            def call(self, method, params):
+                return "0x"
+        self.assertIsNone(value.spoof_reason(NoToken(), "0x" + "88" * 20, 0, None))
+
     def test_unknown_chain_is_unpriced(self):
         h = value.holdings(FakeRPC(), 999999, "0x" + "33" * 20, 10**18)
         self.assertIsNone(h["usd"])

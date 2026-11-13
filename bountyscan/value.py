@@ -14,6 +14,12 @@ BALANCE_OF = "0x70a08231"
 LATEST_ROUND = "0xfeaf968c"
 DECIMALS = "0x313ce567"
 STETH_PER_TOKEN = "0x035faf82"
+TOTAL_SUPPLY = "0x18160ddd"
+
+# Whole-token supply above which a token is a fake-supply "spoof": real tokens top out around 1e18
+# whole tokens (extreme meme coins); impersonation/spoof tokens set totalSupply near max-uint256
+# (~1e58 whole tokens). This threshold sits far above any legitimate supply and far below a spoof's.
+SPOOF_SUPPLY_TOKENS = 10**24
 
 # chain id -> [(symbol, address, decimals, price kind)]
 TOKENS: dict[int, list[tuple[str, str, int, str]]] = {
@@ -176,6 +182,36 @@ def holdings_many(rpc: RPC, chain_id: int, addresses: list[str], chunk: int = 40
             items.sort(key=lambda x: -(x["usd"] or 0))
             out[a] = {"usd": round(total, 2), "items": items, "priced": bool(items)}
     return out
+
+
+def spoof_reason(rpc: RPC, address: str, native_wei: int | None, held: dict | None) -> str | None:
+    """A worthless impersonation/spoof token not worth scanning: holds NO value AND carries the
+    fake astronomical supply that Etherscan flags as 'impersonating well-known cryptocurrencies'.
+
+    Returns a short reason to drop it, or None to let it through. Deliberately conservative:
+      * A contract that holds ANY value (native or priced token) is NEVER dropped - it may be a
+        real target, so it goes to the scanner regardless of supply.
+      * A zero-value contract with a SANE supply is NOT dropped either - a freshly-launched
+        contract that is about to receive funds (the live-scan case) must survive.
+    Only the combination [no value held] + [fake near-max-uint supply] is dropped. Read-only."""
+    if (native_wei or 0) > 0 or (held and held.get("usd")):
+        return None
+    try:
+        raw_hex = _call(rpc, address, TOTAL_SUPPLY)
+        if not raw_hex or raw_hex in ("0x", "0x0"):
+            return None                                   # not an ERC-20 / no supply -> not our call
+        raw = int(raw_hex, 16)
+        dec = int(_call(rpc, address, DECIMALS) or "0x0", 16)
+    except (RPCError, ValueError):
+        return None
+    if raw <= 0:
+        return None
+    if dec > 36:                                          # nonsensical decimals is itself a spoof tell
+        return f"fake-supply spoof token (decimals={dec}, no value held)"
+    whole = raw / 10**dec
+    if whole > SPOOF_SUPPLY_TOKENS:
+        return f"fake-supply spoof token (~{whole:.1e} tokens, no value held)"
+    return None
 
 
 def describe(h: dict | None) -> str:

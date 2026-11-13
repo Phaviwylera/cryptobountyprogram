@@ -22,7 +22,7 @@ from .rpc import RPC, RPCError
 from .scanner import relevant_contracts, scan
 from .sources import (ADDRESS_RE, ExplorerFatal, NotVerified, chain_id_of, fetch_blockscout_source,
                       fetch_verified_source, read_meta)
-from .value import describe as describe_value, holdings as read_holdings
+from .value import describe as describe_value, holdings as read_holdings, spoof_reason
 from .verifier import confirmed_findings, verify_findings
 
 WEI = 10**18
@@ -102,6 +102,15 @@ def process(store, row, cfg: AutoConfig) -> str:
         if too_little:
             store.update(chain, address, status="low_value", balance_wei=None if balance is None else str(balance), **value_fields)
             return "low_value"
+        # Impersonation/spoof tokens (Etherscan "reported for impersonating…"): fake near-max-uint
+        # supply, hold no value, nothing to steal. Drop before the costly source-fetch + fork run.
+        spoof = spoof_reason(cfg.rpc, address, balance, held)
+        if spoof:
+            store.update(chain, address, status="junk", name=None,
+                         balance_wei=None if balance is None else str(balance),
+                         error=spoof, **value_fields)
+            _event(cfg, "found", f"Dropped {short}: {spoof}")
+            return "junk"
     else:
         value_fields = {}
 
@@ -262,6 +271,7 @@ def _describe(status: str, store, chain: str, address: str) -> str:
     if status == "unverified":
         return f"UNVERIFIED - will retry later (attempt {row['attempts']})"
     return {"low_value": f"SKIPPED (balance below threshold){bal}", "no_code": "SKIPPED (no code)",
+            "junk": f"SKIPPED (spoof/impersonation token: {row['error']})",
             "unverified_final": "UNVERIFIED - gave up", "error": f"ERROR {row['error']}"}.get(status, status.upper())
 
 
