@@ -185,6 +185,14 @@ class Store:
             return self.db.execute("SELECT * FROM contracts WHERE status='vulnerable' ORDER BY updated DESC "
                                    "LIMIT ?", (int(limit),)).fetchall()
 
+    def live_vulnerable(self, limit: int = 60) -> list[sqlite3.Row]:
+        """Only LIVE-discovered flagged contracts (origin 'block:<n>', seen at the chain head) - fresh
+        launches, NOT historical backfill rows (which are old regardless of when we last re-scanned them)."""
+        with self._lock:
+            return self.db.execute(
+                "SELECT * FROM contracts WHERE status='vulnerable' AND origin LIKE 'block:%' "
+                "ORDER BY updated DESC LIMIT ?", (int(limit),)).fetchall()
+
     def fund_watch_update(self, chain: str, address: str, wei: int) -> None:
         import time as _t
         now = _t.time()

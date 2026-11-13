@@ -1,2 +1,2 @@
 """bountyscan - find fund-loss bug candidates in Solidity DeFi contracts for responsible disclosure."""
-__version__ = "0.9.30"
+__version__ = "0.9.31"
