@@ -33,6 +33,26 @@ class SenderAdmissionGuard(unittest.TestCase):
         self.assertFalse(sender_admission_guard("x = _c;"))
 
 
+class InitStateGuard(unittest.TestCase):
+    """Phase-4 CFG: set-once initialization guards (not re-callable on a live contract)."""
+
+    def test_setonce_guards_recognised(self):
+        from bountyscan.detectors import init_guarded
+        from types import SimpleNamespace as NS
+        for body in ("require(!initialized); initialized = true; controller = c;",
+                     "require(_initialized == false); x = c;",
+                     "require(slot0.sqrtPriceX96 == 0); init();",
+                     "if (initialized) revert AlreadyInit(); initialized = true;"):
+            self.assertTrue(init_guarded(NS(body=body)), body)
+
+    def test_reentrancy_lock_is_not_an_init_guard(self):
+        from bountyscan.detectors import init_guarded
+        from types import SimpleNamespace as NS
+        # a per-tx reentrancy lock does NOT make an unprotected privileged setter safe
+        self.assertFalse(init_guarded(NS(body="require(!locked); locked = true; controller = c;")))
+        self.assertFalse(init_guarded(NS(body="controller = c;")))
+
+
 class ParserTests(unittest.TestCase):
     def test_parses_contracts_functions_and_state(self):
         sf = parse_source(FIXTURES / "vulnerable" / "VulnerableVault.sol")

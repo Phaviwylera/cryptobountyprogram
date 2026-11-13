@@ -260,8 +260,26 @@ def sender_admission_guard(body: str) -> bool:
     return False
 
 
+# Set-once / initialization STATE guards: the function runs once at init and reverts ever after, so it
+# is not exploitable on a live (already-initialised) contract - the same reasoning as the proxy-initializer
+# suppression. `require(!locked)` is deliberately NOT here: a reentrancy lock restricts WHEN within a tx,
+# not WHO, so it does not make an otherwise-unprotected privileged function safe.
+INIT_GUARD_RE = re.compile(
+    r"require\s*\(\s*!\s*_?initiali[sz]ed\b"
+    r"|require\s*\(\s*_?initiali[sz]ed\s*==\s*false\b"
+    r"|require\s*\([^;]*\bsqrtPriceX96\s*==\s*0\b"                       # uninitialised Uniswap V3 pool slot0
+    r"|if\s*\(\s*_?initiali[sz]ed\s*\)\s*(?:revert|throw|\{\s*(?:revert|throw))",
+    re.I)
+
+
+def init_guarded(fn: Function) -> bool:
+    """A set-once initialization guard - require(!initialized) / require(_initialized == false) /
+    require(slot0.sqrtPriceX96 == 0) - so the function cannot be re-run on a live contract."""
+    return bool(fn.body and INIT_GUARD_RE.search(fn.body))
+
+
 def access_controlled(fn: Function, project: Project) -> bool:
-    """Does the function restrict *who* may call it?"""
+    """Does the function restrict *who* (or, for set-once init, *when*) it may be called?"""
     for m in fn.modifiers:
         if m in project.auth_modifiers or AUTH_MODIFIER_RE.search(m):
             return True
@@ -269,6 +287,8 @@ def access_controlled(fn: Function, project: Project) -> bool:
     if AUTH_BODY_RE.search(body):
         return True
     if sender_admission_guard(body):          # inline `if (msg.sender == owner || msg.sender == dev)`
+        return True
+    if init_guarded(fn):                       # set-once init guard: not re-callable on a live contract
         return True
     if re.search(rf"\bsuper\.{re.escape(fn.name)}\s*\(", body):
         return True  # override delegating to the (checked) parent implementation
