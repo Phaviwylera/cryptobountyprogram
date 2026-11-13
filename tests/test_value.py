@@ -102,6 +102,26 @@ class ValueTests(unittest.TestCase):
         h = value.holdings(FakeRPC(), 999999, "0x" + "33" * 20, 10**18)
         self.assertIsNone(h["usd"])
 
+    def test_watch_targets_includes_confirmed_any_origin_excludes_idle_backfill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Store(Path(tmp) / "w.db")
+            live   = "0x" + "a1" * 20     # fresh live launch
+            conf   = "0x" + "b2" * 20     # payload-confirmed exploit, but from backfill
+            valued = "0x" + "c3" * 20     # backfill, holds value
+            idle   = "0x" + "d4" * 20     # backfill, 0 value, not confirmed -> must be excluded
+            s.enqueue_with("ethereum", live,   "block:1001")
+            s.enqueue_with("ethereum", conf,   "backfill:blockscout")
+            s.enqueue_with("ethereum", valued, "backfill:blockscout")
+            s.enqueue_with("ethereum", idle,   "backfill:blockscout")
+            s.update("ethereum", live,   status="vulnerable")
+            s.update("ethereum", conf,   status="vulnerable", payload_confirmed=1)
+            s.update("ethereum", valued, status="vulnerable", value_usd=5000.0)
+            s.update("ethereum", idle,   status="vulnerable", value_usd=0.0, payload_confirmed=0)
+            got = {r["address"] for r in s.watch_targets(50)}
+            self.assertEqual(got, {live, conf, valued})
+            self.assertNotIn(idle, got)                       # the year-old backfill flood stays hidden
+            s.db.close()
+
     def test_store_migrates_old_database(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as tmp:

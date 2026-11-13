@@ -396,7 +396,7 @@ class Handler(BaseHTTPRequestHandler):
             fw = w.store.fund_watch_map()
             now = _t.time()
             out = []
-            for r in w.store.live_vulnerable(60):     # fresh, live-discovered only (no old backfill rows)
+            for r in w.store.watch_targets(60):     # live launches + confirmed exploits + value-holders + receiving
                 f = fw.get((r["chain"], r["address"]))
                 last_wei = (f["last_wei"] if f else None) or (str(r["balance_wei"]) if r["balance_wei"] else "0")
                 first_wei = int(f["first_wei"] or 0) if f else None

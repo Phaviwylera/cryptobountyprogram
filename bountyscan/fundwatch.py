@@ -54,7 +54,7 @@ class FundWatcher(threading.Thread):
             self._stop.wait(self.interval)
 
     def _tick(self) -> None:
-        for r in self.store.live_vulnerable(self.top):   # watch only fresh, live-discovered contracts
+        for r in self.store.watch_targets(self.top):   # fresh launches + confirmed exploits + value-holders
             if self._stop.is_set():
                 return
             if r["chain"] != self.chain:        # native-balance watch is single-chain for now

@@ -47,11 +47,13 @@ class Store:
             # additive migrations for databases created by older versions
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(contracts)")}
             for name, decl in (("value_usd", "REAL"), ("holdings", "TEXT"), ("value_checked", "REAL"),
-                               ("priority", f"REAL NOT NULL DEFAULT {LIVE_PRIORITY}"), ("txs", "INTEGER")):
+                               ("priority", f"REAL NOT NULL DEFAULT {LIVE_PRIORITY}"), ("txs", "INTEGER"),
+                               ("payload_confirmed", "INTEGER")):
                 if name not in cols:
                     self.db.execute(f"ALTER TABLE contracts ADD COLUMN {name} {decl}")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_due ON contracts(status, priority DESC, next_try)")
             self.db.commit()
+        self.ensure_fund_watch()   # so watch_targets() can always join it, even before the watcher starts
 
     # ---- queue with priority (backfill) -------------------------------------------------
     def enqueue_with(self, chain: str, address: str, origin: str, **fields) -> bool:
@@ -192,6 +194,23 @@ class Store:
             return self.db.execute(
                 "SELECT * FROM contracts WHERE status='vulnerable' AND origin LIKE 'block:%' "
                 "ORDER BY updated DESC LIMIT ?", (int(limit),)).fetchall()
+
+    def watch_targets(self, limit: int = 60) -> list[sqlite3.Row]:
+        """Every flagged contract worth watching for incoming funds, REGARDLESS of how it was found:
+          * live-discovered fresh launches (origin 'block:*'),
+          * payload-CONFIRMED exploits (a real drain proven on a fork) - the ones that most deserve a
+            live watch even if they came from backfill or a bounty scope,
+          * value-holders (already hold USD), and
+          * anything already seen receiving funds (fund_watch inflows>0).
+        Deliberately EXCLUDES idle old backfill rows (not live, not confirmed, no value, never received),
+        so a year-old re-scanned contract never floods the watch/Live page. Ordered value first."""
+        with self._lock:
+            return self.db.execute(
+                "SELECT * FROM contracts WHERE status='vulnerable' AND ("
+                "    origin LIKE 'block:%' OR payload_confirmed = 1 "
+                "    OR (value_usd IS NOT NULL AND value_usd > 0) "
+                "    OR address IN (SELECT address FROM fund_watch WHERE inflows > 0)"
+                ") ORDER BY (value_usd IS NULL), value_usd DESC, updated DESC LIMIT ?", (int(limit),)).fetchall()
 
     def fund_watch_update(self, chain: str, address: str, wei: int) -> None:
         import time as _t

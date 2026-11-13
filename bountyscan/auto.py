@@ -171,6 +171,7 @@ def process(store, row, cfg: AutoConfig) -> str:
     # A payload that reverts or moves no funds/state is NOT a finding and is dropped here.
     payloads = None
     payload_note = ""
+    payload_confirmed = False
     if theft and cfg.forge_verify and cfg.rpc is not None:
         from .forge_verify import forge_available, run_payloads
         if forge_available():
@@ -190,6 +191,7 @@ def process(store, row, cfg: AutoConfig) -> str:
                     _log(cfg, f"    payload attack disproved {dropped} finding(s) (reverted / no funds moved)")
                 payload_note = f" ({dropped} disproved by payload attack)" if dropped else ""
                 theft = kept
+                payload_confirmed = conf > 0
                 if conf:
                     _log(cfg, f"    payload attack CONFIRMED {conf} finding(s)")
             except Exception as exc:
@@ -213,7 +215,8 @@ def process(store, row, cfg: AutoConfig) -> str:
                                    verdicts=verdicts, holdings=held, payloads=payloads)
     worst = min(theft, key=lambda f: SEVERITY_RANK[f.severity]).severity
     store.update(chain, address, status="vulnerable", name=name, findings=len(theft), max_severity=worst,
-                 balance_wei=None if balance is None else str(balance), report=str(report), error=None, **value_fields)
+                 balance_wei=None if balance is None else str(balance), report=str(report), error=None,
+                 payload_confirmed=1 if payload_confirmed else 0, **value_fields)
     return "vulnerable"
 
 
