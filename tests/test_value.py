@@ -142,6 +142,29 @@ class ValueTests(unittest.TestCase):
             self.assertNotIn(idle, got)                      # idle value-holder stays off the fresh page
             s.db.close()
 
+    def test_risk_tier_split_confirmed_vs_review(self):
+        # RISK = fork-confirmed only; latent flags go to the review pile, never shown as RISK.
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Store(Path(tmp) / "r.db")
+            conf = "0x" + "c1" * 20   # fork-proven theft
+            lat1 = "0x" + "11" * 20   # flagged, fork could not prove -> review
+            lat2 = "0x" + "22" * 20   # flagged, payload_confirmed left NULL -> review
+            for a in (conf, lat1, lat2):
+                s.enqueue_with("ethereum", a, "backfill:x")
+            s.update("ethereum", conf, status="vulnerable", payload_confirmed=1, value_usd=500.0)
+            s.update("ethereum", lat1, status="vulnerable", payload_confirmed=0, value_usd=9000.0)
+            s.update("ethereum", lat2, status="vulnerable", value_usd=7000.0)  # payload_confirmed stays NULL
+            c = s.counts()
+            self.assertEqual(c["vulnerable"], 3)
+            self.assertEqual(c["confirmed"], 1)       # only the fork-proven one
+            self.assertEqual(c["review"], 2)          # both latent, NULL counts as unconfirmed
+            vs = s.value_stats()
+            self.assertEqual(vs["confirmed_usd"], 500.0)     # AT RISK shows only proven value
+            self.assertEqual(vs["vulnerable_usd"], 16500.0)  # all flagged, incl. latent
+            self.assertEqual({r["address"] for r in s.flagged(confirmed=True)}, {conf})
+            self.assertEqual({r["address"] for r in s.flagged(confirmed=False)}, {lat1, lat2})
+            s.db.close()
+
     def test_store_migrates_old_database(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as tmp:

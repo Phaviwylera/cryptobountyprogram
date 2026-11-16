@@ -101,7 +101,10 @@ class AutoModeTests(unittest.TestCase):
         with mock.patch.object(auto, "fetch_blockscout_source", fake_fetch), \
                 mock.patch.object(auto, "fetch_verified_source", fake_fetch):
             run_queue(self.store, self.cfg)
-        self.assertEqual(self.store.counts(), {"unverified_final": 1})
+        c = self.store.counts()
+        self.assertEqual(c.get("unverified_final"), 1)
+        self.assertNotIn("vulnerable", c)           # nothing flagged; confirmed/review are the tier split only
+        self.assertEqual(c.get("confirmed", 0), 0)
 
     def test_unverified_gives_up_after_max_attempts(self):
         self.cfg.max_attempts = 2
@@ -109,7 +112,9 @@ class AutoModeTests(unittest.TestCase):
         with mock.patch.object(auto, "fetch_verified_source", fake_fetch):
             run_queue(self.store, self.cfg)
             run_queue(self.store, self.cfg)
-        self.assertEqual(self.store.counts(), {"unverified_final": 1})
+        c = self.store.counts()
+        self.assertEqual(c.get("unverified_final"), 1)
+        self.assertEqual(c.get("confirmed", 0), 0)
 
     def test_requeue_vulnerable_for_rejudging(self):
         self.store.enqueue("ethereum", VULN, "test")

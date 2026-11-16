@@ -245,7 +245,7 @@ INDEX_HTML = r"""<!doctype html>
 
 <section class="findings" id="findings">
   <div class="fh"><h2>FINDINGS</h2>
-    <span class="ftab on" data-t="results">vulnerable</span><span class="ftab" data-t="safe">safe</span><span class="ftab" data-t="errors">errors</span>
+    <span class="ftab on" data-t="results">confirmed</span><span class="ftab" data-t="review">review · unconfirmed</span><span class="ftab" data-t="safe">safe</span><span class="ftab" data-t="errors">errors</span>
     <label id="hideEmptyWrap" style="margin-left:auto;color:var(--dim);font-size:11px;display:flex;align-items:center;gap:5px;cursor:pointer" title="Hide contracts that currently hold no priced value (nothing to steal right now)"><input type="checkbox" id="hideEmpty" checked style="accent-color:var(--teal)">hide holds-nothing</label>
     <a class="cmd" href="/live" target="_blank" style="--c:var(--violet);text-decoration:none" title="Open the live threat-watch page: fresh deployments, scanned in their first hours, watched for incoming funds">⚡ LIVE THREAT WATCH</a>
     <button class="cmd" id="btnDownload" style="--c:var(--teal)" title="Download every confirmed threat's full report as one text document">⬇ DOWNLOAD ALL REPORTS</button>
@@ -681,7 +681,7 @@ function updateChrome(s){
   const total = Object.values(c).reduce((a,b)=>a+b,0);
   $('#tFound').textContent = total; $('#tScanned').textContent = (c.safe||0)+(c.vulnerable||0);
   $('#tSafe').textContent = c.safe||0; $('#tVuln').textContent = c.vulnerable||0; $('#tWait').textContent = c.unverified||0;
-  const vs = s.value || {}; $('#tValue').textContent = usd(vs.seen_usd || 0); $('#tRisk').textContent = usd(vs.vulnerable_usd || 0);
+  const vs = s.value || {}; $('#tValue').textContent = usd(vs.seen_usd || 0); $('#tRisk').textContent = usd(vs.confirmed_usd || 0);
   if (s.mode === 'idle') $('#tT').textContent = '0.00';
   document.querySelectorAll('.tab').forEach((t,i)=>{ const k = t.dataset.k, ai = PHI[phase];
     t.className = 'tab ' + (s.mode === 'idle' ? 'future' : i === ai ? 'on' : i < ai ? 'past' : 'future');
@@ -748,7 +748,7 @@ function updateHud(s){
     <div class="tr"><i style="width:${total ? Math.max(v ? 3 : 0, 100*v/total) : 0}%;background:${col}"></i></div></div>`).join('');
   // RADAR bars
   const dets = META.detectors.length || 27;
-  $('#hRadarBars').innerHTML = [['detectors', dets, dets], ['confirmed', c.vulnerable||0, Math.max(1,(c.safe||0)+(c.vulnerable||0))], ['held back', safeHeld, Math.max(1,c.safe||0)]]
+  $('#hRadarBars').innerHTML = [['detectors', dets, dets], ['confirmed', c.confirmed||0, Math.max(1,(c.safe||0)+(c.vulnerable||0))], ['held back', safeHeld, Math.max(1,c.safe||0)]]
     .map(([n,v,m]) => `<div><span>${n}</span><i style="width:${Math.min(100, 8 + 70*v/m)}px"></i><b>${v}</b></div>`).join('');
   // HEAT
   const heat = [['FND', total, '#e8ecf2'], ['SCN', (c.safe||0)+(c.vulnerable||0), '#3fb8e6'], ['CLR', c.safe||0, '#4fd1b5'], ['VLN', c.vulnerable||0, '#ff5c8a'],
@@ -763,7 +763,7 @@ function updateHud(s){
     .map(([k,v,col]) => `<div><span>${k}</span><b style="color:${col}">${v}</b></div>`).join('');
   // GAUGE
   const sc = (c.safe||0) + (c.vulnerable||0); gaugeVal = sc ? 100*(c.safe||0)/sc : 0;
-  $('#hFlags').textContent = `flags to verify · ${c.vulnerable||0}`;
+  $('#hFlags').textContent = `unconfirmed · review · ${c.review||0}`;
   // PAYLOAD ATTACK
   const pay = s.payload || {counts:{}, running:0, forge:false};
   const pc = pay.counts || {};
@@ -803,11 +803,11 @@ function drawCode(s){
 
 /* ---------------- findings table ---------------- */
 async function loadTable(){
-  const ep = ftab === 'results' ? '/api/results' : ftab === 'safe' ? '/api/safe' : '/api/errors';
+  const ep = ftab === 'results' ? '/api/results' : ftab === 'review' ? '/api/review' : ftab === 'safe' ? '/api/safe' : '/api/errors';
   const d = await api(ep).catch(()=>({})); let rows = d[ftab] || [];
   if (ftab === 'safe') safeHeld = rows.filter(r => (r.error||'').includes('not confirmed')).length;
   const w = $('#fTable');
-  if (!rows.length){ w.innerHTML = `<div class="empty">${ftab==='results' ? 'no confirmed vulnerabilities yet · the crawler keeps going' : 'nothing here yet'}</div>`; return; }
+  if (!rows.length){ w.innerHTML = `<div class="empty">${ftab==='results' ? 'no fork-confirmed theft yet · only proven drains appear here' : ftab==='review' ? 'no unconfirmed candidates' : 'nothing here yet'}</div>`; return; }
   rows.sort((a,b) => (b.value_usd||0) - (a.value_usd||0));
   const valCell = r => `<td style="color:${(r.value_usd||0) >= 1000 ? 'var(--yellow)' : 'var(--dim)'}">${usd(r.value_usd)}</td><td style="color:var(--dim)">${esc(holdTxt(r.holdings)) || (r.value_usd === 0 ? 'holds nothing' : '-')}</td>`;
   // On the vulnerable tab, hide contracts that currently hold no priced value (nothing to steal right
@@ -817,7 +817,7 @@ async function loadTable(){
     hiddenEmpty = rows.filter(r => (r.value_usd||0) <= 0).length;
     rows = rows.filter(r => (r.value_usd||0) > 0);
   }
-  if (ftab === 'results'){
+  if (ftab === 'results' || ftab === 'review'){
     if (!rows.length){ w.innerHTML = `<div class="empty">${hiddenEmpty ? hiddenEmpty+' flagged contract(s) hidden · they hold no priced value · untick “hide holds-nothing” to see them' : 'no confirmed vulnerabilities with value yet · the crawler keeps going'}</div>`;
       $('#fNote').textContent = hiddenEmpty ? hiddenEmpty+' empty hidden' : ''; return; }
     w.innerHTML = `<table><thead><tr><th>severity</th><th>findings</th><th>value held</th><th>holdings</th><th>chain</th><th>address</th><th>contract</th></tr></thead><tbody>` +
@@ -829,7 +829,9 @@ async function loadTable(){
       rows.map(r => `<tr>${valCell(r)}<td>${esc(r.chain)}</td><td>${esc(r.address)}</td><td>${esc(r.name||'')}</td><td style="color:var(--dim)">${esc(r.error||'clear')}</td></tr>`).join('') + '</tbody></table>';
   }
   $('#fNote').textContent = ftab === 'results'
-    ? 'confirmed · sorted by value held · re-checked every 10 min' + (hiddenEmpty ? ` · ${hiddenEmpty} empty hidden` : '')
+    ? 'fork-confirmed theft · sorted by value held · re-checked every 10 min' + (hiddenEmpty ? ` · ${hiddenEmpty} empty hidden` : '')
+    : ftab === 'review'
+    ? 'unconfirmed candidates · flagged by static+verify, fork could not prove a drain · hand-review before reporting'
     : 'value = native coin + major tokens, priced by Chainlink';
 }
 async function openReport(chain, addr){
@@ -927,8 +929,8 @@ requestAnimationFrame(render);
     const s = (typeof S!=='undefined' && S) || {}; const c = s.counts||{}, p=s.payload||{}, pc=p.counts||{};
     const scanned=(c.safe||0)+(c.vulnerable||0);
     return {INGEST:(c.queued||0), SOURCE:scanned+(c.unverified||0), STATIC:(pc.total||0),
-            VERIFY:scanned, PAYLOAD:(pc.total||0), VERDICT:(c.vulnerable||0),
-            safe:(c.safe||0), vuln:(c.vulnerable||0), running:(p.running||0)};
+            VERIFY:scanned, PAYLOAD:(pc.total||0), VERDICT:(c.confirmed||0),
+            safe:(c.safe||0), vuln:(c.confirmed||0), review:(c.review||0), running:(p.running||0)};
   }
   const fmt = n => n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n|0);
   function spawn(){
@@ -966,6 +968,7 @@ requestAnimationFrame(render);
     ctx.textAlign='left'; ctx.font='700 10px ui-monospace,monospace';
     ctx.fillStyle='#4fd1b5'; ctx.fillText('✓ SAFE '+fmt(ct.safe), vx+12, yMid-H*0.26+3);
     ctx.fillStyle='#ff5c8a'; ctx.fillText('⚑ RISK '+fmt(ct.vuln), vx+12, yMid+H*0.26+3);
+    ctx.fillStyle='#6b7a8a'; ctx.font='600 9px ui-monospace,monospace'; ctx.fillText('⋯ review '+fmt(ct.review||0), vx+12, yMid+H*0.26+16);
     if(ct.running>0){ ctx.textAlign='center'; ctx.fillStyle='#9a7cff'; ctx.font='700 9px ui-monospace,monospace'; ctx.fillText('⚔ '+ct.running+' firing', xs[4], yMid+H*0.34); }
     requestAnimationFrame(draw);
   }

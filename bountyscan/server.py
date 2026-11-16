@@ -6,7 +6,8 @@ fund-theft finding lands on the Results page with a full report.
 
 Endpoints (JSON):
   GET  /api/status            -> queue counts, worker state, current target
-  GET  /api/results           -> confirmed-vulnerable contracts (summary rows)
+  GET  /api/results           -> fork-CONFIRMED theft (summary rows) - the only RISK tier
+  GET  /api/review            -> latent candidates: flagged but the fork could not prove a drain
   GET  /api/result?chain&addr -> one contract's full report (markdown + findings)
   GET  /api/safe              -> recently cleared contracts
   POST /api/live/start        -> begin 24/7 live discovery+scan (body: {chain, from_block?, min_balance?})
@@ -417,7 +418,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"version": __version__,
                                     "detectors": [{"id": d.id, "severity": d.severity, "title": d.title} for d in DETECTORS]})
         if u.path == "/api/results":
-            return self._send(200, {"results": [self._row(r) for r in w.store.by_status("vulnerable")]})
+            # RISK list = fork-CONFIRMED theft only (near-zero FP). Latent candidates live under /api/review.
+            return self._send(200, {"results": [self._row(r) for r in w.store.flagged(confirmed=True)]})
+        if u.path == "/api/review":
+            # The latent review pile: flagged by static+verify but the fork could not prove a drain.
+            return self._send(200, {"review": [self._row(r) for r in w.store.flagged(confirmed=False, limit=500)]})
         if u.path in ("/api/report/all.txt", "/download/reports.txt"):
             import time as _t
             fn = f"bountyscan_threats_{_t.strftime('%Y%m%d')}.txt"

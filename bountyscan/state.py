@@ -156,20 +156,41 @@ class Store:
 
     def counts(self) -> dict[str, int]:
         with self._lock:
-            return {r[0]: r[1] for r in self.db.execute("SELECT status, COUNT(*) FROM contracts GROUP BY status")}
+            d = {r[0]: r[1] for r in self.db.execute("SELECT status, COUNT(*) FROM contracts GROUP BY status")}
+            conf = self.db.execute(
+                "SELECT COUNT(*) FROM contracts WHERE status='vulnerable' AND payload_confirmed=1").fetchone()[0]
+        # Split the flagged pile by evidence tier so the UI never presents an unproven candidate as RISK:
+        #   'confirmed' = fork-PROVEN theft (payload_confirmed=1) - the only tier surfaced as RISK (near-zero FP).
+        #   'review'    = flagged by static+verify but the fork could NOT prove a drain (latent, hand-review).
+        d["confirmed"] = conf
+        d["review"] = max(0, d.get("vulnerable", 0) - conf)
+        return d
 
     def by_status(self, status: str) -> list[sqlite3.Row]:
         with self._lock:
             return self.db.execute("SELECT * FROM contracts WHERE status = ? ORDER BY updated DESC", (status,)).fetchall()
 
+    def flagged(self, confirmed: bool, limit: int | None = None) -> list[sqlite3.Row]:
+        """Flagged contracts split by evidence tier. confirmed=True -> fork-PROVEN theft
+        (payload_confirmed=1), the only tier shown as RISK. confirmed=False -> the latent REVIEW
+        pile (flagged by static+verify, but the fork could not prove a drain). Ordered value first."""
+        cond = "payload_confirmed=1" if confirmed else "(payload_confirmed IS NULL OR payload_confirmed=0)"
+        q = ("SELECT * FROM contracts WHERE status='vulnerable' AND " + cond +
+             " ORDER BY (value_usd IS NULL), value_usd DESC, updated DESC")
+        with self._lock:
+            return self.db.execute(q + (f" LIMIT {int(limit)}" if limit else "")).fetchall()
+
     def value_stats(self) -> dict:
-        """USD held by scanned contracts, and by the vulnerable ones (only rows with a known value)."""
+        """USD held by scanned contracts, by the flagged ones, and by the fork-CONFIRMED ones."""
         with self._lock:
             seen, priced = self.db.execute(
                 "SELECT COALESCE(SUM(value_usd),0), COUNT(value_usd) FROM contracts WHERE status IN ('safe','vulnerable')").fetchone()
             vuln = self.db.execute("SELECT COALESCE(SUM(value_usd),0) FROM contracts WHERE status='vulnerable'").fetchone()[0]
+            conf = self.db.execute(
+                "SELECT COALESCE(SUM(value_usd),0) FROM contracts WHERE status='vulnerable' AND payload_confirmed=1").fetchone()[0]
             top = self.db.execute("SELECT COALESCE(MAX(value_usd),0) FROM contracts WHERE status IN ('safe','vulnerable')").fetchone()[0]
-        return {"seen_usd": seen, "priced": priced, "vulnerable_usd": vuln, "max_usd": top}
+        # vulnerable_usd = all flagged (incl. latent); confirmed_usd = fork-proven only (what 'AT RISK' shows).
+        return {"seen_usd": seen, "priced": priced, "vulnerable_usd": vuln, "confirmed_usd": conf, "max_usd": top}
 
     def fetch_one(self, chain: str, address: str) -> sqlite3.Row | None:
         with self._lock:
