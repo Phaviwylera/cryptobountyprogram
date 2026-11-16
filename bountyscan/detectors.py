@@ -472,6 +472,28 @@ def is_immutable(contract, ident: str) -> bool:
                           rf"|\b{re.escape(ident)}\b[^;]*\b(?:immutable|constant)\b", contract.text))
 
 
+# A call/relay authorized by a cryptographic proof the attacker cannot forge: a merkle / withdraw-trie
+# proof, a bridge VAA/VM, or a signature. The call's target+calldata are then COMMITTED data (a message
+# finalized on another domain), not open caller input - so an "arbitrary call" behind such a gate is a
+# guarded bridge/mailbox relay (Scroll L1Mailbox's verifyMerkleProof, Wormhole's parseAndVerifyVM), NOT
+# the open LiFi/Socket forwarder this detector hunts (those forward raw calldata with no such gate).
+PROOF_GATE_RE = re.compile(
+    r"verifyMerkleProof|MerkleProof|verifyProof|verify\w*Proof|parseAndVerifyVM|verifyVM\b|verifyVAA"
+    r"|\.verify\s*\(|ecrecover\s*\(|\.recover\s*\(|SignatureChecker|isValidSignature", re.I)
+
+
+def is_erc20_token(contract, project: Project) -> bool:
+    """The contract is itself an ERC-20/4626 token (inherits an ERC20 base, or defines the
+    approve + allowance surface). A token's OWN `transferFrom(from, ...)` spends msg.sender's
+    allowance by construction - so a `super`/`this` transferFrom with a caller-chosen `from` is
+    standard ERC-20, not a contract forwarding an approval it holds over an EXTERNAL token
+    (the Transit/Sushi router drain, where the contract is a SPENDER of other tokens, not a token)."""
+    if any(re.search(r"\bERC20\b|ERC20\w*|ERC777|ERC4626", i) for i in contract.inherits):
+        return True
+    fam = family_text(contract, project)
+    return bool(re.search(r"function\s+approve\s*\(", fam) and re.search(r"function\s+allowance\s*\(", fam))
+
+
 PAYOUT_RE = re.compile(
     r"payable\s*\(\s*(\w+)\s*\)\s*\.\s*(?:transfer|send|call)\b"     # payable(x).transfer(...)
     r"|(\w+)\s*\.\s*call\s*\{\s*value"                              # x.call{value: ...}
@@ -1028,6 +1050,13 @@ def _arbitrary_call(project: Project):
         # Governance executors forward proposal-approved targets/calldata; they are gated by a vote, not open.
         if GOVERNANCE_GATE_RE.search(eff):
             continue
+        # Authorized by a cryptographic proof (merkle/withdraw-trie proof, bridge VAA, signature): the
+        # target+calldata are committed data the attacker cannot forge - a guarded bridge/mailbox relay
+        # (Scroll L1Mailbox, Wormhole), not the open LiFi/Socket forwarder. Replay of the proof is the
+        # signature-replay detector's job, not this one's. Check the RAW body too: the inliner
+        # substitutes a `verifyMerkleProof(...)` helper's body in, erasing the call token from `eff`.
+        if PROOF_GATE_RE.search(body) or PROOF_GATE_RE.search(eff):
+            continue
         # bytes params of this fn, plus bytes fields of any struct/array calldata param (V11 LiFi shape).
         bytes_params = fn.params_of_type("bytes")
         calldata_params = {p.name for p in fn.params if p.name}
@@ -1081,7 +1110,15 @@ def _arbitrary_transferfrom(project: Project):
                 continue
             # Method form `token.(safe)transferFrom(from, to, amount/id)` - `from` is the first arg.
             src = root_identifier(args[0])
-            if src in addr_params and not re.search(r"permit|_spendAllowance|allowance|ecrecover|\.recover\s*\(|SignatureChecker|isValidSignature|_useNonce|_isApprovedOrOwner|_isAuthorized|getApproved|ownerOf", body, re.I):
+            if src not in addr_params:
+                continue
+            # `super.`/`this.` transferFrom on the contract's OWN token (the contract IS an ERC-20) spends
+            # msg.sender's allowance - standard ERC-20, not a forwarder draining an approval it holds over
+            # an EXTERNAL token. An external token receiver (`IERC20(token).transferFrom`) is still flagged.
+            recv = root_identifier(expression_before(body, m.start()))
+            if recv in ("super", "this") and is_erc20_token(fn.contract, project):
+                continue
+            if not re.search(r"permit|_spendAllowance|allowance|ecrecover|\.recover\s*\(|SignatureChecker|isValidSignature|_useNonce|_isApprovedOrOwner|_isAuthorized|getApproved|ownerOf", body, re.I):
                 yield Hit(fn, fn.offset, f"`{fn.name}` calls {m.group(1)} with caller-chosen `from` = `{src}`, so anyone can move a victim's approved tokens.", absolute=True)
                 break
 
@@ -1143,6 +1180,11 @@ def _cross_function_reentrancy(project: Project):
                 value_out = re.compile(r"\.call\s*\{|\.transfer\s*\(|\.send\s*\(|\.safeTransfer\s*\(|payable\s*\(|sendValue\s*\(")
                 for other in entry:
                     if other is fn or any(REENTRANCY_GUARD_RE.search(m) for m in other.modifiers):
+                        continue
+                    # The attacker can only drive the cross-function path through a function they can CALL.
+                    # A role-gated mutator (withdrawer-only `withdrawDepositFee`, onlyOwner) is unreachable,
+                    # so re-entering it is impossible - not a cross-function reentrancy vector.
+                    if is_role_controlled(other, project):
                         continue
                     ob = other.body or ""
                     # The other function must itself be an extraction path (moves value out); a pure

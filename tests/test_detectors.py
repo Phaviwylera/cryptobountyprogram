@@ -143,6 +143,72 @@ class SafeFixtureTests(unittest.TestCase):
                          "hardened fixtures must stay clean (incl. ERC1363 transferAndCall / verified uniswapV2Call)")
 
 
+class PrecisionSuppressionTests(unittest.TestCase):
+    """The three FP classes confirmed on live contracts are suppressed, while the REAL shape each one
+    mimics still fires (no true positive lost). Each test scopes its assertion to one detector so
+    unrelated detectors don't interfere."""
+
+    def _dets(self, src: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "C.sol").write_text(src, encoding="utf-8")
+            return {f.detector for f in scan([Path(tmp)], min_severity="info").findings}
+
+    def test_proof_gated_relay_not_flagged_but_open_forwarder_is(self):
+        gated = """pragma solidity ^0.8.20;
+contract Bridge {
+    bytes32 public root;
+    function relayMsgWithProof(address target, bytes calldata data, bytes calldata proof) external {
+        require(verifyMerkleProof(root, keccak256(data), proof), "Invalid proof");
+        (bool ok,) = target.call(data);
+        require(ok, "RelayMsg Failed");
+    }
+    function verifyMerkleProof(bytes32 r, bytes32 l, bytes calldata p) internal pure returns (bool) { return p.length > 0; }
+}"""
+        self.assertNotIn("arbitrary-external-call", self._dets(gated))      # merkle-gated bridge relay (L1Mailbox/Wormhole shape)
+        open_fwd = """pragma solidity ^0.8.20;
+contract Router {
+    function execute(address target, bytes calldata data) external {
+        (bool ok,) = target.call(data); require(ok);
+    }
+}"""
+        self.assertIn("arbitrary-external-call", self._dets(open_fwd))       # the real LiFi/Socket open forwarder still fires
+
+    def test_token_own_transferfrom_not_flagged_but_router_is(self):
+        token = """pragma solidity ^0.8.20;
+contract MyToken is ERC20Upgradeable {
+    function transferFromWithUpdatePrice(address from, address to, uint256 v, bytes[] calldata u) public returns (bool) {
+        return super.transferFrom(from, to, v);
+    }
+}"""
+        self.assertNotIn("arbitrary-transferfrom", self._dets(token))        # token's own allowance-spending transferFrom (Cashiva shape)
+        router = """pragma solidity ^0.8.20;
+interface IERC20 { function transferFrom(address,address,uint256) external returns (bool); }
+contract Router {
+    function pull(address token, address from, address to, uint256 v) external {
+        IERC20(token).transferFrom(from, to, v);
+    }
+}"""
+        self.assertIn("arbitrary-transferfrom", self._dets(router))          # the real approved-spender drain still fires
+
+    def test_cross_function_reentrancy_skips_role_gated_other(self):
+        src = """pragma solidity ^0.8.20;
+contract Mailbox {
+    mapping(address => uint256) public feeBalance;
+    address public withdrawer;
+    modifier onlyWithdrawer() { require(msg.sender == withdrawer, "Only callable by the withdrawer"); _; }
+    function sendMsg(address target, uint256 v) external {
+        (bool ok,) = target.call{value: v}("");
+        require(ok);
+        feeBalance[msg.sender] -= v;
+    }
+    function withdrawDepositFee(address to, uint256 v) external onlyWithdrawer {
+        feeBalance[address(this)] -= v;
+        payable(to).transfer(v);
+    }
+}"""
+        self.assertNotIn("cross-function-reentrancy", self._dets(src))       # the only shared-state mutator is withdrawer-only
+
+
 class ReportAndCliTests(unittest.TestCase):
     def test_reports_written(self):
         result = scan([FIXTURES / "vulnerable"])
