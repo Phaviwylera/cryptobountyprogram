@@ -52,6 +52,23 @@ class BuildExploit(unittest.TestCase):
     def test_non_auto_type_returns_none(self):
         self.assertIsNone(build_exploit(_finding("signature-replay"), _fn("claim", [("bytes", "sig")]), "0x0"))
 
+    def test_every_critical_faces_the_fork(self):
+        # arbitrary-transferfrom is NOT in AUTO_VERIFIABLE, but as a CRITICAL it must still get a fork probe.
+        f = types.SimpleNamespace(detector="arbitrary-transferfrom", function="transferFrom",
+                                  contract="C", severity="critical")
+        t = build_exploit(f, _fn("transferFrom", [("address", "from"), ("address", "to"), ("uint256", "amount")]),
+                          "0x" + "ab" * 20)
+        self.assertIsNotNone(t)                                          # it faces the fork, not parked
+        # `from` -> TARGET (drain the contract's OWN tokens), `to` -> attacker, amount nonzero
+        self.assertIn('abi.encodeWithSignature("transferFrom(address,address,uint256)", TARGET, attacker, 1000000000000000000)', t)
+        self.assertIn("TARGET_TOK_DELTA", t)                            # 200% differential measured
+
+    def test_noncritical_nonauto_stays_manual(self):
+        # a non-critical, non-auto detector must NOT get a noisy generic probe
+        f = types.SimpleNamespace(detector="missing-slippage-protection", function="swap",
+                                  contract="C", severity="high")
+        self.assertIsNone(build_exploit(f, _fn("swap", [("uint256", "amt")]), "0x0"))
+
     def test_struct_param_not_encodable(self):
         self.assertIsNone(build_exploit(_finding("unprotected-privileged-function"),
                                         _fn("exec", [("MyStruct", "s")]), "0x0"))

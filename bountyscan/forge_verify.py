@@ -7,9 +7,14 @@ a finding and is dropped. Nothing is ever broadcast - every call runs inside the
 
 Scope, honestly: the payload is auto-generated for the classes where a generic attempt is decisive -
 unprotected privileged functions (does an unauthorized call revert?), selfdestruct (does the contract
-actually die / pay the attacker?), free mint, caller-chosen withdrawal, burn-from. Multi-step exploits
-(reentrancy, signature replay) can't be proven by a generic payload, so they are marked
-`manual` rather than falsely auto-confirmed.
+actually die / pay the attacker?), free mint, caller-chosen withdrawal, burn-from. In addition, EVERY
+critical-severity finding now also gets a generic drain probe (route `from`-> TARGET to move the
+contract's OWN assets, `to`-> attacker, a large amount) so that no critical is parked unexamined -
+arbitrary-transferfrom / arbitrary-call / arbitrary-approval included. The probe CONFIRMS only on a real
+200% differential (the target actually loses funds and the wallet gains them); a revert is a FALSE
+POSITIVE (the guard holds) and no movement stays `manual`. Multi-step exploits that genuinely need an
+attacker contract or a victim's live approval (reentrancy, cross-function reentrancy) still come back
+`manual` rather than being falsely auto-confirmed - nothing is ever fabricated.
 """
 from __future__ import annotations
 
@@ -200,13 +205,26 @@ def _encodable(fn: Function) -> bool:
     return True
 
 
-def _arg_for(ptype: str, *, amount: bool) -> str:
-    """An attacker-favourable literal for a parameter: attacker address, a nonzero amount where it
-    helps (mint/withdraw), empty bytes/strings, zero otherwise."""
+# Param-name roles for the generic drain probe. A `from`/source address is routed to TARGET so the probe
+# tries to move the CONTRACT's OWN assets (real balance, nothing fabricated); a `to`/recipient address is
+# routed to the attacker (where stolen funds must land). This lets the generic probe prove an
+# arbitrary-transferfrom / arbitrary-call SELF-drain, while a normal token reverts (no allowance) -> FP.
+_SRC_NAME_RE = re.compile(r"from|src|sender|owner|holder|account|victim|payer|spender", re.I)
+_DST_NAME_RE = re.compile(r"\bto\b|dst|dest|recipient|receiver|beneficiary|wallet", re.I)
+
+
+def _arg_for(ptype: str, *, amount: bool, pname: str = "") -> str:
+    """An attacker-favourable literal for a parameter: attacker address (or TARGET for a `from`/source
+    param, to drain the contract's own assets), a nonzero amount where it helps (mint/withdraw/transfer),
+    empty bytes/strings, zero otherwise."""
     t = re.sub(r"\b(memory|calldata|storage|payable)\b", "", ptype).strip()
     if t.endswith("[]"):
         return "new " + t.replace("uint ", "uint256 ").replace("int ", "int256 ") + "(0)"
     if t == "address":
+        if _DST_NAME_RE.search(pname or ""):
+            return "attacker"
+        if _SRC_NAME_RE.search(pname or ""):
+            return "TARGET"          # move the CONTRACT's own assets out (sound: its real balance)
         return "attacker"
     if t == "bool":
         return "false"
@@ -227,7 +245,7 @@ def _args(fn: Function, *, amount_param_hint: bool) -> str:
         t = re.sub(r"\b(memory|calldata|storage|payable)\b", "", p.type).strip()
         is_amount = amount_param_hint and re.fullmatch(r"u?int\d*", {"uint": "uint256", "int": "int256"}.get(t, t) or "") \
             and re.search(r"amount|amt|value|shares|qty|quantity|wad|tokens?", p.name or "", re.I)
-        out.append(_arg_for(p.type, amount=bool(is_amount)))
+        out.append(_arg_for(p.type, amount=bool(is_amount), pname=p.name or ""))
     return ", ".join(out)
 
 
@@ -249,9 +267,12 @@ _FOOTER = "    }\n}\n"
 
 
 def build_exploit(finding, fn: Function, target: str, wallet: str = ATTACKER_WALLET) -> str | None:
-    """Full Exploit.t.sol for an auto-verifiable finding, or None if it must be verified manually."""
+    """Full Exploit.t.sol for an auto-verifiable finding OR any CRITICAL finding (so every critical faces
+    the fork), or None if the function can't be ABI-encoded (then it is held manual). A non-critical,
+    non-auto-verifiable detector still returns None - its generic probe would be noise."""
     det = finding.detector
-    if det not in AUTO_VERIFIABLE or fn is None or not _encodable(fn):
+    critical = str(getattr(finding, "severity", "") or "") == "critical"
+    if (det not in AUTO_VERIFIABLE and not critical) or fn is None or not _encodable(fn):
         return None
     sig = canonical_sig(fn)
     body = _HEADER.format(target=_addr_literal(target), attacker=_addr_literal(wallet))
