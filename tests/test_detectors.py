@@ -190,6 +190,58 @@ contract Router {
 }"""
         self.assertIn("arbitrary-transferfrom", self._dets(router))          # the real approved-spender drain still fires
 
+    def test_safeerc20_library_form_reads_from_at_arg1(self):
+        # SafeERC20.safeTransferFrom(IERC20(token), msg.sender, to, amt): `from` is arg1 (msg.sender), not
+        # arg0 (the token param) - the Wormhole _transferTokens shape. Must NOT be flagged.
+        wormhole = """pragma solidity ^0.8.20;
+library SafeERC20 { function safeTransferFrom(IERC20 t, address f, address to, uint256 v) internal {} }
+interface IERC20 {}
+contract Bridge {
+    function transferTokens(address token, uint256 amount) external {
+        SafeERC20.safeTransferFrom(IERC20(token), msg.sender, address(this), amount);
+    }
+}"""
+        self.assertNotIn("arbitrary-transferfrom", self._dets(wormhole))
+        # but the library form with a caller-chosen victim as `from` (arg1) IS still a real drain
+        drain = """pragma solidity ^0.8.20;
+library SafeERC20 { function safeTransferFrom(IERC20 t, address f, address to, uint256 v) internal {} }
+interface IERC20 {}
+contract Router {
+    function pull(address token, address victim, uint256 amount) external {
+        SafeERC20.safeTransferFrom(IERC20(token), victim, msg.sender, amount);
+    }
+}"""
+        self.assertIn("arbitrary-transferfrom", self._dets(drain))
+
+    def test_governance_vaa_gated_upgrade_not_flagged_but_open_upgrade_is(self):
+        gated = """pragma solidity ^0.8.20;
+contract BridgeGovernance {
+    function upgrade(bytes memory encodedVM) public {
+        (address impl, bool valid,) = verifyGovernanceVM(encodedVM);
+        require(valid, "invalid VAA");
+        _upgradeTo(impl);
+    }
+    function verifyGovernanceVM(bytes memory vm) internal returns (address, bool, string memory) { return (address(0), vm.length>0, ""); }
+    function _upgradeTo(address a) internal {}
+}"""
+        self.assertNotIn("unprotected-privileged-function", self._dets(gated))
+        open_up = """pragma solidity ^0.8.20;
+contract C {
+    address public implementation;
+    function upgrade(address newImpl) public { implementation = newImpl; }
+}"""
+        self.assertIn("unprotected-privileged-function", self._dets(open_up))
+
+    def test_parent_name_delegation_is_access_controlled(self):
+        # transferOwnership override forwarding to Ownable2StepUpgradeable.transferOwnership (onlyOwner parent).
+        src = """pragma solidity ^0.8.20;
+contract StakingVault is Ownable2StepUpgradeable {
+    function transferOwnership(address _newOwner) public override {
+        Ownable2StepUpgradeable.transferOwnership(_newOwner);
+    }
+}"""
+        self.assertNotIn("unprotected-privileged-function", self._dets(src))
+
     def test_cross_function_reentrancy_skips_role_gated_other(self):
         src = """pragma solidity ^0.8.20;
 contract Mailbox {

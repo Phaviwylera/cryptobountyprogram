@@ -278,6 +278,26 @@ def init_guarded(fn: Function) -> bool:
     return bool(fn.body and INIT_GUARD_RE.search(fn.body))
 
 
+# Known access-control base mixins: a thin override that forwards to `<Base>.<sameName>(...)` keeps the
+# base's caller check (OZ Ownable2Step.transferOwnership, AccessControl.grantRole, AccessManaged...).
+_AC_BASE_RE = re.compile(r"Ownable|AccessControl|AccessManaged|Governor|\bAuth\b|Roles?\b|Admin|Guardian|Permission", re.I)
+
+
+def delegates_to_guarded_parent(fn: Function) -> bool:
+    """A thin override that forwards to a parent implementation of the SAME method: `super.f(...)`, or the
+    explicit `Base.f(...)` form where Base is an inherited access-control mixin. The parent keeps the
+    caller check, so the override is guarded too (StakingVault.transferOwnership ->
+    Ownable2StepUpgradeable.transferOwnership; a Wormhole-style governance override -> super.upgrade)."""
+    body = fn.body or ""
+    if re.search(rf"\bsuper\s*\.\s*{re.escape(fn.name)}\s*\(", body):
+        return True
+    for i in fn.contract.inherits:
+        base = i.split(".")[-1].strip()
+        if _AC_BASE_RE.search(base) and re.search(rf"\b{re.escape(base)}\s*\.\s*{re.escape(fn.name)}\s*\(", body):
+            return True
+    return False
+
+
 def access_controlled(fn: Function, project: Project) -> bool:
     """Does the function restrict *who* (or, for set-once init, *when*) it may be called?"""
     for m in fn.modifiers:
@@ -290,8 +310,8 @@ def access_controlled(fn: Function, project: Project) -> bool:
         return True
     if init_guarded(fn):                       # set-once init guard: not re-callable on a live contract
         return True
-    if re.search(rf"\bsuper\.{re.escape(fn.name)}\s*\(", body):
-        return True  # override delegating to the (checked) parent implementation
+    if delegates_to_guarded_parent(fn):        # thin override -> guarded parent (super.f or Ownable2Step.f)
+        return True
     for alias in SENDER_ALIAS_RE.findall(body):
         if re.search(rf"(?:require|if)\s*\([^;{{]*\b{re.escape(alias)}\b\s*[!=]=", body):
             return True
@@ -397,7 +417,7 @@ def is_role_controlled(fn: Function, project: Project) -> bool:
     body = fn.body or ""
     if ROLE_BODY_RE.search(body):
         return True
-    if re.search(rf"\bsuper\.{re.escape(fn.name)}\s*\(", body):
+    if delegates_to_guarded_parent(fn):
         return True
     for alias in re.findall(rf"\b(\w+)\s*=\s*{SENDER}\s*;", body):
         if re.search(rf"(?:require|if)\s*\([^;{{]*\b{re.escape(alias)}\b\s*[!=]=", body):
@@ -478,8 +498,8 @@ def is_immutable(contract, ident: str) -> bool:
 # guarded bridge/mailbox relay (Scroll L1Mailbox's verifyMerkleProof, Wormhole's parseAndVerifyVM), NOT
 # the open LiFi/Socket forwarder this detector hunts (those forward raw calldata with no such gate).
 PROOF_GATE_RE = re.compile(
-    r"verifyMerkleProof|MerkleProof|verifyProof|verify\w*Proof|parseAndVerifyVM|verifyVM\b|verifyVAA"
-    r"|\.verify\s*\(|ecrecover\s*\(|\.recover\s*\(|SignatureChecker|isValidSignature", re.I)
+    r"verifyMerkleProof|MerkleProof|verifyProof|verify\w*Proof|parseAndVerify\w*|verify\w*VM\b|verifyGovernance\w*"
+    r"|verifyVAA|\.verify\s*\(|ecrecover\s*\(|\.recover\s*\(|SignatureChecker|isValidSignature", re.I)
 
 
 def is_erc20_token(contract, project: Project) -> bool:
@@ -592,6 +612,11 @@ def _privileged(project: Project):
         # Whether that signature can be replayed is the signature-replay detector's job.
         if re.search(r"_check\w*Signature\w*\s*\(|_verify\w*Sig\w*\s*\(|SignatureChecker|isValidSignatureNow|"
                      r"ECDSA\s*\.\s*recover|\becrecover\s*\(|MerkleProof\s*\.\s*verify", fn.body or ""):
+            continue
+        # Authorized by a signed governance message / bridge VAA (Wormhole `upgrade` verifies a guardian VAA
+        # via `verifyGovernanceVM`), or a merkle proof - gated by committed data, not by msg.sender. Whether
+        # that proof can be replayed is the signature-replay detector's job, not this one's.
+        if PROOF_GATE_RE.search(fn.body or ""):
             continue
         # Metadata setters (token URI, name, symbol, description) cannot move funds.
         if re.search(r"URI|Uri|Metadata|Description|Image|Symbol|Name(?!d)|Banner|Logo", fn.name):
@@ -1098,6 +1123,7 @@ def _arbitrary_call(project: Project):
     ["https://rekt.news/transit-swap-rekt/", "https://rekt.news/sushi-rekt/"],
 )
 def _arbitrary_transferfrom(project: Project):
+    lib_names = {c.name for f in project.files for c in f.contracts if c.kind == "library"}
     for fn in entrypoints(project):
         if is_role_controlled(fn, project):
             continue
@@ -1108,15 +1134,19 @@ def _arbitrary_transferfrom(project: Project):
             args, _ = call_args(body, m.end() - 1)
             if len(args) < 2:
                 continue
-            # Method form `token.(safe)transferFrom(from, to, amount/id)` - `from` is the first arg.
-            src = root_identifier(args[0])
+            recv_root = root_identifier(expression_before(body, m.start()))
+            # Static library form `SafeERC20.safeTransferFrom(IERC20(token), from, to, amount)`: arg0 is the
+            # TOKEN and arg1 is `from`. The method form `token.(safe)transferFrom(from, to, amount)` has `from`
+            # at arg0. Reading arg0 as `from` for the library form is the bug that flagged every
+            # `SafeERC20.safeTransferFrom(token, msg.sender, ...)` with a token parameter (Wormhole _transferTokens).
+            lib_form = len(args) >= 4 and (re.search(r"Safe(?:ERC20|Transfer)\w*", recv_root or "") or recv_root in lib_names)
+            src = root_identifier(args[1] if lib_form else args[0])
             if src not in addr_params:
                 continue
             # `super.`/`this.` transferFrom on the contract's OWN token (the contract IS an ERC-20) spends
             # msg.sender's allowance - standard ERC-20, not a forwarder draining an approval it holds over
             # an EXTERNAL token. An external token receiver (`IERC20(token).transferFrom`) is still flagged.
-            recv = root_identifier(expression_before(body, m.start()))
-            if recv in ("super", "this") and is_erc20_token(fn.contract, project):
+            if recv_root in ("super", "this") and is_erc20_token(fn.contract, project):
                 continue
             if not re.search(r"permit|_spendAllowance|allowance|ecrecover|\.recover\s*\(|SignatureChecker|isValidSignature|_useNonce|_isApprovedOrOwner|_isAuthorized|getApproved|ownerOf", body, re.I):
                 yield Hit(fn, fn.offset, f"`{fn.name}` calls {m.group(1)} with caller-chosen `from` = `{src}`, so anyone can move a victim's approved tokens.", absolute=True)
