@@ -81,6 +81,20 @@ class ParseOutcome(unittest.TestCase):
         self.assertFalse(v.is_finding)   # dropped
         self.assertIn("guard holds", v.detail)
 
+    def test_revert_is_false_positive_only_for_decisive_detectors(self):
+        # transferFrom/approve/privileged: a revert IS a real guard -> FALSE POSITIVE (dropped)
+        for det in ("arbitrary-transferfrom", "unprotected-privileged-function", "arbitrary-recipient-withdrawal"):
+            v = parse_outcome(_finding(det), "CALL_OK false\nATTACKER_WEI_DELTA 0\nTOKEN_DELTA 0\nTARGET_WEI_DELTA 0\nTARGET_TOK_DELTA 0")
+            self.assertEqual(v.outcome, "reverted", det)
+            self.assertFalse(v.is_finding, det)                  # dropped
+        # arbitrary-external-call / controlled-delegatecall: a generic-args revert may just be wrong shape ->
+        # CANDIDATE (manual), kept for a shaped payload, NOT dropped (no true positive escapes)
+        for det in ("arbitrary-external-call", "controlled-delegatecall"):
+            v = parse_outcome(_finding(det), "CALL_OK false\nATTACKER_WEI_DELTA 0\nTOKEN_DELTA 0\nTARGET_WEI_DELTA 0\nTARGET_TOK_DELTA 0")
+            self.assertEqual(v.outcome, "manual", det)
+            self.assertTrue(v.is_finding, det)                   # kept
+            self.assertIn("shaped payload", v.detail)
+
     def test_mint_confirmed_when_tokens_minted(self):
         v = parse_outcome(_finding("unrestricted-mint"), "CALL_OK true\nTOKEN_DELTA 1000000000000000000\nATTACKER_WEI_DELTA 0")
         self.assertEqual(v.outcome, "confirmed")

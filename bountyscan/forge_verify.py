@@ -72,6 +72,16 @@ AUTO_VERIFIABLE = {
     "unrestricted-burn-from",
 }
 
+# Detectors where a REVERT of the generic probe is DECISIVE evidence of a real guard, so a revert ->
+# FALSE_POSITIVE (dropped). For these, the generic args ARE the exploit shape and the revert can only be an
+# access/allowance guard firing: an unauthorized privileged call, a free-mint, a withdrawal/selfdestruct,
+# or transferFrom/approve where the revert is a missing allowance (a genuine ERC-20 guard).
+# For every OTHER critical routed through the generic probe (arbitrary-external-call, controlled-delegatecall,
+# and generic permissionless state-changers), a revert may just mean the GENERIC ARGS were wrong-shaped -
+# a real exploit could need a crafted payload / on-chain state. Dropping those as FALSE_POSITIVE would be a
+# false negative, so a revert there -> CANDIDATE (manual, kept for a shaped-payload PoC), never auto-dropped.
+REVERT_IS_DECISIVE = AUTO_VERIFIABLE | {"arbitrary-transferfrom", "arbitrary-approval"}
+
 # ---------------------------------------------------------------------------------------------
 # Phase 3 - sound state injection, classified into tiers.
 #
@@ -343,7 +353,13 @@ def parse_outcome(finding, stdout: str) -> PayloadVerdict:
         return PayloadVerdict(finding, outcome, detail, profit, metrics=metrics, injected=injected)
 
     if not call_ok:
-        return mk("reverted", "an unprivileged attacker's call reverts - the access guard holds")
+        if det in REVERT_IS_DECISIVE:
+            return mk("reverted", "an unprivileged attacker's call reverts - the access guard holds")
+        # Non-decisive class: the generic args may simply be the wrong SHAPE (a struct/queue-state payload
+        # the probe can't synthesize). A revert here is NOT proof of safety - hold as a CANDIDATE for a
+        # hand-written shaped PoC rather than dropping a possible true positive.
+        return mk("manual", "generic-args call reverts - could be argument/state validation, not an access "
+                            "guard; needs a shaped payload to decide (held, not auto-dropped)")
     w = ATTACKER_WALLET
     if det == "unprotected-selfdestruct":
         if code < 0:
