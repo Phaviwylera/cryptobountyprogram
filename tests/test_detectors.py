@@ -232,6 +232,25 @@ contract C {
 }"""
         self.assertIn("unprotected-privileged-function", self._dets(open_up))
 
+    def test_odd_named_modifier_with_body_check_is_guarded(self):
+        # modifier name isn't auth-ish ("gated"), but its BODY carries a real caller check -> guarded
+        guarded = """pragma solidity ^0.8.20;
+contract C {
+    address owner;
+    address impl;
+    modifier gated() { require(msg.sender == owner, "no"); _; }
+    function setImplementation(address a) public gated { impl = a; }
+}"""
+        self.assertNotIn("unprotected-privileged-function", self._dets(guarded))
+        # control: an empty/no-check modifier body must NOT be mistaken for access control -> still flagged
+        open_c = """pragma solidity ^0.8.20;
+contract C {
+    address impl;
+    modifier noop() { _; }
+    function setImplementation(address a) public noop { impl = a; }
+}"""
+        self.assertIn("unprotected-privileged-function", self._dets(open_c))
+
     def test_parent_name_delegation_is_access_controlled(self):
         # transferOwnership override forwarding to Ownable2StepUpgradeable.transferOwnership (onlyOwner parent).
         src = """pragma solidity ^0.8.20;

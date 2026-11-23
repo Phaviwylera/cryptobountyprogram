@@ -170,7 +170,7 @@ class PayloadVerdict:
 
     @property
     def status_word(self) -> str:
-        return {"confirmed": "CONFIRMED EXPLOIT", "manual": "LATENT / MANUAL REVIEW",
+        return {"confirmed": "CONFIRMED EXPLOIT", "manual": "UNVERIFIED (SHAPED-PAYLOAD POC NEEDED)",
                 "conditional": "LOGIC-CONFIRMED (ECONOMICALLY CONDITIONAL)",
                 "reverted": "FALSE POSITIVE", "no_change": "FALSE POSITIVE",
                 "error": "NOT RUN"}.get(self.outcome, self.outcome.upper())
@@ -185,7 +185,7 @@ class PayloadVerdict:
         icon = {"confirmed": "CONFIRMED", "reverted": "NOT REPRODUCIBLE (reverted)",
                 "no_change": "NOT REPRODUCIBLE (no state/funds moved)",
                 "conditional": "LOGIC CONFIRMED (economically conditional)",
-                "manual": "MANUAL PoC REQUIRED", "error": "NOT RUN"}[self.outcome]
+                "manual": "UNVERIFIED - shaped-payload PoC needed", "error": "NOT RUN"}[self.outcome]
         return f"Payload attack: {icon} - {self.detail}"
 
 

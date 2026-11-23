@@ -298,11 +298,40 @@ def delegates_to_guarded_parent(fn: Function) -> bool:
     return False
 
 
+def modifier_has_access_check(fn: Function, project: Project) -> bool:
+    """Follow each of fn's modifier NAMES to its definition (in fn's contract or any parent) and inspect the
+    modifier BODY for a real caller check (AUTH_BODY_RE), not just the modifier name. Catches a guard hidden
+    behind a non-obvious name: `modifier gated() { require(msg.sender == owner); _; }`. Sound: AUTH_BODY_RE
+    distinguishes genuine caller auth from balance / `!= address(0)` zero-checks, so an empty or non-auth
+    modifier body (`modifier noop(){ _; }`) is NOT mistaken for access control."""
+    if not getattr(fn, "modifiers", None) or fn.contract is None:
+        return False
+    by_name = {c.name: c for f in project.files for c in f.contracts}
+    defs: dict[str, Function] = {}
+    fam, todo = set(), [fn.contract.name]
+    while todo:                                        # walk fn's contract + all ancestors
+        n = todo.pop()
+        if n in fam or n not in by_name:
+            continue
+        fam.add(n)
+        c = by_name[n]
+        for md in getattr(c, "modifiers", []):
+            defs.setdefault(md.name, md)
+        todo += [i.split(".")[-1].strip() for i in c.inherits]
+    for mname in fn.modifiers:
+        md = defs.get(mname.split("(")[0].strip())     # onlyRole(ADMIN) -> onlyRole
+        if md and md.body and AUTH_BODY_RE.search(md.body):
+            return True
+    return False
+
+
 def access_controlled(fn: Function, project: Project) -> bool:
     """Does the function restrict *who* (or, for set-once init, *when*) it may be called?"""
     for m in fn.modifiers:
         if m in project.auth_modifiers or AUTH_MODIFIER_RE.search(m):
             return True
+    if modifier_has_access_check(fn, project):     # a guard hidden in a non-obvious modifier name
+        return True
     body = fn.body or ""
     if AUTH_BODY_RE.search(body):
         return True
@@ -414,6 +443,8 @@ def is_role_controlled(fn: Function, project: Project) -> bool:
     for m in fn.modifiers:
         if m in project.auth_modifiers or ROLE_MODIFIER_RE.search(m):
             return True
+    if modifier_has_access_check(fn, project):     # guard body behind a non-obvious modifier name
+        return True
     body = fn.body or ""
     if ROLE_BODY_RE.search(body):
         return True

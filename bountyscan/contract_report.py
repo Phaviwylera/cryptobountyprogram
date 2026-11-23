@@ -103,9 +103,12 @@ def write_contract_report(chain: str, address: str, meta: dict, findings: list[F
     high = len(findings) - crit
     # forensic overall status from the dynamic payload attack
     outs = {pv.outcome for pv in (payloads or [])}
+    # Explicit verdicts only - never the vague "LATENT / MANUAL REVIEW". A probe that ran but could not
+    # resolve the finding says exactly why (shaped-payload PoC needed); one that never ran says so.
     fstatus = ("CONFIRMED EXPLOIT" if "confirmed" in outs else
                "LOGIC-CONFIRMED (ECONOMICALLY CONDITIONAL)" if "conditional" in outs else
-               "LATENT / MANUAL REVIEW" if ("manual" in outs or not payloads) else
+               "UNVERIFIED — SHAPED-PAYLOAD POC NEEDED" if "manual" in outs else
+               "UNABLE TO VERIFY — PROBE NOT RUN" if not payloads else
                "STATIC CANDIDATE")
 
     lines = [
