@@ -52,6 +52,10 @@ class Store:
                 if name not in cols:
                     self.db.execute(f"ALTER TABLE contracts ADD COLUMN {name} {decl}")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_due ON contracts(status, priority DESC, next_try)")
+            # Live/Review feed queries filter status='vulnerable' and order by discovery / scan origin.
+            # Without these the live_feed / watch_targets scan the whole table (~6s on a large DB); indexed ~0.1s.
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_vuln_disc ON contracts(status, discovered)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_vuln_origin ON contracts(status, origin)")
             self.db.commit()
         self.ensure_fund_watch()   # so watch_targets() can always join it, even before the watcher starts
 
