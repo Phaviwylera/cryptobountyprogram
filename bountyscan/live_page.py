@@ -48,6 +48,7 @@ LIVE_HTML = r"""<!doctype html>
     <div class="stat"><b id="sWatch">0</b> <span class="tag">watched</span></div>
     <div class="stat pink"><b id="sRecv">0</b> <span class="tag">receiving $</span></div>
     <div class="stat y"><b id="sVal">$0</b> <span class="tag">value at watch</span></div>
+    <a class="pill" href="/poc">🎯 PoC findings</a>
     <a class="pill" href="/">← dashboard</a>
   </div>
 </header>

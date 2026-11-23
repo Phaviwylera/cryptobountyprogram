@@ -165,6 +165,19 @@ class ValueTests(unittest.TestCase):
             self.assertEqual({r["address"] for r in s.flagged(confirmed=False)}, {lat1, lat2})
             s.db.close()
 
+    def test_confirmed_pocs_only_returns_fork_proven(self):
+        # The PoC page shows ONLY payload_confirmed=1 (a fork-proven drain), never latent candidates.
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Store(Path(tmp) / "p.db")
+            conf = "0x" + "a1" * 20       # fork-proven
+            latent = "0x" + "b2" * 20     # flagged but not fork-proven (bigger value, still excluded)
+            s.enqueue_with("ethereum", conf, "x")
+            s.enqueue_with("ethereum", latent, "x")
+            s.update("ethereum", conf, status="vulnerable", payload_confirmed=1, value_usd=50000.0)
+            s.update("ethereum", latent, status="vulnerable", payload_confirmed=0, value_usd=99999.0)
+            self.assertEqual({r["address"] for r in s.confirmed_pocs(50)}, {conf})
+            s.db.close()
+
     def test_store_migrates_old_database(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as tmp:

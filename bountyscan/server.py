@@ -392,6 +392,16 @@ class Handler(BaseHTTPRequestHandler):
         if u.path in ("/live", "/live/"):
             from .live_page import LIVE_HTML
             return self._send(200, LIVE_HTML.encode(), "text/html; charset=utf-8")
+        if u.path in ("/poc", "/poc/"):
+            from .poc_page import POC_HTML
+            return self._send(200, POC_HTML.encode(), "text/html; charset=utf-8")
+        if u.path == "/api/poc/feed":
+            # PoC-backed findings only: fork-CONFIRMED drains (payload_confirmed=1).
+            out = [{"chain": r["chain"], "address": r["address"], "name": r["name"],
+                    "severity": r["max_severity"], "findings": r["findings"],
+                    "value_usd": r["value_usd"] if "value_usd" in r.keys() else None}
+                   for r in w.store.confirmed_pocs(100)]
+            return self._send(200, {"findings": out, "count": len(out)})
         if u.path == "/api/live/feed":
             import time as _t
             fw = w.store.fund_watch_map()

@@ -239,6 +239,15 @@ class Store:
                 "    OR address IN (SELECT address FROM fund_watch WHERE inflows > 0)"
                 ") ORDER BY (value_usd IS NULL), value_usd DESC, updated DESC LIMIT ?", (int(limit),)).fetchall()
 
+    def confirmed_pocs(self, limit: int = 100) -> list[sqlite3.Row]:
+        """The PoC-backed set: fork-CONFIRMED findings only (payload_confirmed=1) - a drain actually
+        moved the target's funds to the attacker on a mainnet fork. These are the only reportable
+        findings. Value (funds at stake) first, then most recent."""
+        with self._lock:
+            return self.db.execute(
+                "SELECT * FROM contracts WHERE status='vulnerable' AND payload_confirmed=1 "
+                "ORDER BY (value_usd IS NULL), value_usd DESC, updated DESC LIMIT ?", (int(limit),)).fetchall()
+
     def live_feed(self, limit: int = 60) -> list[sqlite3.Row]:
         """What the Live page shows: genuinely FRESH live-discovered launches (origin 'block:*'), PLUS
         any watched contract that has actually started RECEIVING funds (fund_watch inflows>0) - the
