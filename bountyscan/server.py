@@ -194,13 +194,19 @@ class Worker:
             return
         self._last_value_discovery = now
         try:
-            from .discovery import defillama_addresses, llama_chain_name
+            from .discovery import defillama_rows, llama_chain_name
             min_tvl = float(os.environ.get("BOUNTYSCAN_DISCOVERY_MIN_TVL", "100000"))
-            addrs = defillama_addresses(min_tvl, chain=llama_chain_name(self.chain))
+            rows = defillama_rows(min_tvl, chain=llama_chain_name(self.chain))
+            addrs = [r["address"] for r in rows]
         except Exception as exc:
             self.last_error = f"discovery: {type(exc).__name__}: {exc}"
             self._last_value_discovery = now - self.VALUE_DISCOVERY_INTERVAL + 300   # retry in ~5 min
             return
+        try:   # write-only audit map: address -> DeFiLlama name/TVL (never read by the scan)
+            from .chain_audit import write_protocol_map
+            write_protocol_map(Path(self.cfg.out_dir).parent.parent / "digests", rows)
+        except Exception:
+            pass
         added = sum(self.store.enqueue(self.chain, a, "defillama") for a in addrs)
         self.set_stage(f"Value-weighted discovery: {len(addrs)} protocols with TVL>${int(min_tvl):,}, {added} new queued")
         self.add_event("found", f"DeFiLlama: {added} new high-TVL {self.chain} target(s) queued "

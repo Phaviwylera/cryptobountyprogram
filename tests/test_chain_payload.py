@@ -74,6 +74,39 @@ class RunChainPayloads(unittest.TestCase):
         self.assertEqual(out, [])                         # failed to reproduce on the 2nd block -> discarded
         self.assertIn(("reentrancy", "DISCARDED-2nd-block"), log)
 
+    def _digest_json(self, tmp):
+        p = [q for q in Path(tmp).glob("*.json") if ".targets." not in q.name and ".health." not in q.name][0]
+        return json.loads(p.read_text())
+
+    def test_pattern_stats_and_target_audit_on_confirm(self):
+        from bountyscan.chain_audit import TargetAudit
+        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=10**18, test_path="p")
+        with tempfile.TemporaryDirectory() as tmp:
+            d, au = Digest(tmp), TargetAudit(tmp)
+            out, _ = cp.run_chain_payloads([_f("reentrancy")], [], "0x" + "cd" * 20, "ethereum", "rpc",
+                                           digest=d, audit=au, target_name="Aave", **self.ECON)
+            self.assertEqual(len(out), 1)
+            j = self._digest_json(tmp)
+            self.assertEqual(j["reentrancy_matched"], 1)
+            self.assertEqual(j["reentrancy_generated"], 1)
+            self.assertEqual(j["reentrancy_confirmed"], 1)
+            self.assertEqual(j["reentrancy_false_positive_rate"], 0)
+            row = json.loads(next(Path(tmp).glob("*.targets.json")).read_text())[("0x" + "cd" * 20)]
+            self.assertEqual(row["name"], "Aave")
+            self.assertEqual(row["generators_run"], 1)
+
+    def test_pattern_stats_false_positive_on_below_threshold(self):
+        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=10**15, test_path="p")
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Digest(tmp)
+            cp.run_chain_payloads([_f("reentrancy")], [], "0x0", "ethereum", "rpc",
+                                  digest=d, target_tvl_usd=1_000_000.0, eth_price_usd=3000.0)
+            j = self._digest_json(tmp)
+            self.assertEqual(j["reentrancy_matched"], 1)
+            self.assertEqual(j["reentrancy_generated"], 1)      # reached generator
+            self.assertEqual(j["reentrancy_confirmed"], 0)      # but did not clear the profit gate
+            self.assertEqual(j["reentrancy_false_positive_rate"], 1)   # matched - confirmed
+
     def test_fp_cluster_skipped(self):
         many = [_f("reentrancy", f"f{i}") for i in range(3)] + [_f("donation", "d"), _f("spot-price-oracle", "s"),
                 _f("erc4626-inflation", "e"), _f("unvalidated-flash-callback", "c")]  # 7 pattern matches > 5

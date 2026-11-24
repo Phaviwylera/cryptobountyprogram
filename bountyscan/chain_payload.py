@@ -60,7 +60,8 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
                        max_targets: int = 25, max_minutes: int = 30, max_pattern_matches: int = 5,
                        second_block_offset: int = 10, digest=None, health=None,
                        target_tvl_usd: float | None = None, eth_price_usd: float | None = None,
-                       min_gain_usd: float = 100.0, min_tvl_usd: float = 10_000.0) -> tuple[list[ChainFinding], list]:
+                       min_gain_usd: float = 100.0, min_tvl_usd: float = 10_000.0,
+                       audit=None, target_name: str | None = None) -> tuple[list[ChainFinding], list]:
     """Run the chain generator for each pattern-matched finding against the REAL target, under a staged-
     rollout cost cap, and emit a finding ONLY after it reconfirms on a SECOND fork block AND clears an
     economically meaningful threshold.
@@ -81,11 +82,24 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
     if chain != "ethereum":                           # staged rollout: Ethereum mainnet (chain id 1) only
         return out, [("_skip", "non-eth-chain")]
     pattern_findings = [f for f in findings if PATTERN_OF.get(getattr(f, "detector", ""))]
+    matched_pats = sorted({PATTERN_OF[f.detector] for f in pattern_findings})
+    generated_pats: set = set()
+    confirmed_pats: set = set()
+
+    def _flush_pattern_stats(ran_count: int):
+        # Write-only diagnostics: per-pattern hit rate (digest) + per-target generators_run (audit).
+        if digest:
+            digest.record_patterns({p: {"matched": 1, "generated": 1 if p in generated_pats else 0,
+                                        "confirmed": 1 if p in confirmed_pats else 0} for p in matched_pats})
+        if audit:
+            audit.record(target, name=target_name, generators_run=ran_count)
+
     if len(pattern_findings) > max_pattern_matches:   # K cap: FP cluster, skip the whole contract
         if digest:
             digest.record(target, matched=len(pattern_findings), skipped=True)
         if health:
             health.record(target=True)
+        _flush_pattern_stats(0)   # matched but never generated (FP cluster)
         return out, [("_skip", f"fp-cluster:{len(pattern_findings)}>{max_pattern_matches}")]
 
     eth_px = eth_price_usd if eth_price_usd is not None else _eth_price(rpc_url)
@@ -118,6 +132,7 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
             log.append((pat, f"ERROR:{exc}"[:60]))
             continue
         ran += 1
+        generated_pats.add(pat)       # this pattern passed the FP-cluster gate and reached the generator
         if v is None:
             log.append((pat, "no-generator"))
             continue
@@ -144,6 +159,7 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
                     out.append(ChainFinding(pat, chain, target, getattr(f, "function", ""), v.profit_wei,
                                             round(gain_usd, 2), NATIVE_TOKEN, v.test_path, "", round(tvl, 2)))
                     confirmed += 1
+                    confirmed_pats.add(pat)
                     log.append((pat, "CONFIRMED-2x"))
                 else:
                     below_threshold += 1
@@ -170,6 +186,7 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
                       confirmed_usd=sum(h.gain_usd for h in out))
     if health:
         health.record(target=True, finding=(confirmed > 0), **hc)
+    _flush_pattern_stats(ran)
     return out, log
 
 

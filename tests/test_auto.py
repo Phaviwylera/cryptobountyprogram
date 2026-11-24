@@ -181,11 +181,20 @@ class TvlFloorTests(unittest.TestCase):
         files = list((self.root / "digests").glob("*.json"))
         return _json.loads(files[0].read_text(encoding="utf-8")) if files else {}
 
+    def _targets(self):
+        import json as _json
+        files = list((self.root / "digests").glob("*.targets.json"))
+        return _json.loads(files[0].read_text(encoding="utf-8")) if files else {}
+
     def test_below_floor_is_skipped_and_counted(self):
-        self.assertEqual(self._run_one("0x" + "a1" * 20, 42.0), "low_value")
+        addr = "0x" + "a1" * 20
+        self.assertEqual(self._run_one(addr, 42.0), "low_value")
         d = self._digest()
         self.assertEqual(d.get("skipped_low_tvl"), 1)
         self.assertEqual(d.get("targets_scanned", 0), 0)      # a skip is NOT a scanned target
+        row = self._targets().get(addr)                       # and the per-target audit row exists
+        self.assertEqual(row["outcome"], "SKIPPED_LOW_TVL")
+        self.assertEqual(row["tvl_usd"], 42.0)
 
     def test_unknown_value_is_skipped(self):
         # value could not be read (RPC/pricing failed) -> cannot prove >= floor -> skip

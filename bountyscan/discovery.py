@@ -70,6 +70,37 @@ def parse_protocol_addresses(protocols: list, min_tvl_usd: float, chain: str = "
     return out
 
 
+def parse_protocol_rows(protocols: list, min_tvl_usd: float, chain: str = "Ethereum") -> list[dict]:
+    """Like parse_protocol_addresses, but each qualifying protocol as {address, name, tvl} - for the audit
+    name map. Same chain + TVL filter + address validation; deduplicated by address, order kept."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for p in protocols:
+        if not isinstance(p, dict):
+            continue
+        if chain not in (p.get("chains") or []):
+            continue
+        tvl = (p.get("chainTvls") or {}).get(chain)
+        if tvl is None:
+            tvl = p.get("tvl")
+        try:
+            tvl = float(tvl or 0)
+        except (TypeError, ValueError):
+            tvl = 0.0
+        if tvl < min_tvl_usd:
+            continue
+        addr = _eth_address(p.get("address"))
+        if addr and addr not in seen:
+            seen.add(addr)
+            out.append({"address": addr, "name": p.get("name"), "tvl": tvl})
+    return out
+
+
 def defillama_addresses(min_tvl_usd: float = 100_000.0, chain: str = "Ethereum", timeout: float = 40.0) -> list[str]:
     """Fetch and parse: validated contract addresses of `chain` protocols with TVL >= min_tvl_usd."""
     return parse_protocol_addresses(_fetch_protocols(timeout), min_tvl_usd, chain)
+
+
+def defillama_rows(min_tvl_usd: float = 100_000.0, chain: str = "Ethereum", timeout: float = 40.0) -> list[dict]:
+    """Fetch and parse: {address, name, tvl} rows of `chain` protocols with TVL >= min_tvl_usd."""
+    return parse_protocol_rows(_fetch_protocols(timeout), min_tvl_usd, chain)

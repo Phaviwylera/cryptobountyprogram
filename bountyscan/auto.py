@@ -63,6 +63,10 @@ def _event(cfg: AutoConfig, kind: str, msg: str) -> None:
             pass
 
 
+def _digests_dir(cfg: AutoConfig) -> Path:
+    return Path(cfg.out_dir).parent.parent / "digests"
+
+
 def _active_digest(cfg: AutoConfig):
     """The chain-poc daily digest when the window is enabled, else None. Used so the pre-detection TVL
     floor can record skips (skipped_low_tvl) into the same digest the payload phase writes."""
@@ -70,9 +74,44 @@ def _active_digest(cfg: AutoConfig):
         return None
     try:
         from .chain_digest import Digest
-        return Digest(Path(cfg.out_dir).parent.parent / "digests")
+        return Digest(_digests_dir(cfg))
     except Exception:
         return None
+
+
+def _active_audit(cfg: AutoConfig):
+    """The per-target audit writer when the window is enabled, else None. Write-only diagnostic; never
+    read by the scan, never changes any verdict (same contract as the health file)."""
+    if not os.environ.get("BOUNTYSCAN_CHAIN_POC"):
+        return None
+    try:
+        from .chain_audit import TargetAudit
+        return TargetAudit(_digests_dir(cfg))
+    except Exception:
+        return None
+
+
+def _chain_pattern_types(findings) -> list[str]:
+    """Which of the 8 chain patterns the given findings matched (deduped, sorted)."""
+    from .chain_exploit import PATTERN_OF
+    return sorted({PATTERN_OF[getattr(f, "detector", "")] for f in findings
+                   if getattr(f, "detector", "") in PATTERN_OF})
+
+
+def _audit_target(cfg: AutoConfig, chain: str, address: str, outcome: str, tvl_usd=None,
+                  findings=None, generators_run: int | None = None) -> None:
+    """Best-effort per-target audit row. Never raises, never affects the scan or the verdict."""
+    audit = _active_audit(cfg)
+    if not audit:
+        return
+    try:
+        from .chain_audit import load_protocol_names
+        name = load_protocol_names(_digests_dir(cfg)).get(address.lower())
+        pats = _chain_pattern_types(findings or [])
+        audit.record(address, name=name, tvl_usd=tvl_usd, outcome=outcome,
+                     patterns_matched=len(pats), pattern_types=pats, generators_run=generators_run)
+    except Exception:
+        pass
 
 
 def parse_address_lines(text: str, default_chain: str) -> list[tuple[str, str]]:
@@ -104,6 +143,7 @@ def process(store, row, cfg: AutoConfig) -> str:
         try:
             if cfg.rpc.code(address) in ("0x", "0x0", ""):
                 store.update(chain, address, status="no_code")
+                _audit_target(cfg, chain, address, "ERROR")   # no code at this address (self-destructed / EOA)
                 return "no_code"
             balance = cfg.rpc.balance(address)
             held = read_holdings(cfg.rpc, chain_id_of(chain), address, balance)
@@ -124,6 +164,7 @@ def process(store, row, cfg: AutoConfig) -> str:
                 d = _active_digest(cfg)
                 if d:
                     d.record_skip_low_tvl(chain, address, tvl_usd)   # separate counter; NOT counted as scanned
+                _audit_target(cfg, chain, address, "SKIPPED_LOW_TVL", tvl_usd=tvl_usd)
             return "low_value"
         # Impersonation/spoof tokens (Etherscan "reported for impersonating…"): fake near-max-uint
         # supply, hold no value, nothing to steal. Drop before the costly source-fetch + fork run.
@@ -167,6 +208,7 @@ def process(store, row, cfg: AutoConfig) -> str:
         store.update(chain, address, status="safe", name=name, findings=0, max_severity=None,
                      balance_wei=None if balance is None else str(balance),
                      error=f"(identical source to {hit[1]})", **value_fields)
+        _audit_target(cfg, chain, address, "DISCARDED", tvl_usd=(held["usd"] if held else None))
         _discard_source(src, cfg)
         return "safe"
 
@@ -242,9 +284,13 @@ def process(store, row, cfg: AutoConfig) -> str:
                             min_gain_usd=float(os.environ.get("BOUNTYSCAN_CHAIN_MIN_GAIN_USD", "100")),
                             min_tvl_usd=float(os.environ.get("BOUNTYSCAN_CHAIN_MIN_TVL_USD", "10000")))
                 tvl_usd = held["usd"] if held is not None else None
+                audit = _active_audit(cfg)
+                from .chain_audit import load_protocol_names
+                tname = load_protocol_names(_digests_dir(cfg)).get(address.lower())
                 chain_hits, chain_log = run_chain_payloads(theft, result.files, address, chain, cfg.rpc.url,
                                                            digest=digest, health=health,
-                                                           target_tvl_usd=tvl_usd, **caps)
+                                                           target_tvl_usd=tvl_usd, audit=audit,
+                                                           target_name=tname, **caps)
                 if chain_hits:
                     payload_confirmed = True      # survived BOTH the first and the second-block fork PoC
                     _log(cfg, "    chain-exploit CONFIRMED (2nd-block) " + str(len(chain_hits)) + ": "
@@ -262,6 +308,8 @@ def process(store, row, cfg: AutoConfig) -> str:
                      balance_wei=None if balance is None else str(balance), error=extra or None, **value_fields)
         if hasattr(store, "cache_verdict"):
             store.cache_verdict(shash, "safe", address)
+        _audit_target(cfg, chain, address, "DISCARDED", tvl_usd=(held["usd"] if held else None),
+                      findings=candidates)
         _discard_source(src, cfg)
         return "safe"
 
@@ -271,6 +319,8 @@ def process(store, row, cfg: AutoConfig) -> str:
     store.update(chain, address, status="vulnerable", name=name, findings=len(theft), max_severity=worst,
                  balance_wei=None if balance is None else str(balance), report=str(report), error=None,
                  payload_confirmed=1 if payload_confirmed else 0, **value_fields)
+    _audit_target(cfg, chain, address, "CONFIRMED" if payload_confirmed else "DISCARDED",
+                  tvl_usd=(held["usd"] if held else None), findings=theft)
     return "vulnerable"
 
 

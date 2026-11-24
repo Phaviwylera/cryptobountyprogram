@@ -1,6 +1,6 @@
 import unittest
 
-from bountyscan.discovery import llama_chain_name, parse_protocol_addresses
+from bountyscan.discovery import llama_chain_name, parse_protocol_addresses, parse_protocol_rows
 
 A1 = "0x" + "a1" * 20
 A2 = "0x" + "b2" * 20
@@ -40,6 +40,14 @@ class DiscoveryParseTests(unittest.TestCase):
     def test_chain_name_mapping(self):
         self.assertEqual(llama_chain_name("ethereum"), "Ethereum")
         self.assertEqual(llama_chain_name("mainnet"), "Ethereum")
+
+    def test_rows_carry_name_and_tvl(self):
+        rows = parse_protocol_rows(self._payload(), min_tvl_usd=100_000.0, chain="Ethereum")
+        self.assertEqual([r["address"] for r in rows], [A1.lower(), A2.lower()])
+        self.assertEqual(rows[0]["name"], "Big")
+        self.assertEqual(rows[0]["tvl"], 5_000_000)     # chain TVL used when present
+        self.assertEqual(rows[1]["name"], "Mid")
+        self.assertEqual(rows[1]["tvl"], 250_000)       # overall tvl used when no chainTvls entry
 
 
 if __name__ == "__main__":

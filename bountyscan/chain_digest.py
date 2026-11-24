@@ -74,6 +74,19 @@ class Digest:
         deliberately NOT counted as scanned (it never reached pattern detection)."""
         self._rmw(lambda d: d.__setitem__("skipped_low_tvl", d.get("skipped_low_tvl", 0) + 1))
 
+    def record_patterns(self, stats: dict) -> None:
+        """Per-pattern hit rate across the day's live traffic. `stats` maps a pattern name to counts for
+        ONE target: {matched, generated, confirmed} (each 0/1). Accumulates <pat>_matched / _generated /
+        _confirmed and derives <pat>_false_positive_rate = matched - confirmed (how many targets matched
+        the detector but never became a profitable, gate-passing finding). Diagnostic only."""
+        def mutate(d):
+            for pat, c in (stats or {}).items():
+                for kind in ("matched", "generated", "confirmed"):
+                    key = f"{pat}_{kind}"
+                    d[key] = d.get(key, 0) + int(c.get(kind, 0) or 0)
+                d[f"{pat}_false_positive_rate"] = d.get(f"{pat}_matched", 0) - d.get(f"{pat}_confirmed", 0)
+        self._rmw(mutate)
+
 
 class Health:
     """Write-only diagnostic alongside the main digest: <dir>/YYYY-MM-DD.health.json. Tells apart a healthy
