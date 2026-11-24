@@ -205,18 +205,25 @@ def process(store, row, cfg: AutoConfig) -> str:
     # probe, in the payload phase only. CONFIRMED (the attacker profit assertion passed on a fork) promotes
     # the finding to payload_confirmed, which /poc reads; DISCARDED/ERROR emit nothing. Gated behind
     # BOUNTYSCAN_CHAIN_POC so it never changes the running scan unless explicitly enabled.
-    if theft and cfg.forge_verify and cfg.rpc is not None and os.environ.get("BOUNTYSCAN_CHAIN_POC"):
+    if (theft and cfg.forge_verify and cfg.rpc is not None and chain == "ethereum"
+            and os.environ.get("BOUNTYSCAN_CHAIN_POC")):
         try:
             from .chain_payload import run_chain_payloads
+            from .chain_digest import Digest
             from .forge_verify import forge_available
             if forge_available():
-                chain_hits, chain_log = run_chain_payloads(theft, result.files, address, chain, cfg.rpc.url)
+                digest = Digest(Path(cfg.out_dir).parent.parent / "digests")
+                caps = dict(max_targets=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_TARGETS", "25")),
+                            max_minutes=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_MINUTES", "30")),
+                            max_pattern_matches=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_MATCHES", "5")))
+                chain_hits, chain_log = run_chain_payloads(theft, result.files, address, chain, cfg.rpc.url,
+                                                           digest=digest, **caps)
                 if chain_hits:
-                    payload_confirmed = True
-                    _log(cfg, "    chain-exploit CONFIRMED " + str(len(chain_hits)) + " finding(s): "
+                    payload_confirmed = True      # survived BOTH the first and the second-block fork PoC
+                    _log(cfg, "    chain-exploit CONFIRMED (2nd-block) " + str(len(chain_hits)) + ": "
                          + ", ".join(h.pattern for h in chain_hits))
                 elif chain_log:
-                    _log(cfg, "    chain-exploit: " + ", ".join(p + ":" + o for p, o in chain_log))
+                    _log(cfg, "    chain-exploit: " + ", ".join(p + ":" + o for p, o in chain_log[:6]))
         except Exception as exc:
             _log(cfg, f"    chain-exploit warning ({exc}); keeping payload verdicts")
 

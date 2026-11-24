@@ -8,11 +8,24 @@ dashboard, or the contract-scanning (detector / source-fetch) logic.
 """
 from __future__ import annotations
 
+import json as _json
+import time
+import urllib.request
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
 from .chain_exploit import NATIVE_TOKEN, PATTERN_OF, run_chain_poc
 from .forge_verify import _function_of
+
+
+def _latest_block(rpc_url: str) -> int | None:
+    try:
+        body = _json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}).encode()
+        req = urllib.request.Request(rpc_url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return int(_json.loads(r.read().decode())["result"], 16)
+    except Exception:
+        return None
 
 
 @dataclass
@@ -32,17 +45,39 @@ class ChainFinding:
 
 
 def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
-                       fork_block: int | None = None, out_dir: Path | None = None) -> tuple[list[ChainFinding], list]:
-    """Run the chain generator for each pattern-matched finding against the REAL target. Returns
-    (confirmed_findings, log). confirmed_findings carry a passing PoC; the log records every pattern's
-    outcome (CONFIRMED / DISCARDED / ERROR / no-generator) for observability."""
+                       fork_block: int | None = None, out_dir: Path | None = None,
+                       max_targets: int = 25, max_minutes: int = 30, max_pattern_matches: int = 5,
+                       second_block_offset: int = 10, digest=None) -> tuple[list[ChainFinding], list]:
+    """Run the chain generator for each pattern-matched finding against the REAL target, under a staged-
+    rollout cost cap, and emit a finding ONLY after it reconfirms on a SECOND fork block.
+
+    Caps: at most `max_targets` PoC runs and `max_minutes` wall-clock per contract; a contract matching
+    more than `max_pattern_matches` patterns is skipped as a likely false-positive cluster. Chain is
+    restricted to Ethereum mainnet. Every CONFIRMED PoC is re-run at `latest - second_block_offset`; a
+    finding that does not reproduce there is DISCARDED (transient-state false positive). The digest, if
+    given, records the per-contract tally.
+    """
     out: list[ChainFinding] = []
     log: list[tuple[str, str]] = []
+    if chain != "ethereum":                           # staged rollout: Ethereum mainnet (chain id 1) only
+        return out, [("_skip", "non-eth-chain")]
+    pattern_findings = [f for f in findings if PATTERN_OF.get(getattr(f, "detector", ""))]
+    if len(pattern_findings) > max_pattern_matches:   # K cap: FP cluster, skip the whole contract
+        if digest:
+            digest.record(target, matched=len(pattern_findings), skipped=True)
+        return out, [("_skip", f"fp-cluster:{len(pattern_findings)}>{max_pattern_matches}")]
+
+    latest = _latest_block(rpc_url)
+    deadline = time.time() + max_minutes * 60
+    ran = 0
+    confirmed = 0
+    discarded_2nd = 0
     seen = set()
-    for f in findings:
-        pat = PATTERN_OF.get(getattr(f, "detector", ""))
-        if pat is None:
-            continue
+    for f in pattern_findings:
+        if ran >= max_targets or time.time() > deadline:
+            log.append(("_cap", "budget-exhausted"))
+            break
+        pat = PATTERN_OF[f.detector]
         key = (pat, getattr(f, "function", ""))
         if key in seen:
             continue
@@ -50,20 +85,37 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
         fn = _function_of(files, f)
         try:
             v = run_chain_poc(f, fn, target, chain, rpc_url, fork_block=fork_block)
-        except Exception as exc:                      # never let a PoC run break the payload phase
+        except Exception as exc:
             log.append((pat, f"ERROR:{exc}"[:60]))
             continue
+        ran += 1
         if v is None:
-            log.append((pat, "no-generator"))         # pattern recognised but no real-target template yet
+            log.append((pat, "no-generator"))
             continue
         if v.outcome == "confirmed":
-            out.append(ChainFinding(pat, chain, target, getattr(f, "function", ""), v.profit_wei, 0.0,
-                                    NATIVE_TOKEN, v.test_path, v.test_path and ""))
-            log.append((pat, "CONFIRMED"))
+            # Second-block re-confirmation: a real bug reproduces at an earlier block; transient state does not.
+            second = (latest - second_block_offset) if latest else None
+            v2 = None
+            if second:
+                try:
+                    v2 = run_chain_poc(f, fn, target, chain, rpc_url, fork_block=second)
+                except Exception:
+                    v2 = None
+            if v2 is not None and v2.outcome == "confirmed":
+                out.append(ChainFinding(pat, chain, target, getattr(f, "function", ""), v.profit_wei, 0.0,
+                                        NATIVE_TOKEN, v.test_path, ""))
+                confirmed += 1
+                log.append((pat, "CONFIRMED-2x"))
+            else:
+                discarded_2nd += 1
+                log.append((pat, "DISCARDED-2nd-block"))
         elif v.outcome == "no_profit":
-            log.append((pat, "DISCARDED"))            # the gate rejected it - emit nothing
+            log.append((pat, "DISCARDED"))
         else:
             log.append((pat, f"ERROR:{v.detail}"[:60]))
+    if digest:
+        digest.record(target, matched=len(pattern_findings), ran=ran, confirmed=confirmed,
+                      discarded_2nd=discarded_2nd, confirmed_usd=sum(h.gain_usd for h in out))
     return out, log
 
 
