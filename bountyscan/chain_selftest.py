@@ -985,3 +985,94 @@ def run_sellburn_self_test(rpc_url: str, out_dir: Path) -> dict:
         "WETH difference.",
         "Transfer the seller's tokens in and sync reserves BEFORE pricing / burning; never price a trade "
         "against reserves that do not yet reflect the inbound transfer.")
+
+
+# ---- #8 Withdrawal logic flaw (SC02, Premia V3 pattern) ----
+# withdraw() computes the payout from a manipulable state variable with no invariant check. The attacker
+# deposits, manipulates the state (abstracted flash-loan price move), and withdraws more than it deposited.
+# Safe variant enforces `amount <= deposited` (an invariant) so the manipulation cannot over-withdraw.
+_WITHDRAWFLAW_SELFTEST = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {Test, console2} from "forge-std/Test.sol";
+
+contract MockERC20 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 a) external { balanceOf[to] += a; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transfer(address to, uint256 a) external returns (bool) { balanceOf[msg.sender] -= a; balanceOf[to] += a; return true; }
+    function transferFrom(address f, address to, uint256 a) external returns (bool) {
+        if (allowance[f][msg.sender] != type(uint256).max) allowance[f][msg.sender] -= a;
+        balanceOf[f] -= a; balanceOf[to] += a; return true;
+    }
+}
+
+contract Vault {
+    MockERC20 public asset;
+    uint256 public rate = 1e18;                    // manipulable state (oracle / pool-derived)
+    mapping(address => uint256) public deposited;
+    bool public immutable hasInvariant;            // safe: enforce amount <= deposited
+    constructor(MockERC20 a, bool inv) { asset = a; hasInvariant = inv; }
+    function deposit(uint256 a) external { asset.transferFrom(msg.sender, address(this), a); deposited[msg.sender] += a; }
+    function setRate(uint256 r) external { rate = r; }   // attacker-movable (abstracted flash-loan price move)
+    function withdraw() external returns (uint256 amt) {
+        amt = deposited[msg.sender] * rate / 1e18;        // payout from manipulable state, no invariant
+        if (hasInvariant) require(amt <= deposited[msg.sender], "invariant: cannot withdraw more than deposited");
+        deposited[msg.sender] = 0;
+        asset.transfer(msg.sender, amt);
+    }
+}
+
+contract PoC is Test {
+    uint256 constant EXPECTED_CHAINID = 1;
+    function setUp() public { require(block.chainid == EXPECTED_CHAINID, "fork guard"); }
+    function test_withdraw_flaw() public {
+        MockERC20 tok = new MockERC20();
+        Vault v = new Vault(tok, __HAS_INVARIANT__);
+        tok.mint(address(v), 2000 ether);              // protocol / other-user funds available to over-withdraw
+        address attacker = address(0xA11CE);
+        tok.mint(attacker, 100 ether);
+        uint256 bef = tok.balanceOf(attacker);
+        vm.startPrank(attacker);
+        tok.approve(address(v), type(uint256).max);
+        v.deposit(100 ether);
+        v.setRate(10 ether);                           // manipulate state 10x (10e18)
+        try v.withdraw() {} catch {}
+        vm.stopPrank();
+        uint256 aft = tok.balanceOf(attacker);
+        console2.log("CHAIN_PROFIT_WEI", int256(aft) - int256(bef));
+        assertGt(aft, bef, "no profit: withdrawal logic flaw netted nothing");
+    }
+}
+"""
+
+
+def build_withdrawflaw_selftest_sol(vulnerable: bool) -> str:
+    """Withdrawal logic flaw: vulnerable (no invariant) or safe (amount <= deposited invariant)."""
+    return _WITHDRAWFLAW_SELFTEST.replace("__HAS_INVARIANT__", "false" if vulnerable else "true")
+
+
+def run_withdrawflaw_self_test(rpc_url: str, out_dir: Path) -> dict:
+    return _pattern_selftest(
+        rpc_url, out_dir, "withdraw_flaw", "selftestwdraw", "test_withdraw_flaw",
+        build_withdrawflaw_selftest_sol,
+        "Withdrawal logic flaw over-withdraws via manipulable state",
+        "withdraw() computes the payout from a manipulable state variable (an oracle/pool-derived rate) with "
+        "no invariant check. The attacker deposits, moves the state, and withdraws far more than it deposited, "
+        "draining other users' funds.",
+        "Enforce an invariant on every withdrawal (e.g. payout <= principal, or a share/accounting identity) "
+        "and value payouts off a manipulation-resistant source, not instantaneous state.")
+
+
+# =====================================================================================================
+# Full 8-pattern self-test registry, so the integration test / batch runs can iterate them uniformly.
+ALL_SELFTESTS = [
+    ("reentrancy", "run_self_test"),
+    ("erc4626_inflation", "run_erc4626_self_test"),
+    ("amm_donation", "run_amm_self_test"),
+    ("spot_price", "run_spot_self_test"),
+    ("cross_function_reentrancy", "run_cross_reentrancy_self_test"),
+    ("share_exclusion", "run_exclusion_self_test"),
+    ("sell_burn", "run_sellburn_self_test"),
+    ("withdrawal_flaw", "run_withdrawflaw_self_test"),
+]
