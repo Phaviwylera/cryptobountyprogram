@@ -194,9 +194,15 @@ class Worker:
             return
         self._last_value_discovery = now
         try:
-            from .discovery import defillama_rows, llama_chain_name
-            min_tvl = float(os.environ.get("BOUNTYSCAN_DISCOVERY_MIN_TVL", "100000"))
-            rows = defillama_rows(min_tvl, chain=llama_chain_name(self.chain))
+            if self.discovery == "custody":
+                # Custody contracts (pools/vaults that actually hold TVL), not governance tokens.
+                from .discovery import custody_addresses
+                rows = custody_addresses(self.rpc.url,
+                                         univ2_max=int(os.environ.get("BOUNTYSCAN_CUSTODY_UNIV2_MAX", "500")))
+            else:
+                from .discovery import defillama_rows, llama_chain_name
+                min_tvl = float(os.environ.get("BOUNTYSCAN_DISCOVERY_MIN_TVL", "100000"))
+                rows = defillama_rows(min_tvl, chain=llama_chain_name(self.chain))
             addrs = [r["address"] for r in rows]
         except Exception as exc:
             self.last_error = f"discovery: {type(exc).__name__}: {exc}"
@@ -207,10 +213,12 @@ class Worker:
             write_protocol_map(Path(self.cfg.out_dir).parent.parent / "digests", rows)
         except Exception:
             pass
-        added = sum(self.store.enqueue(self.chain, a, "defillama") for a in addrs)
-        self.set_stage(f"Value-weighted discovery: {len(addrs)} protocols with TVL>${int(min_tvl):,}, {added} new queued")
-        self.add_event("found", f"DeFiLlama: {added} new high-TVL {self.chain} target(s) queued "
-                       f"(of {len(addrs)} resolved; the $10k on-chain floor filters again at scan time).")
+        origin = "custody" if self.discovery == "custody" else "defillama"
+        src = "custody contracts (pools/vaults)" if self.discovery == "custody" else "DeFiLlama protocols"
+        added = sum(self.store.enqueue(self.chain, a, origin) for a in addrs)
+        self.set_stage(f"Value-weighted discovery: {len(addrs)} {src} resolved, {added} new queued")
+        self.add_event("found", f"Discovery ({origin}): {added} new {self.chain} target(s) queued of {len(addrs)} "
+                       f"resolved; the $10k on-chain TVL floor filters at scan time.")
 
     FUNDED_ALERT_USD = 1000.0
 
