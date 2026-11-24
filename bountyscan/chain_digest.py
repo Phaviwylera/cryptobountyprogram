@@ -58,3 +58,47 @@ class Digest:
                 p.write_text(json.dumps(d, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+
+class Health:
+    """Write-only diagnostic alongside the main digest: <dir>/YYYY-MM-DD.health.json. Tells apart a healthy
+    empty run (scanner found nothing) from a broken one (RPC/forge failing, no recent targets). Never read
+    by any live system, never affects the scan or finding output; best-effort, never raises."""
+    def __init__(self, directory):
+        self.dir = Path(directory)
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+    def _path(self) -> Path:
+        return self.dir / (_today() + ".health.json")
+
+    def _blank(self) -> dict:
+        return {"date": _today(), "rpc_calls": 0, "rpc_errors": 0, "forge_runs": 0, "forge_timeouts": 0,
+                "forge_errors": 0, "last_target_at": None, "last_finding_at": None}
+
+    def record(self, rpc_calls: int = 0, rpc_errors: int = 0, forge_runs: int = 0, forge_timeouts: int = 0,
+               forge_errors: int = 0, target: bool = False, finding: bool = False) -> None:
+        try:
+            with _lock:
+                p = self._path()
+                d = self._blank()
+                if p.exists():
+                    try:
+                        d = json.loads(p.read_text(encoding="utf-8"))
+                    except Exception:
+                        d = self._blank()
+                d["rpc_calls"] = d.get("rpc_calls", 0) + int(rpc_calls)
+                d["rpc_errors"] = d.get("rpc_errors", 0) + int(rpc_errors)
+                d["forge_runs"] = d.get("forge_runs", 0) + int(forge_runs)
+                d["forge_timeouts"] = d.get("forge_timeouts", 0) + int(forge_timeouts)
+                d["forge_errors"] = d.get("forge_errors", 0) + int(forge_errors)
+                now = time.time()
+                if target:
+                    d["last_target_at"] = now
+                if finding:
+                    d["last_finding_at"] = now
+                p.write_text(json.dumps(d, indent=2), encoding="utf-8")
+        except Exception:
+            pass

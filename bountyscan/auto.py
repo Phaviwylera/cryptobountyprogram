@@ -209,15 +209,17 @@ def process(store, row, cfg: AutoConfig) -> str:
             and os.environ.get("BOUNTYSCAN_CHAIN_POC")):
         try:
             from .chain_payload import run_chain_payloads
-            from .chain_digest import Digest
+            from .chain_digest import Digest, Health
             from .forge_verify import forge_available
             if forge_available():
-                digest = Digest(Path(cfg.out_dir).parent.parent / "digests")
+                _digdir = Path(cfg.out_dir).parent.parent / "digests"
+                digest = Digest(_digdir)
+                health = Health(_digdir)
                 caps = dict(max_targets=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_TARGETS", "25")),
                             max_minutes=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_MINUTES", "30")),
                             max_pattern_matches=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_MATCHES", "5")))
                 chain_hits, chain_log = run_chain_payloads(theft, result.files, address, chain, cfg.rpc.url,
-                                                           digest=digest, **caps)
+                                                           digest=digest, health=health, **caps)
                 if chain_hits:
                     payload_confirmed = True      # survived BOTH the first and the second-block fork PoC
                     _log(cfg, "    chain-exploit CONFIRMED (2nd-block) " + str(len(chain_hits)) + ": "

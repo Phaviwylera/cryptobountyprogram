@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from bountyscan import chain_payload as cp
-from bountyscan.chain_digest import Digest
+from bountyscan.chain_digest import Digest, Health
 from bountyscan.chain_exploit import ChainVerdict
 
 
@@ -87,6 +87,62 @@ class DigestTest(unittest.TestCase):
             self.assertEqual(j["skipped_fp_clusters"], 1)
             self.assertEqual(j["confirmed_usd"], 10338.0)
             self.assertEqual(j["confirmed_targets"], ["0xaaa"])
+
+
+class HealthTest(unittest.TestCase):
+    def test_accumulates_and_writes_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = Health(tmp)
+            h.record(rpc_calls=1, rpc_errors=0, forge_runs=2, target=True, finding=True)
+            h.record(rpc_calls=1, rpc_errors=1, forge_timeouts=1, target=True)
+            files = list(Path(tmp).glob("*.health.json"))
+            self.assertEqual(len(files), 1)
+            j = json.loads(files[0].read_text())
+            self.assertEqual(j["rpc_calls"], 2)
+            self.assertEqual(j["rpc_errors"], 1)
+            self.assertEqual(j["forge_runs"], 2)
+            self.assertEqual(j["forge_timeouts"], 1)
+            self.assertIsNotNone(j["last_target_at"])
+            self.assertIsNotNone(j["last_finding_at"])
+
+    def test_never_raises_on_bad_dir(self):
+        h = Health("/nonexistent\x00/cannot/create")   # mkdir fails, record swallows
+        h.record(rpc_calls=1)                            # must not raise
+
+
+class HealthWiringTest(unittest.TestCase):
+    """The payload phase feeds the health counters without affecting finding output."""
+    def setUp(self):
+        self._poc = cp.run_chain_poc
+        self._blk = cp._latest_block
+        cp._latest_block = lambda rpc: 1_000_000
+
+    def tearDown(self):
+        cp.run_chain_poc = self._poc
+        cp._latest_block = self._blk
+
+    def test_confirmed_records_target_and_finding(self):
+        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=5, test_path="p")
+        with tempfile.TemporaryDirectory() as tmp:
+            h = Health(tmp)
+            out, _ = cp.run_chain_payloads([_f("reentrancy")], [], "0x0", "ethereum", "rpc", health=h)
+            self.assertEqual(len(out), 1)                 # finding output unchanged
+            j = json.loads(next(Path(tmp).glob("*.health.json")).read_text())
+            self.assertEqual(j["forge_runs"], 2)          # first block + second-block reconfirm
+            self.assertIsNotNone(j["last_target_at"])
+            self.assertIsNotNone(j["last_finding_at"])
+
+    def test_fp_cluster_records_target_only(self):
+        many = [_f("reentrancy", f"f{i}") for i in range(3)] + [_f("donation", "d"), _f("spot-price-oracle", "s"),
+                _f("erc4626-inflation", "e"), _f("unvalidated-flash-callback", "c")]
+        with tempfile.TemporaryDirectory() as tmp:
+            h = Health(tmp)
+            out, log = cp.run_chain_payloads(many, [], "0x0", "ethereum", "rpc", max_pattern_matches=5, health=h)
+            self.assertEqual(out, [])
+            j = json.loads(next(Path(tmp).glob("*.health.json")).read_text())
+            self.assertIsNotNone(j["last_target_at"])     # target counted
+            self.assertIsNone(j["last_finding_at"])       # but no finding
+            self.assertEqual(j["forge_runs"], 0)          # skipped before any forge run
 
 
 if __name__ == "__main__":

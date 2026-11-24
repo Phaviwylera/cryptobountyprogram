@@ -47,7 +47,7 @@ class ChainFinding:
 def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
                        fork_block: int | None = None, out_dir: Path | None = None,
                        max_targets: int = 25, max_minutes: int = 30, max_pattern_matches: int = 5,
-                       second_block_offset: int = 10, digest=None) -> tuple[list[ChainFinding], list]:
+                       second_block_offset: int = 10, digest=None, health=None) -> tuple[list[ChainFinding], list]:
     """Run the chain generator for each pattern-matched finding against the REAL target, under a staged-
     rollout cost cap, and emit a finding ONLY after it reconfirms on a SECOND fork block.
 
@@ -65,6 +65,8 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
     if len(pattern_findings) > max_pattern_matches:   # K cap: FP cluster, skip the whole contract
         if digest:
             digest.record(target, matched=len(pattern_findings), skipped=True)
+        if health:
+            health.record(target=True)
         return out, [("_skip", f"fp-cluster:{len(pattern_findings)}>{max_pattern_matches}")]
 
     latest = _latest_block(rpc_url)
@@ -73,6 +75,8 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
     confirmed = 0
     discarded_2nd = 0
     seen = set()
+    hc = {"rpc_calls": 1, "rpc_errors": 1 if latest is None else 0,
+          "forge_runs": 0, "forge_timeouts": 0, "forge_errors": 0}   # health counters for this contract
     for f in pattern_findings:
         if ran >= max_targets or time.time() > deadline:
             log.append(("_cap", "budget-exhausted"))
@@ -85,7 +89,10 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
         fn = _function_of(files, f)
         try:
             v = run_chain_poc(f, fn, target, chain, rpc_url, fork_block=fork_block)
+            hc["forge_runs"] += 1
         except Exception as exc:
+            hc["forge_runs"] += 1
+            hc["forge_errors"] += 1
             log.append((pat, f"ERROR:{exc}"[:60]))
             continue
         ran += 1
@@ -99,7 +106,10 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
             if second:
                 try:
                     v2 = run_chain_poc(f, fn, target, chain, rpc_url, fork_block=second)
+                    hc["forge_runs"] += 1
                 except Exception:
+                    hc["forge_runs"] += 1
+                    hc["forge_errors"] += 1
                     v2 = None
             if v2 is not None and v2.outcome == "confirmed":
                 out.append(ChainFinding(pat, chain, target, getattr(f, "function", ""), v.profit_wei, 0.0,
@@ -111,11 +121,17 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
                 log.append((pat, "DISCARDED-2nd-block"))
         elif v.outcome == "no_profit":
             log.append((pat, "DISCARDED"))
-        else:
+        else:                                             # error: compile / fork / timeout
+            if "timed out" in (v.detail or ""):
+                hc["forge_timeouts"] += 1
+            else:
+                hc["forge_errors"] += 1
             log.append((pat, f"ERROR:{v.detail}"[:60]))
     if digest:
         digest.record(target, matched=len(pattern_findings), ran=ran, confirmed=confirmed,
                       discarded_2nd=discarded_2nd, confirmed_usd=sum(h.gain_usd for h in out))
+    if health:
+        health.record(target=True, finding=(confirmed > 0), **hc)
     return out, log
 
 
