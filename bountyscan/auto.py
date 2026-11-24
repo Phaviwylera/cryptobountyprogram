@@ -10,6 +10,7 @@ Everything is read-only: sources come from the explorer, balances from eth_getBa
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -199,6 +200,25 @@ def process(store, row, cfg: AutoConfig) -> str:
             finally:
                 if cfg.on_payload:
                     cfg.on_payload("end", n_started)
+
+    # Chain-exploit generators (reentrancy / erc4626 / amm / spot-price) - ADDITIVE to the single-call
+    # probe, in the payload phase only. CONFIRMED (the attacker profit assertion passed on a fork) promotes
+    # the finding to payload_confirmed, which /poc reads; DISCARDED/ERROR emit nothing. Gated behind
+    # BOUNTYSCAN_CHAIN_POC so it never changes the running scan unless explicitly enabled.
+    if theft and cfg.forge_verify and cfg.rpc is not None and os.environ.get("BOUNTYSCAN_CHAIN_POC"):
+        try:
+            from .chain_payload import run_chain_payloads
+            from .forge_verify import forge_available
+            if forge_available():
+                chain_hits, chain_log = run_chain_payloads(theft, result.files, address, chain, cfg.rpc.url)
+                if chain_hits:
+                    payload_confirmed = True
+                    _log(cfg, "    chain-exploit CONFIRMED " + str(len(chain_hits)) + " finding(s): "
+                         + ", ".join(h.pattern for h in chain_hits))
+                elif chain_log:
+                    _log(cfg, "    chain-exploit: " + ", ".join(p + ":" + o for p, o in chain_log))
+        except Exception as exc:
+            _log(cfg, f"    chain-exploit warning ({exc}); keeping payload verdicts")
 
     if not theft:
         extra = ""
