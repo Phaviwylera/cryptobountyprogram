@@ -30,12 +30,11 @@ class Digest:
 
     def _blank(self) -> dict:
         return {"date": _today(), "targets_scanned": 0, "patterns_matched": 0, "generators_run": 0,
-                "confirmed": 0, "discarded_second_block": 0, "confirmed_usd": 0.0,
-                "skipped_fp_clusters": 0, "confirmed_targets": []}
+                "confirmed": 0, "discarded_second_block": 0, "below_threshold": 0, "confirmed_usd": 0.0,
+                "skipped_fp_clusters": 0, "skipped_low_tvl": 0, "confirmed_targets": []}
 
-    def record(self, target: str, matched: int = 0, ran: int = 0, confirmed: int = 0,
-               discarded_2nd: int = 0, confirmed_usd: float = 0.0, skipped: bool = False) -> None:
-        """Accumulate one contract's chain-payload outcome into today's digest. Best-effort; never raises."""
+    def _rmw(self, mutate) -> None:
+        """Read-modify-write today's digest under the shared lock. Best-effort; never raises."""
         try:
             with _lock:
                 p = self._path()
@@ -45,19 +44,35 @@ class Digest:
                         d = json.loads(p.read_text(encoding="utf-8"))
                     except Exception:
                         d = self._blank()
-                d["targets_scanned"] = d.get("targets_scanned", 0) + 1
-                d["patterns_matched"] = d.get("patterns_matched", 0) + int(matched)
-                d["generators_run"] = d.get("generators_run", 0) + int(ran)
-                d["confirmed"] = d.get("confirmed", 0) + int(confirmed)
-                d["discarded_second_block"] = d.get("discarded_second_block", 0) + int(discarded_2nd)
-                d["confirmed_usd"] = round(d.get("confirmed_usd", 0.0) + float(confirmed_usd), 2)
-                if skipped:
-                    d["skipped_fp_clusters"] = d.get("skipped_fp_clusters", 0) + 1
-                if confirmed > 0 and target not in d.get("confirmed_targets", []):
-                    d.setdefault("confirmed_targets", []).append(target)
+                mutate(d)
                 p.write_text(json.dumps(d, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    def record(self, target: str, matched: int = 0, ran: int = 0, confirmed: int = 0,
+               discarded_2nd: int = 0, confirmed_usd: float = 0.0, skipped: bool = False,
+               below_threshold: int = 0) -> None:
+        """Accumulate one contract's chain-payload outcome into today's digest. A contract that reaches
+        the payload phase is counted as scanned here; a contract dropped earlier by the TVL floor is NOT
+        (see record_skip_low_tvl). Best-effort; never raises."""
+        def mutate(d):
+            d["targets_scanned"] = d.get("targets_scanned", 0) + 1
+            d["patterns_matched"] = d.get("patterns_matched", 0) + int(matched)
+            d["generators_run"] = d.get("generators_run", 0) + int(ran)
+            d["confirmed"] = d.get("confirmed", 0) + int(confirmed)
+            d["discarded_second_block"] = d.get("discarded_second_block", 0) + int(discarded_2nd)
+            d["below_threshold"] = d.get("below_threshold", 0) + int(below_threshold)
+            d["confirmed_usd"] = round(d.get("confirmed_usd", 0.0) + float(confirmed_usd), 2)
+            if skipped:
+                d["skipped_fp_clusters"] = d.get("skipped_fp_clusters", 0) + 1
+            if confirmed > 0 and target not in d.get("confirmed_targets", []):
+                d.setdefault("confirmed_targets", []).append(target)
+        self._rmw(mutate)
+
+    def record_skip_low_tvl(self, chain: str = "", address: str = "", tvl_usd: float | None = None) -> None:
+        """A candidate dropped by the pre-detection TVL floor: counted separately in skipped_low_tvl and
+        deliberately NOT counted as scanned (it never reached pattern detection)."""
+        self._rmw(lambda d: d.__setitem__("skipped_low_tvl", d.get("skipped_low_tvl", 0) + 1))
 
 
 class Health:

@@ -23,12 +23,46 @@ class RunChainPayloads(unittest.TestCase):
         cp.run_chain_poc = self._poc
         cp._latest_block = self._blk
 
+    # economic inputs that clear the gate: 1 ETH profit at $3000, $1M target TVL
+    ECON = dict(target_tvl_usd=1_000_000.0, eth_price_usd=3000.0)
+
     def test_confirmed_requires_second_block_reconfirm(self):
-        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=500, test_path="p.t.sol")
-        out, log = cp.run_chain_payloads([_f("reentrancy")], [], "0x" + "ab" * 20, "ethereum", "rpc")
-        self.assertEqual(len(out), 1)                     # confirmed on BOTH blocks
-        self.assertEqual(out[0].gain_wei, 500)
+        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=10**18, test_path="p.t.sol")
+        out, log = cp.run_chain_payloads([_f("reentrancy")], [], "0x" + "ab" * 20, "ethereum", "rpc", **self.ECON)
+        self.assertEqual(len(out), 1)                     # confirmed on BOTH blocks AND clears the gate
+        self.assertEqual(out[0].gain_wei, 10**18)
+        self.assertEqual(out[0].gain_usd, 3000.0)
+        self.assertEqual(out[0].target_tvl_usd, 1_000_000.0)
         self.assertIn(("reentrancy", "CONFIRMED-2x"), log)
+
+    def test_below_min_gain_is_discarded(self):
+        # confirmed on both blocks, but 0.001 ETH (~$3) profit < $100 -> below_threshold, nothing emitted
+        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=10**15, test_path="p")
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Digest(tmp)
+            out, log = cp.run_chain_payloads([_f("reentrancy")], [], "0x0", "ethereum", "rpc",
+                                             digest=d, target_tvl_usd=1_000_000.0, eth_price_usd=3000.0)
+            self.assertEqual(out, [])
+            self.assertTrue(any(k == "reentrancy" and o.startswith("BELOW-THRESHOLD") and "gain=" in o for k, o in log))
+            j = json.loads(next(Path(tmp).glob("*.json")).read_text())
+            self.assertEqual(j["below_threshold"], 1)
+            self.assertEqual(j["confirmed"], 0)
+
+    def test_below_min_tvl_is_discarded(self):
+        # big profit, but the target only holds $5k < $10k floor -> below_threshold, nothing emitted
+        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=10**18, test_path="p")
+        out, log = cp.run_chain_payloads([_f("reentrancy")], [], "0x0", "ethereum", "rpc",
+                                         target_tvl_usd=5_000.0, eth_price_usd=3000.0)
+        self.assertEqual(out, [])
+        self.assertTrue(any(k == "reentrancy" and o.startswith("BELOW-THRESHOLD") and "tvl=" in o for k, o in log))
+
+    def test_unknown_eth_price_discards(self):
+        # cannot price the gain -> cannot prove >= $100 -> discard, never emit on faith
+        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=10**18, test_path="p")
+        out, log = cp.run_chain_payloads([_f("reentrancy")], [], "0x0", "ethereum", "rpc",
+                                         target_tvl_usd=1_000_000.0, eth_price_usd=None)
+        # eth_price_usd=None triggers an on-chain fetch; with rpc="rpc" that fails -> None -> below_threshold
+        self.assertEqual(out, [])
 
     def test_second_block_discard(self):
         calls = {"n": 0}
@@ -88,6 +122,23 @@ class DigestTest(unittest.TestCase):
             self.assertEqual(j["confirmed_usd"], 10338.0)
             self.assertEqual(j["confirmed_targets"], ["0xaaa"])
 
+    def test_skip_low_tvl_counter_does_not_count_as_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Digest(tmp)
+            d.record("0xaaa", matched=1, ran=1, confirmed=0)   # one real scan
+            d.record_skip_low_tvl("ethereum", "0xbbb", 12.0)    # two floor skips
+            d.record_skip_low_tvl("ethereum", "0xccc", None)
+            j = json.loads(next(Path(tmp).glob("*.json")).read_text())
+            self.assertEqual(j["skipped_low_tvl"], 2)
+            self.assertEqual(j["targets_scanned"], 1)           # skips are NOT scanned targets
+
+    def test_below_threshold_counter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Digest(tmp)
+            d.record("0xaaa", matched=1, ran=1, confirmed=0, below_threshold=1)
+            j = json.loads(next(Path(tmp).glob("*.json")).read_text())
+            self.assertEqual(j["below_threshold"], 1)
+
 
 class HealthTest(unittest.TestCase):
     def test_accumulates_and_writes_file(self):
@@ -122,10 +173,11 @@ class HealthWiringTest(unittest.TestCase):
         cp._latest_block = self._blk
 
     def test_confirmed_records_target_and_finding(self):
-        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=5, test_path="p")
+        cp.run_chain_poc = lambda *a, **k: ChainVerdict("reentrancy", "confirmed", "d", profit_wei=10**18, test_path="p")
         with tempfile.TemporaryDirectory() as tmp:
             h = Health(tmp)
-            out, _ = cp.run_chain_payloads([_f("reentrancy")], [], "0x0", "ethereum", "rpc", health=h)
+            out, _ = cp.run_chain_payloads([_f("reentrancy")], [], "0x0", "ethereum", "rpc", health=h,
+                                           target_tvl_usd=1_000_000.0, eth_price_usd=3000.0)
             self.assertEqual(len(out), 1)                 # finding output unchanged
             j = json.loads(next(Path(tmp).glob("*.health.json")).read_text())
             self.assertEqual(j["forge_runs"], 2)          # first block + second-block reconfirm

@@ -35,27 +35,46 @@ class ChainFinding:
     address: str
     function: str
     gain_wei: int
-    gain_usd: float
+    gain_usd: float         # attacker profit in USD (eth_price * gain_wei) - must clear min_gain_usd
     token: str              # token address the attacker gained (native sentinel for ETH)
     poc_path: str           # runnable: forge test --match-path <poc_path>
     report_path: str        # Immunefi-format report
+    target_tvl_usd: float = 0.0   # the target's value-at-risk at scan time - must clear min_tvl_usd
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
+def _eth_price(rpc_url: str) -> float | None:
+    """USD price of ETH from on-chain Chainlink (via value.prices), or None if unavailable."""
+    try:
+        from .rpc import RPC
+        from .value import prices
+        return prices(RPC(rpc_url), 1).get("eth")
+    except Exception:
+        return None
+
+
 def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
                        fork_block: int | None = None, out_dir: Path | None = None,
                        max_targets: int = 25, max_minutes: int = 30, max_pattern_matches: int = 5,
-                       second_block_offset: int = 10, digest=None, health=None) -> tuple[list[ChainFinding], list]:
+                       second_block_offset: int = 10, digest=None, health=None,
+                       target_tvl_usd: float | None = None, eth_price_usd: float | None = None,
+                       min_gain_usd: float = 100.0, min_tvl_usd: float = 10_000.0) -> tuple[list[ChainFinding], list]:
     """Run the chain generator for each pattern-matched finding against the REAL target, under a staged-
-    rollout cost cap, and emit a finding ONLY after it reconfirms on a SECOND fork block.
+    rollout cost cap, and emit a finding ONLY after it reconfirms on a SECOND fork block AND clears an
+    economically meaningful threshold.
 
     Caps: at most `max_targets` PoC runs and `max_minutes` wall-clock per contract; a contract matching
     more than `max_pattern_matches` patterns is skipped as a likely false-positive cluster. Chain is
     restricted to Ethereum mainnet. Every CONFIRMED PoC is re-run at `latest - second_block_offset`; a
-    finding that does not reproduce there is DISCARDED (transient-state false positive). The digest, if
-    given, records the per-contract tally.
+    finding that does not reproduce there is DISCARDED (transient-state false positive).
+
+    Economic gate: a twice-confirmed PoC is a finding ONLY when the attacker's realised profit
+    `gain_usd >= min_gain_usd` ($100) AND the target's value-at-risk `target_tvl_usd >= min_tvl_usd`
+    ($10k). Any profit > 0 below these is a build artifact, not a bug: it is DISCARDED and logged to the
+    digest as `below_threshold`. `target_tvl_usd` is the holdings USD computed by the scan pipeline at
+    scan time; `eth_price_usd` converts gain_wei (native) to USD (fetched on-chain if not supplied).
     """
     out: list[ChainFinding] = []
     log: list[tuple[str, str]] = []
@@ -69,11 +88,14 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
             health.record(target=True)
         return out, [("_skip", f"fp-cluster:{len(pattern_findings)}>{max_pattern_matches}")]
 
+    eth_px = eth_price_usd if eth_price_usd is not None else _eth_price(rpc_url)
+    tvl = target_tvl_usd if target_tvl_usd is not None else 0.0
     latest = _latest_block(rpc_url)
     deadline = time.time() + max_minutes * 60
     ran = 0
     confirmed = 0
     discarded_2nd = 0
+    below_threshold = 0
     seen = set()
     hc = {"rpc_calls": 1, "rpc_errors": 1 if latest is None else 0,
           "forge_runs": 0, "forge_timeouts": 0, "forge_errors": 0}   # health counters for this contract
@@ -112,10 +134,25 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
                     hc["forge_errors"] += 1
                     v2 = None
             if v2 is not None and v2.outcome == "confirmed":
-                out.append(ChainFinding(pat, chain, target, getattr(f, "function", ""), v.profit_wei, 0.0,
-                                        NATIVE_TOKEN, v.test_path, ""))
-                confirmed += 1
-                log.append((pat, "CONFIRMED-2x"))
+                # Economic gate: a profit > 0 is not a finding unless it is economically meaningful AND the
+                # target actually holds value. gain_wei is native (ETH) wei; price it, require >= $100 gain
+                # and >= $10k target TVL. Below either -> DISCARD as a build artifact (below_threshold).
+                gain_usd = (v.profit_wei / 1e18) * eth_px if eth_px else None
+                gain_ok = gain_usd is not None and gain_usd >= min_gain_usd
+                tvl_ok = tvl >= min_tvl_usd
+                if gain_ok and tvl_ok:
+                    out.append(ChainFinding(pat, chain, target, getattr(f, "function", ""), v.profit_wei,
+                                            round(gain_usd, 2), NATIVE_TOKEN, v.test_path, "", round(tvl, 2)))
+                    confirmed += 1
+                    log.append((pat, "CONFIRMED-2x"))
+                else:
+                    below_threshold += 1
+                    why = []
+                    if not gain_ok:
+                        why.append(f"gain=${(gain_usd or 0):.0f}<{min_gain_usd:.0f}")
+                    if not tvl_ok:
+                        why.append(f"tvl=${tvl:.0f}<{min_tvl_usd:.0f}")
+                    log.append((pat, "BELOW-THRESHOLD:" + ",".join(why)))
             else:
                 discarded_2nd += 1
                 log.append((pat, "DISCARDED-2nd-block"))
@@ -129,7 +166,8 @@ def run_chain_payloads(findings, files, target: str, chain: str, rpc_url: str,
             log.append((pat, f"ERROR:{v.detail}"[:60]))
     if digest:
         digest.record(target, matched=len(pattern_findings), ran=ran, confirmed=confirmed,
-                      discarded_2nd=discarded_2nd, confirmed_usd=sum(h.gain_usd for h in out))
+                      discarded_2nd=discarded_2nd, below_threshold=below_threshold,
+                      confirmed_usd=sum(h.gain_usd for h in out))
     if health:
         health.record(target=True, finding=(confirmed > 0), **hc)
     return out, log

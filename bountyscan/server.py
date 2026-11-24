@@ -64,6 +64,10 @@ class Worker:
         self.min_balance_wei = 0
         self.min_value_usd = 0.0
         self._last_recheck = 0.0
+        # Discovery source: "blocks" = every newly-deployed contract (legacy); "defillama" = value-weighted
+        # (high-TVL protocols only). The window runs "defillama" so the queue is real protocols, not mocks.
+        self.discovery = os.environ.get("BOUNTYSCAN_DISCOVERY", "blocks").lower()
+        self._last_value_discovery = 0.0
         self.current = None
         self.last_error = None
         self.started_at = None
@@ -121,7 +125,10 @@ class Worker:
         while not self._stop.is_set():
             try:
                 if self.mode == "live" and self.rpc is not None:
-                    self._discover_step()
+                    if self.discovery == "defillama":
+                        self._discover_value_step()
+                    else:
+                        self._discover_step()
                 if self.rpc is not None and time.time() - self._last_recheck > 600:
                     self._recheck_vulnerable_value()
                 idle_now = (self.mode == "draining" and not self.store.pending_count()
@@ -176,6 +183,28 @@ class Worker:
             with self.lock:
                 discover_blocks(self.store, self.rpc, self.chain, self.cursor + 1, end, self.cfg)
             self.cursor = end
+
+    VALUE_DISCOVERY_INTERVAL = 6 * 3600   # re-pull the DeFiLlama protocol list every 6 hours
+
+    def _discover_value_step(self):
+        """Value-weighted discovery: enqueue high-TVL protocol contracts from DeFiLlama. Throttled to
+        every VALUE_DISCOVERY_INTERVAL (the list barely moves hour to hour); enqueue is idempotent."""
+        now = time.time()
+        if self._last_value_discovery and now - self._last_value_discovery < self.VALUE_DISCOVERY_INTERVAL:
+            return
+        self._last_value_discovery = now
+        try:
+            from .discovery import defillama_addresses, llama_chain_name
+            min_tvl = float(os.environ.get("BOUNTYSCAN_DISCOVERY_MIN_TVL", "100000"))
+            addrs = defillama_addresses(min_tvl, chain=llama_chain_name(self.chain))
+        except Exception as exc:
+            self.last_error = f"discovery: {type(exc).__name__}: {exc}"
+            self._last_value_discovery = now - self.VALUE_DISCOVERY_INTERVAL + 300   # retry in ~5 min
+            return
+        added = sum(self.store.enqueue(self.chain, a, "defillama") for a in addrs)
+        self.set_stage(f"Value-weighted discovery: {len(addrs)} protocols with TVL>${int(min_tvl):,}, {added} new queued")
+        self.add_event("found", f"DeFiLlama: {added} new high-TVL {self.chain} target(s) queued "
+                       f"(of {len(addrs)} resolved; the $10k on-chain floor filters again at scan time).")
 
     FUNDED_ALERT_USD = 1000.0
 

@@ -63,6 +63,18 @@ def _event(cfg: AutoConfig, kind: str, msg: str) -> None:
             pass
 
 
+def _active_digest(cfg: AutoConfig):
+    """The chain-poc daily digest when the window is enabled, else None. Used so the pre-detection TVL
+    floor can record skips (skipped_low_tvl) into the same digest the payload phase writes."""
+    if not os.environ.get("BOUNTYSCAN_CHAIN_POC"):
+        return None
+    try:
+        from .chain_digest import Digest
+        return Digest(Path(cfg.out_dir).parent.parent / "digests")
+    except Exception:
+        return None
+
+
 def parse_address_lines(text: str, default_chain: str) -> list[tuple[str, str]]:
     out = []
     for raw in text.splitlines():
@@ -98,10 +110,20 @@ def process(store, row, cfg: AutoConfig) -> str:
         except (RPCError, ValueError) as exc:
             _log(cfg, f"    rpc warning: {exc}")
         value_fields = value_columns(held)
-        too_little = (balance is not None and balance < cfg.min_balance_wei) or \
-            (cfg.min_value_usd > 0 and held is not None and held["usd"] is not None and held["usd"] < cfg.min_value_usd)
-        if too_little:
-            store.update(chain, address, status="low_value", balance_wei=None if balance is None else str(balance), **value_fields)
+        # Hard TVL floor, BEFORE pattern detection and the payload phase. value-at-risk = native + the
+        # major tokens DeFi value sits in (value.holdings, Chainlink-priced, on-chain). A contract below
+        # the floor - OR whose value could not be read at all - is SKIPPED entirely: no detection, no
+        # fork run. Most newly-deployed contracts are test deployments with $0; this is what drops them.
+        tvl_usd = held["usd"] if held is not None else None
+        below_balance = balance is not None and balance < cfg.min_balance_wei
+        below_tvl = cfg.min_value_usd > 0 and (tvl_usd is None or tvl_usd < cfg.min_value_usd)
+        if below_balance or below_tvl:
+            store.update(chain, address, status="low_value",
+                         balance_wei=None if balance is None else str(balance), **value_fields)
+            if below_tvl:
+                d = _active_digest(cfg)
+                if d:
+                    d.record_skip_low_tvl(chain, address, tvl_usd)   # separate counter; NOT counted as scanned
             return "low_value"
         # Impersonation/spoof tokens (Etherscan "reported for impersonating…"): fake near-max-uint
         # supply, hold no value, nothing to steal. Drop before the costly source-fetch + fork run.
@@ -187,14 +209,13 @@ def process(store, row, cfg: AutoConfig) -> str:
                         cfg.on_payload(pv.outcome)
                 kept = [pv.finding for pv in payloads if pv.is_finding]
                 dropped = n_started - len(kept)
-                conf = sum(pv.outcome == "confirmed" for pv in payloads)
                 if dropped:
                     _log(cfg, f"    payload attack disproved {dropped} finding(s) (reverted / no funds moved)")
                 payload_note = f" ({dropped} disproved by payload attack)" if dropped else ""
                 theft = kept
-                payload_confirmed = conf > 0
-                if conf:
-                    _log(cfg, f"    payload attack CONFIRMED {conf} finding(s)")
+                # The single-call probe FILTERS (disproves reverts / no-fund-moves) but no longer CONFIRMS
+                # on its own: "any gain > 0" is a build artifact, not a finding. payload_confirmed is set
+                # only by the chain-exploit economic gate below (2nd-block reconfirm + >=$100 gain + >=$10k TVL).
             except Exception as exc:
                 _log(cfg, f"    payload attack warning ({exc}); keeping static verdicts")
             finally:
@@ -217,9 +238,13 @@ def process(store, row, cfg: AutoConfig) -> str:
                 health = Health(_digdir)
                 caps = dict(max_targets=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_TARGETS", "25")),
                             max_minutes=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_MINUTES", "30")),
-                            max_pattern_matches=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_MATCHES", "5")))
+                            max_pattern_matches=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_MATCHES", "5")),
+                            min_gain_usd=float(os.environ.get("BOUNTYSCAN_CHAIN_MIN_GAIN_USD", "100")),
+                            min_tvl_usd=float(os.environ.get("BOUNTYSCAN_CHAIN_MIN_TVL_USD", "10000")))
+                tvl_usd = held["usd"] if held is not None else None
                 chain_hits, chain_log = run_chain_payloads(theft, result.files, address, chain, cfg.rpc.url,
-                                                           digest=digest, health=health, **caps)
+                                                           digest=digest, health=health,
+                                                           target_tvl_usd=tvl_usd, **caps)
                 if chain_hits:
                     payload_confirmed = True      # survived BOTH the first and the second-block fork PoC
                     _log(cfg, "    chain-exploit CONFIRMED (2nd-block) " + str(len(chain_hits)) + ": "

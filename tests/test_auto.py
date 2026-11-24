@@ -142,6 +142,57 @@ class AutoModeTests(unittest.TestCase):
             self.assertEqual(run_queue(self.store, self.cfg), {"safe": 1})
 
 
+class _FakeRPC:
+    url = "http://rpc"
+
+    def code(self, a):
+        return "0x60"       # has code
+
+    def balance(self, a):
+        return 0
+
+
+class TvlFloorTests(unittest.TestCase):
+    """The hard TVL floor skips a low/unknown-value target BEFORE detection and records skipped_low_tvl."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = Store(self.root / "state.db")
+        # digests land at out_dir.parent.parent / "digests" == root/"digests"
+        self.cfg = AutoConfig(out_dir=self.root / "data" / "reports", cache_dir=self.root / "cache",
+                              quiet=True, verify=False, rpc=_FakeRPC(), min_value_usd=10_000.0)
+
+    def tearDown(self):
+        self.store.db.close()
+        self.tmp.cleanup()
+
+    def _run_one(self, addr, usd):
+        self.store.enqueue("ethereum", addr, "defillama")
+        row = self.store.fetch_one("ethereum", addr)
+        with mock.patch.object(auto, "read_holdings", lambda *a, **k: {"usd": usd, "items": [], "priced": usd is not None}), \
+                mock.patch.object(auto, "fetch_verified_source", side_effect=AssertionError("must not fetch below floor")), \
+                mock.patch.object(auto, "scan", side_effect=AssertionError("must not scan below floor")), \
+                mock.patch.dict("os.environ", {"BOUNTYSCAN_CHAIN_POC": "1"}):
+            return auto.process(self.store, row, self.cfg)
+
+    def _digest(self):
+        import json as _json
+        files = list((self.root / "digests").glob("*.json"))
+        return _json.loads(files[0].read_text(encoding="utf-8")) if files else {}
+
+    def test_below_floor_is_skipped_and_counted(self):
+        self.assertEqual(self._run_one("0x" + "a1" * 20, 42.0), "low_value")
+        d = self._digest()
+        self.assertEqual(d.get("skipped_low_tvl"), 1)
+        self.assertEqual(d.get("targets_scanned", 0), 0)      # a skip is NOT a scanned target
+
+    def test_unknown_value_is_skipped(self):
+        # value could not be read (RPC/pricing failed) -> cannot prove >= floor -> skip
+        self.assertEqual(self._run_one("0x" + "a2" * 20, None), "low_value")
+        self.assertEqual(self._digest().get("skipped_low_tvl"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 
