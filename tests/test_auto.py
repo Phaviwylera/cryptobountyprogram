@@ -178,7 +178,8 @@ class TvlFloorTests(unittest.TestCase):
 
     def _digest(self):
         import json as _json
-        files = list((self.root / "digests").glob("*.json"))
+        files = [p for p in (self.root / "digests").glob("*.json")
+                 if ".targets." not in p.name and ".health." not in p.name]   # the core digest, not the side files
         return _json.loads(files[0].read_text(encoding="utf-8")) if files else {}
 
     def _targets(self):
