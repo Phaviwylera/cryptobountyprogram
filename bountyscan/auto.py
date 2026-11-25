@@ -154,7 +154,22 @@ def process(store, row, cfg: AutoConfig) -> str:
         # major tokens DeFi value sits in (value.holdings, Chainlink-priced, on-chain). A contract below
         # the floor - OR whose value could not be read at all - is SKIPPED entirely: no detection, no
         # fork run. Most newly-deployed contracts are test deployments with $0; this is what drops them.
-        tvl_usd = held["usd"] if held is not None else None
+        value_at_risk = held["usd"] if held is not None else None
+        # Second-chance exotic-token pricing: a pool may hold value in a non-major token (LINK, CRV, PEPE,
+        # ...) the Chainlink-major floor misses. Only for a contract that fell below the floor on majors,
+        # price a wider token set (DeFiLlama) before skipping it. Pricing logic only - the floor THRESHOLD
+        # is unchanged. Opt-in so the base behaviour and tests are untouched.
+        if (cfg.min_value_usd > 0 and cfg.rpc is not None and os.environ.get("BOUNTYSCAN_EXOTIC_PRICING")
+                and (value_at_risk is None or value_at_risk < cfg.min_value_usd)):
+            try:
+                from .pricing import extended_token_value_usd
+                extra = extended_token_value_usd(cfg.rpc, address)
+                if extra > 0:
+                    value_at_risk = (value_at_risk or 0.0) + extra
+                    value_fields["value_usd"] = round(value_at_risk, 2)   # record the rescued value
+            except Exception:
+                pass
+        tvl_usd = value_at_risk
         below_balance = balance is not None and balance < cfg.min_balance_wei
         below_tvl = cfg.min_value_usd > 0 and (tvl_usd is None or tvl_usd < cfg.min_value_usd)
         if below_balance or below_tvl:
@@ -283,7 +298,7 @@ def process(store, row, cfg: AutoConfig) -> str:
                             max_pattern_matches=int(os.environ.get("BOUNTYSCAN_CHAIN_MAX_MATCHES", "5")),
                             min_gain_usd=float(os.environ.get("BOUNTYSCAN_CHAIN_MIN_GAIN_USD", "100")),
                             min_tvl_usd=float(os.environ.get("BOUNTYSCAN_CHAIN_MIN_TVL_USD", "10000")))
-                tvl_usd = held["usd"] if held is not None else None
+                tvl_usd = value_at_risk   # set in the floor block above (always runs when cfg.rpc is set)
                 audit = _active_audit(cfg)
                 from .chain_audit import load_protocol_names
                 tname = load_protocol_names(_digests_dir(cfg)).get(address.lower())

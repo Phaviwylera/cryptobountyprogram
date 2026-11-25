@@ -50,6 +50,65 @@ class CustodyResolutionTests(unittest.TestCase):
             self.assertEqual(custody_addresses("http://rpc"), [])
 
 
+class PeripheryResolverTests(unittest.TestCase):
+    def _word(self, n):
+        return "%064x" % n
+
+    def test_univ3_extracts_pool_from_last_data_word(self):
+        pool = "0x" + "77" * 20
+        data = "0x" + self._word(60) + self._word(int(pool, 16))     # (tickSpacing, pool)
+
+        def fake_post(url, method, params, timeout=30.0):
+            if method == "eth_blockNumber":
+                return hex(1_000_000)
+            if method == "eth_getLogs":
+                frm = int(params[0]["fromBlock"], 16)
+                return [{"data": data}] if frm == max(0, 1_000_000 - 300_000) else []
+            return None
+        with mock.patch.object(discovery, "_rpc_post", fake_post):
+            self.assertEqual(discovery.univ3_pool_addresses("http://rpc"), [pool.lower()])
+
+    def test_balancer_extracts_pool_from_poolid_topic(self):
+        pool = "0x" + "88" * 20
+        poolid = "0x" + pool[2:] + "00" * 12      # Balancer poolId = pool ++ nonce/specialization
+
+        def fake_post(url, method, params, timeout=30.0):
+            if method == "eth_blockNumber":
+                return hex(1_000_000)
+            if method == "eth_getLogs":
+                frm = int(params[0]["fromBlock"], 16)
+                return [{"topics": [discovery.TOPIC_POOL_REGISTERED, poolid]}] if frm == max(0, 1_000_000 - 400_000) else []
+            return None
+        with mock.patch.object(discovery, "_rpc_post", fake_post):
+            self.assertEqual(discovery.balancer_pool_addresses("http://rpc"), [pool.lower()])
+
+    def test_is_erc4626_true_when_asset_and_convert_respond(self):
+        asset_word = "0x" + "0" * 24 + "cd" * 20
+        def fake_post(url, method, params, timeout=30.0):
+            data = params[0]["data"]
+            if data == "0x" + discovery.SEL_ASSET:
+                return asset_word
+            return "0x" + "%064x" % (5 * 10**17)    # convertToShares -> nonzero
+        with mock.patch.object(discovery, "_rpc_post", fake_post):
+            self.assertTrue(discovery.is_erc4626("http://rpc", "0x" + "ab" * 20))
+
+    def test_is_erc4626_false_when_no_asset(self):
+        with mock.patch.object(discovery, "_rpc_post", lambda *a, **k: "0x" + "0" * 64):
+            self.assertFalse(discovery.is_erc4626("http://rpc", "0x" + "ab" * 20))
+
+    def test_recent_verified_pulls_blockscout_pages(self):
+        # Blockscout v2 nests the address under {"address": {"hash": ...}}; also tolerate flat forms.
+        pages = [([{"address": {"hash": "0x" + "11" * 20}}, {"address_hash": "0x" + "22" * 20}], 7),
+                 ([{"address": "0x" + "33" * 20}], None)]
+        calls = {"n": 0}
+        def fake_page(chain, cursor):
+            i = calls["n"]; calls["n"] += 1
+            return pages[i]
+        with mock.patch("bountyscan.sources.blockscout_verified_page", fake_page):
+            got = discovery.recent_verified_addresses("ethereum", pages=4)
+        self.assertEqual(got, ["0x" + "11" * 20, "0x" + "22" * 20, "0x" + "33" * 20])
+
+
 class DiscoveryParseTests(unittest.TestCase):
     def _payload(self):
         return [

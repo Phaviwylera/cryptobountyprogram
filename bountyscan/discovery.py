@@ -152,7 +152,157 @@ def _nonzero_addr(word_bytes: bytes) -> str | None:
     return a if int(a, 16) != 0 else None
 
 
-def custody_addresses(rpc_url: str, univ2_max: int = 500, curve_max: int = 200) -> list[dict]:
+# ---- extended resolvers: periphery / newer DeFi primitives (higher bug density) --------------------
+CONVEX_BOOSTER = "0xF403C135812408BFbE8713b5A23a04b3D48AAE31"
+UNIV3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+BALANCER_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+
+SEL_POOL_LENGTH = "081e3eda"         # Convex Booster poolLength() -> uint256
+SEL_POOL_INFO = "1526fe27"           # Convex Booster poolInfo(uint256) -> (lptoken,token,gauge,crvRewards,stash,shutdown)
+# event topic0 (keccak of the event signature), both publicly documented and validated on-chain before deploy:
+TOPIC_POOL_CREATED = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"   # UniV3 PoolCreated(...)
+TOPIC_POOL_REGISTERED = "0x3c13bc30b8e878c53fd2a36b679409c073afd75950be43d8858768e956fbc20e"  # Balancer PoolRegistered
+# ERC-4626 detection selectors
+SEL_ASSET = "38d52e0f"                # asset() -> address
+SEL_CONVERT_TO_SHARES = "c6e6f592"    # convertToShares(uint256) -> uint256
+
+
+def _rpc_post(rpc_url: str, method: str, params, timeout: float = 30.0):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    req = urllib.request.Request(rpc_url, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    if "error" in d:
+        raise RuntimeError(str(d["error"])[:120])
+    return d.get("result")
+
+
+def _block_number(rpc_url: str) -> int:
+    return int(_rpc_post(rpc_url, "eth_blockNumber", []), 16)
+
+
+def _logs_pool_addresses(rpc_url: str, address: str, topic0: str, blocks_back: int, max_pools: int,
+                         extract, window: int = 9000) -> list[str]:
+    """Collect addresses from `address`'s `topic0` logs over the last `blocks_back` blocks (chunked), using
+    `extract(log) -> address|None`. Bounded by max_pools. Best-effort: a failing window is skipped."""
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        head = _block_number(rpc_url)
+    except Exception:
+        return out
+    frm = max(0, head - blocks_back)
+    b = frm
+    while b <= head and len(out) < max_pools:
+        to = min(b + window, head)
+        try:
+            logs = _rpc_post(rpc_url, "eth_getLogs",
+                             [{"address": address, "topics": [topic0], "fromBlock": hex(b), "toBlock": hex(to)}])
+            for lg in logs or []:
+                a = extract(lg)
+                if a and a not in seen:
+                    seen.add(a)
+                    out.append(a)
+                    if len(out) >= max_pools:
+                        break
+        except Exception:
+            pass
+        b = to + 1
+    return out
+
+
+def univ3_pool_addresses(rpc_url: str, blocks_back: int = 300_000, max_pools: int = 1500) -> list[str]:
+    """Uniswap V3 pools from recent PoolCreated events (the pool address is the last 32-byte word of data)."""
+    def extract(lg):
+        data = lg.get("data", "")
+        h = data[2:] if data.startswith("0x") else data
+        return ("0x" + h[-40:]) if len(h) >= 64 else None
+    return _logs_pool_addresses(rpc_url, UNIV3_FACTORY, TOPIC_POOL_CREATED, blocks_back, max_pools, extract)
+
+
+def balancer_pool_addresses(rpc_url: str, blocks_back: int = 400_000, max_pools: int = 1000) -> list[str]:
+    """Balancer v2 pools from recent PoolRegistered events (poolId topic's first 20 bytes = pool address)."""
+    def extract(lg):
+        topics = lg.get("topics", [])
+        if len(topics) >= 2:
+            pid = topics[1][2:] if topics[1].startswith("0x") else topics[1]
+            return "0x" + pid[:40]
+        return None
+    return _logs_pool_addresses(rpc_url, BALANCER_VAULT, TOPIC_POOL_REGISTERED, blocks_back, max_pools, extract)
+
+
+def convex_reward_pools(rpc_url: str, max_pools: int = 400) -> list[str]:
+    """Convex staking (BaseRewardPool) contracts from the Booster: poolInfo(i).crvRewards (word 3)."""
+    from .rpc import RPC
+    from .value import MULTICALL3, _call, _word, decode_aggregate3, encode_aggregate3
+    rpc = RPC(rpc_url)
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        n = int(_call(rpc, CONVEX_BOOSTER, "0x" + SEL_POOL_LENGTH), 16)
+    except Exception:
+        return out
+    idxs = list(range(min(n, max_pools)))
+    for i in range(0, len(idxs), 40):
+        group = idxs[i:i + 40]
+        calls = [(CONVEX_BOOSTER, bytes.fromhex(SEL_POOL_INFO) + bytes.fromhex(_word(j))) for j in group]
+        try:
+            res = decode_aggregate3(_call(rpc, MULTICALL3, encode_aggregate3(calls)))
+        except Exception:
+            continue
+        for ok, data in res:
+            if ok and len(data) >= 4 * 32:
+                a = "0x" + data[3 * 32 + 12:4 * 32].hex()   # crvRewards = word 3
+                if int(a, 16) != 0 and a not in seen:
+                    seen.add(a)
+                    out.append(a)
+    return out
+
+
+def is_erc4626(rpc_url: str, address: str) -> bool:
+    """True if `address` looks like an ERC-4626 vault: asset() returns an address and convertToShares(1e18)
+    returns a value without reverting. Read-only; best-effort (False on any error)."""
+    try:
+        asset = _rpc_post(rpc_url, "eth_call", [{"to": address, "data": "0x" + SEL_ASSET}, "latest"])
+        if not asset or len(asset) < 66 or int(asset, 16) == 0:
+            return False
+        shares = _rpc_post(rpc_url, "eth_call",
+                           [{"to": address, "data": "0x" + SEL_CONVERT_TO_SHARES + "%064x" % (10 ** 18)}, "latest"])
+        return bool(shares and shares != "0x" and len(shares) >= 66)
+    except Exception:
+        return False
+
+
+def recent_verified_addresses(chain: str = "ethereum", pages: int = 4) -> list[str]:
+    """Most-recently-verified contracts (the 'new, un-audited code' universe) via Blockscout's verified
+    list, newest first. The TVL floor filters these at scan time. Best-effort."""
+    from .sources import blockscout_verified_page
+    out: list[str] = []
+    seen: set[str] = set()
+    cursor = None
+    for _ in range(max(1, pages)):
+        try:
+            items, cursor = blockscout_verified_page(chain, cursor)
+        except Exception:
+            break
+        for it in items or []:
+            # Blockscout v2 nests the address: {"address": {"hash": "0x.."}}; tolerate flat forms too.
+            af = it.get("address")
+            if isinstance(af, dict):
+                a = (af.get("hash") or "").lower()
+            else:
+                a = (af or it.get("address_hash") or it.get("hash") or "").lower()
+            if ADDRESS_RE.match(a) and a not in seen:
+                seen.add(a)
+                out.append(a)
+        if not cursor:
+            break
+    return out
+
+
+def custody_addresses(rpc_url: str, univ2_max: int = 500, curve_max: int = 200,
+                      include_periphery: bool = False, include_logs: bool = False, univ3_max: int = 1500,
+                      balancer_max: int = 1000, convex_max: int = 400) -> list[dict]:
     """Enumerate custody contracts (Compound cTokens, Curve pools, Aave aTokens, Uniswap V2 pairs) via
     read-only eth_call + Multicall3. Returns {address, name, source} rows, deduped. Best-effort per source:
     a source that fails is skipped, never raising. Network-bound; call off the hot path (every few hours)."""
@@ -210,4 +360,16 @@ def custody_addresses(rpc_url: str, univ2_max: int = 500, curve_max: int = 200) 
                 add(_nonzero_addr(data), "Uniswap V2 pair", "univ2")
     except Exception:
         pass
+    if include_periphery:
+        # Convex reward pools: enumerable via eth_call (no getLogs needed). Each wrapped so one failing
+        # source never sinks the others.
+        for a in convex_reward_pools(rpc_url, max_pools=convex_max):
+            add(a, "Convex reward pool", "convex")
+    if include_logs:
+        # UniV3 / Balancer need eth_getLogs over block ranges the box's free RPC refuses ("max range"
+        # limit). Off by default; enable only on a getLogs-capable RPC.
+        for a in balancer_pool_addresses(rpc_url, max_pools=balancer_max):
+            add(a, "Balancer pool", "balancer")
+        for a in univ3_pool_addresses(rpc_url, max_pools=univ3_max):
+            add(a, "Uniswap V3 pool", "univ3")
     return rows

@@ -198,7 +198,14 @@ class Worker:
                 # Custody contracts (pools/vaults that actually hold TVL), not governance tokens.
                 from .discovery import custody_addresses
                 rows = custody_addresses(self.rpc.url,
-                                         univ2_max=int(os.environ.get("BOUNTYSCAN_CUSTODY_UNIV2_MAX", "500")))
+                                         univ2_max=int(os.environ.get("BOUNTYSCAN_CUSTODY_UNIV2_MAX", "500")),
+                                         include_periphery=bool(os.environ.get("BOUNTYSCAN_CUSTODY_PERIPHERY")),
+                                         include_logs=bool(os.environ.get("BOUNTYSCAN_CUSTODY_LOGS")))
+                if os.environ.get("BOUNTYSCAN_DISCOVERY_RECENT"):
+                    # Item 3: recently-verified ('new, un-audited') contracts; the $10k floor filters them.
+                    from .discovery import recent_verified_addresses
+                    rows += [{"address": a, "name": "recently verified", "source": "recent"}
+                             for a in recent_verified_addresses(self.chain, int(os.environ.get("BOUNTYSCAN_RECENT_PAGES", "4")))]
             else:
                 from .discovery import defillama_rows, llama_chain_name
                 min_tvl = float(os.environ.get("BOUNTYSCAN_DISCOVERY_MIN_TVL", "100000"))
